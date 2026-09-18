@@ -1,0 +1,22 @@
+[pack]
+name = "example-pack"
+namespaces = ["example"]
+platforms = ["darwin", "linux"]
+
+[pack.entry]
+nodes = "nodes:PACK_NODES"
+
+[pack.contracts]
+host = "dinkster-pack-host/1"
+api = "dinkster-api/v1"
+
+[pack.sandbox]
+gpu = false
+network = false
+writable-mounts = false
+
+[pack.release]
+version = "1.2.3"
+dinkster = ">=0.9,<1"
+license = "Apache-2.0"
+repository = "https://github.com/example-org/dinkster-example-pack"

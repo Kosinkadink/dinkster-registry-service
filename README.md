@@ -1,0 +1,279 @@
+# Dinkster Registry
+
+The Dinkster Registry is a FastAPI service for browsing and downloading public
+Dinkster node packs. PostgreSQL is authoritative for catalog metadata. Immutable
+pack archives live behind an object-store interface; development uses the
+local filesystem implementation.
+
+Operators can submit pack archives to quarantine through the in-process CLI.
+Lease-based scanner workers validate every candidate and promote accepted bytes
+to immutable artifact storage. The public HTTP API remains a read-only catalog:
+pending, rejected, and operator-review candidates are never visible through it.
+
+## Run the fixture catalog
+
+Requirements are Docker with Compose, Python 3.12, uv, Git, GitHub CLI, and
+authenticated read access to the private Dinkster repository. The second command
+starts PostgreSQL 16, migrates and seeds the database, starts the service on
+port 18041, and starts one isolated scanner worker.
+
+```sh
+env -u GITHUB_TOKEN uv sync --frozen
+DOCKER_BUILDKIT=1 DINKSTER_REPO_TOKEN="$(env -u GITHUB_TOKEN gh auth token)" docker-compose up --build --wait
+uv run python conformance/run.py http://127.0.0.1:18041
+docker-compose down --volumes --remove-orphans --rmi local
+```
+
+The conformance runner browses both fixtures, queries the provider for
+`example.resize`, repeats a browse request with `If-None-Match`, and downloads
+the `example-pack` archive. It recomputes BLAKE3 over the response bytes and
+compares the result and byte count with the download ticket.
+
+The fixture seed is idempotent. Re-running the service keeps the same pack,
+release, digest, and object identities. The included fixture source archives
+are rootless, uncompressed ZIP files with sorted paths, ZIP epoch timestamps,
+0644 modes, and no links or extra fields.
+
+## Release admission
+
+Submission, status, and re-scan commands connect directly to PostgreSQL and the
+object store. There is no public HTTP mutation route and no unauthenticated
+publishing path. The scanner runs these mandatory checks in order:
+
+1. `ingest_integrity`: verifies size, BLAKE3, ZIP structure and CRCs, safe
+   paths, regular files, limits, stored compression, and deterministic bytes.
+2. `manifest`: invokes the pinned Dinkster manifest parser, validates release and
+   catalog fields, checks namespace ownership, and rejects version collisions.
+3. `doctor_static`: invokes the pinned Dinkster doctor's static checks against the
+   exact extracted object.
+4. `executable_probe`: imports the pack in a fresh process under bubblewrap
+   with no network, read-only binds, and CPU, memory, process, file-size, and
+   wall-time limits. The scanner requires full user and PID namespaces and
+   refuses the degraded bubblewrap rung or any host without isolation.
+5. `fast_security`: scans for confirmed secrets and known-bad file hashes and
+   inventories native, executable, bytecode-only, and obfuscated content.
+
+The development Compose scanner runs as root in a privileged container so
+bubblewrap can create full user, PID, mount, and network namespaces on Docker
+hosts that restrict unprivileged namespaces. The API container remains
+non-root and unprivileged. Production hosts should grant bubblewrap's
+documented AppArmor profile and run the scanner as the image's `dinkster` user
+instead.
+
+The registry replaces the parent environment with a controlled PATH and locale
+while Dinkster constructs the probe jail. Dinkster currently passes its six-name
+probe allowlist to bubblewrap through `--setenv` arguments, so these controlled
+values remain visible in the host process table until the upstream probe
+builder delivers them through a private file descriptor. Do not put secrets in
+these variables.
+
+All evidence uses policy `registry-scan/1` and is append-only. By default,
+probe stdout and stderr are each capped at 256 KiB; exceeding either cap blocks
+the candidate. Bounded output tails are stored only in operator details and
+never copied into public finding messages. A `block` finding rejects an upload;
+a blocking active-release re-scan quarantines that release. A `review` finding
+leaves an upload visible only to operators and does not change active bytes
+during re-scan. A `signal` finding is non-blocking and is included in accepted
+trust evidence. By default, a candidate can be claimed at most three times
+before it is rejected with append-only evidence.
+
+The admission transaction rechecks version and namespace conflicts, inserts
+the immutable release, schemas, dependencies, trust evidence, audit event, and
+promotion outbox event, but leaves the release in `pending_scan`. The outbox
+worker verifies and copies the quarantine object to its digest-derived artifact
+key. It marks the release active only after that copy succeeds, then removes the
+quarantine object. This activation is the public catalog visibility barrier.
+
+To exercise admission instead of loading the fixture catalog, start an empty
+registry, build the registry's deterministic test fixture inside the container,
+and submit it:
+
+```sh
+DOCKER_BUILDKIT=1 DINKSTER_REPO_TOKEN="$(env -u GITHUB_TOKEN gh auth token)" DINKSTER_SEED_FIXTURES=0 docker-compose up --build --wait
+docker-compose exec -T registry python -c 'from pathlib import Path; from dinkster_registry_service.artifacts import build_registry_fixture_archive; from dinkster_registry_service.seed import FIXTURE_ROOT; Path("/tmp/example-pack.zip").write_bytes(build_registry_fixture_archive(FIXTURE_ROOT / "example-pack"))'
+candidate_id="$(docker-compose exec -T registry dinkster-registry submit /tmp/example-pack.zip --pack example-pack --version 1.2.3)"
+docker-compose exec -T registry dinkster-registry status "$candidate_id"
+curl --fail http://127.0.0.1:18041/v1/packs/example-pack/versions/1.2.3
+```
+
+Repeat `status` until it reports `accepted`; before that point the final `curl`
+returns 404. The operator can schedule a 30-day static and security re-scan
+immediately with:
+
+```sh
+docker-compose exec -T registry dinkster-registry rescan --pack example-pack --version 1.2.3
+```
+
+Dependency and SBOM scanning is tracked in
+[issue 1](https://github.com/Kosinkadink/dinkster-registry/issues/1). Dynamic
+behavior analysis is tracked in
+[issue 2](https://github.com/Kosinkadink/dinkster-registry/issues/2).
+
+## Public API
+
+All catalog routes are under `/v1` and use camelCase JSON fields:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/v1/health` | Check database access and fixture counts. |
+| GET | `/v1/packs` | Search, filter, sort, and browse public packs. |
+| GET | `/v1/packs/{name}` | Read pack metadata. |
+| GET | `/v1/packs/{name}/versions` | List active releases, optionally including yanks. |
+| GET | `/v1/packs/{name}/versions/{version}` | Read immutable release facts and trust signals. |
+| GET | `/v1/packs/{name}/versions/{version}/schemas` | Read complete indexed node schemas. |
+| GET | `/v1/nodes/{nodeType}/providers` | Find active compatible providers for a node type. |
+| POST | `/v1/packs/{name}/versions/{version}/download-tickets` | Get an immutable public artifact URL. |
+| GET | `/v1/artifacts/{digest}` | Download and verify an active or yanked public release archive. |
+| GET | `/v1/security/blocks` | Read the public digest block feed, currently empty. |
+
+Browse accepts `q`, `ownerType`, `owner`, `nodeType`, `visibility`, `sort`,
+`limit`, and opaque `cursor` parameters. Only `visibility=public` is available
+without authenticated private-pack support. Version lists accept
+`includeYanked`, `limit`, and `cursor`. Node-provider queries accept
+`dinksterVersion` and `includePrerelease`.
+
+Every mutable public GET returns a strong opaque ETag and:
+
+```text
+Cache-Control: public, max-age=60, stale-while-revalidate=300
+```
+
+A matching `If-None-Match` returns 304 with an empty body, the same ETag, and
+the same cache policy. Public 404 responses may be cached for 30 seconds.
+Download-ticket responses use `no-store`. Artifact bytes use:
+
+```text
+ETag: "blake3:<64 lowercase hex>"
+Cache-Control: public, max-age=31536000, immutable
+X-Dinkster-Artifact-Digest: blake3:<64 lowercase hex>
+```
+
+Errors use one envelope:
+
+```json
+{
+  "error": {
+    "code": "not_found",
+    "message": "The requested pack was not found.",
+    "retryable": false,
+    "requestId": "01990000-0000-7000-8000-000000000006",
+    "detail": {"packName": "missing-pack"}
+  }
+}
+```
+
+## Identity and version rules
+
+Pack names use Dinkster's shared closed grammar: 1 through 64 lowercase ASCII
+characters, starting with a letter, with alphanumeric segments separated by
+one `-`, `_`, or `.`. Separators are equivalent for identity, and hosted
+coordinates use canonical hyphen spelling. Namespace validation and conflict
+checks call the same pinned `dinkster-schema` functions used by Dinkster.
+
+Pack, owner, and release identities use UUIDv7 values. Release versions are
+normalized public PEP 440 versions. Pre-releases, post-releases, and
+development releases are accepted; local versions such as `1.2.3+vendor.1`
+are rejected. Each release also stores a semantic collision key, so equivalent
+spellings such as `1.0` and `1.0.0` cannot both be published for one pack.
+
+Artifact and manifest identifiers use only:
+
+```text
+blake3:<64 lowercase hex>
+```
+
+Other algorithm tags are invalid. There is no compatibility path for an
+artifact, cache entry, or release record using another digest algorithm.
+
+## Storage
+
+Alembic revisions `20260902_0001`, `20260903_0002`, and `20260904_0003` create:
+
+- `packs`: public metadata, globally canonical names, UUIDv7 owners, and the
+  current active version.
+- `namespace_grants`: canonical pack-name and node-namespace claims.
+- `artifacts`: immutable digest, size, media type, manifest digest, and object
+  key metadata.
+- `releases`: immutable publication facts plus separately mutable lifecycle state.
+- `release_nodes`: version-specific node type, schema version, wire version,
+  signature, role, and complete schema JSON.
+- `release_scan_runs`: append-only accepted and superseded doctor, scan,
+  provenance, vulnerability, and candidate-only operator evidence.
+- `release_findings`: append-only findings attached to one scan run.
+- `release_attestations`: append-only attestation evaluations.
+- `release_cloud_evaluations`: append-only cloud eligibility evaluations.
+- `release_candidates`: quarantined uploads and active-release re-scan leases.
+- `release_dependencies`: immutable declared pack dependencies.
+- `audit_events`: append-only operator and activation records.
+- `outbox`: idempotent artifact promotion work.
+
+Reads project the latest accepted scan run, latest attestation, and latest
+cloud evaluation into the public release DTO. PostgreSQL triggers reject
+updates and deletes of artifacts, node evidence, and append-only evidence,
+reject release deletion, and prevent deletion of packs that have releases.
+Statement-level triggers reject plain and cascading truncation of every durable
+catalog table. Candidate identity and upload facts are immutable while scanner
+lease and status fields can advance. Audit records and declared dependencies
+are append-only.
+
+Artifact size must be between 1 byte and 64 MiB. The local object store writes
+accepted bytes atomically, reads them in bounded chunks, and verifies the
+declared size and BLAKE3 digest before returning them. Objects live at:
+
+```text
+artifacts/blake3/<first-two-hex>/<64-hex>.dinksterpack.zip
+```
+
+Quarantined uploads live at `quarantine/uploads/<candidate-uuid>` and are not
+addressable by a public route. Admission accepts at most 10,000 entries, 256
+MiB expanded content, 64 MiB per file, 1 MiB manifests, and 512-byte UTF-8
+paths. Executable probes have a default 30-second wall limit, a 512 MiB
+address-space limit, and a 64-process limit in addition to the Dinkster bubblewrap
+limits.
+
+Apply and seed manually with:
+
+```sh
+export DINKSTER_DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost/dinkster_registry
+export DINKSTER_OBJECT_STORE_ROOT=.data/objects
+uv run alembic upgrade head
+uv run dinkster-registry seed
+uv run dinkster-registry serve --host 127.0.0.1 --port 8000
+uv run dinkster-registry scanner
+```
+
+Configuration uses `DINKSTER_DATABASE_URL`, `DINKSTER_OBJECT_STORE_ROOT`,
+`DINKSTER_PUBLIC_BASE_URL`, and `DINKSTER_CURSOR_SECRET`. Development startup also
+accepts `DINKSTER_SEED_FIXTURES=0` to keep the catalog empty. Only PostgreSQL URLs
+are accepted. Production deployments must provide a shared unpredictable
+cursor secret and a public base URL that clients can reach.
+
+Probe and scanner limits use integer environment variables validated at
+startup. Invalid values stop the process with an error naming the variable.
+
+| Variable | Default | Valid range |
+| --- | ---: | ---: |
+| `DINKSTER_PROBE_TIMEOUT_SECONDS` | 30 | 1-600 seconds |
+| `DINKSTER_PROBE_OUTPUT_LIMIT_BYTES` | 262144 | 4096-4194304 bytes per stream |
+| `DINKSTER_PROBE_OPERATOR_TAIL_BYTES` | 8192 | 512 bytes through the configured output limit |
+| `DINKSTER_SCANNER_MAX_ATTEMPTS` | 3 | 1-10 claims |
+
+## Development
+
+The package targets Python 3.12 and commits `uv.lock`. Tests require a
+disposable PostgreSQL database because there is no SQLite implementation.
+
+```sh
+env -u GITHUB_TOKEN uv sync --frozen
+env -u GITHUB_TOKEN uv lock --check
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src tests
+TEST_POSTGRES_URL=postgresql+psycopg://postgres:postgres@localhost/dinkster_registry_test uv run pytest -q
+uv build
+```
+
+CI runs these checks against PostgreSQL 16, starts the HTTP conformance runner,
+builds the container with the private dependency credential as a BuildKit
+secret, inspects image contents, runs the isolated probe under bubblewrap, and
+runs conformance against the image.

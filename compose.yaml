@@ -1,0 +1,76 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: dinkster_registry
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d dinkster_registry"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  registry:
+    image: dinkster-registry:local
+    build:
+      context: .
+      secrets:
+        - dinkster_repo_token
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DINKSTER_CURSOR_SECRET: local-compose-cursor-secret-at-least-32-bytes
+      DINKSTER_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/dinkster_registry
+      DINKSTER_OBJECT_STORE_ROOT: /data/objects
+      DINKSTER_PUBLIC_BASE_URL: http://127.0.0.1:${DINKSTER_REGISTRY_PORT:-18041}
+      DINKSTER_SEED_FIXTURES: ${DINKSTER_SEED_FIXTURES:-1}
+    command: ["/app/scripts/start-dev.sh", "serve"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/health', timeout=2)",
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+    ports:
+      - "${DINKSTER_REGISTRY_PORT:-18041}:8000"
+    volumes:
+      - object-data:/data
+
+  scanner:
+    image: dinkster-registry:local
+    user: root
+    privileged: true
+    depends_on:
+      registry:
+        condition: service_healthy
+    environment:
+      DINKSTER_DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/dinkster_registry
+      DINKSTER_OBJECT_STORE_ROOT: /data/objects
+      # 1-600 seconds.
+      DINKSTER_PROBE_TIMEOUT_SECONDS: ${DINKSTER_PROBE_TIMEOUT_SECONDS:-30}
+      # 4096-4194304 bytes per output stream.
+      DINKSTER_PROBE_OUTPUT_LIMIT_BYTES: ${DINKSTER_PROBE_OUTPUT_LIMIT_BYTES:-262144}
+      # 512 bytes through DINKSTER_PROBE_OUTPUT_LIMIT_BYTES.
+      DINKSTER_PROBE_OPERATOR_TAIL_BYTES: ${DINKSTER_PROBE_OPERATOR_TAIL_BYTES:-8192}
+      # 1-10 claims.
+      DINKSTER_SCANNER_MAX_ATTEMPTS: ${DINKSTER_SCANNER_MAX_ATTEMPTS:-3}
+    command: ["/app/scripts/start-dev.sh", "scanner"]
+    volumes:
+      - object-data:/data
+
+volumes:
+  object-data:
+  postgres-data:
+
+secrets:
+  dinkster_repo_token:
+    environment: DINKSTER_REPO_TOKEN

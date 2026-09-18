@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dinkster-registry-service"
+version = "0.1.0"
+description = "Hosted catalog service for Dinkster node packs"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic>=1.16,<2",
+  "blake3>=1.0,<2",
+  "dinkster-api @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-api",
+  "dinkster-assets @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-assets",
+  "dinkster-caches @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-caches",
+  "dinkster-inference @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-inference",
+  "dinkster-memory @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-memory",
+  "dinkster-protocol @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-protocol",
+  "dinkster-schema @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-schema",
+  "dinkster-values @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-values",
+  "dinkster-workers @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-workers",
+  "fastapi>=0.116,<1",
+  "packaging>=25,<26",
+  "psycopg[binary]>=3.2,<4",
+  "pydantic>=2.11,<3",
+  "sqlalchemy>=2.0,<3",
+  "uvicorn>=0.35,<1",
+]
+
+[project.scripts]
+dinkster-registry = "dinkster_registry_service.cli:main"
+
+[dependency-groups]
+dev = [
+  "httpx2>=2.12,<3",
+  "mypy>=1.17,<2",
+  "pytest>=8.4,<9",
+  "ruff>=0.12,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dinkster_registry_service"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
