@@ -7,6 +7,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from dinkster_schema import SCHEMA_WIRE_VERSION, schema_from_wire, schema_signature
+
 from dinkster_registry_service.admission_checks import run_executable_probe
 from dinkster_registry_service.seed import FIXTURE_ROOT
 
@@ -68,6 +70,16 @@ def main() -> None:
         raise SystemExit(f"isolated probe failed: {messages}")
     if result.data is None or len(result.data["schemas"]) != 2:
         raise SystemExit("isolated probe did not return the two fixture schemas")
+    expected_versions = {"example.resize": 2, "example.save": 1}
+    for record in result.data["schemas"]:
+        node_type = record["nodeType"]
+        if record["schemaVersion"] != expected_versions.get(node_type):
+            raise SystemExit(f"isolated probe returned an invalid node version for {node_type}")
+        if record["schemaWireVersion"] != SCHEMA_WIRE_VERSION:
+            raise SystemExit(f"isolated probe returned an invalid wire version for {node_type}")
+        schema = schema_from_wire(record["schema"])
+        if record["schemaSignature"] != schema_signature(schema):
+            raise SystemExit(f"isolated probe returned an invalid schema signature for {node_type}")
     check_controlled_probe_environment()
     print("isolated_probe=passed schemas=2 environment=controlled")
 

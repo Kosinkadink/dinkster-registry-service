@@ -670,7 +670,8 @@ def run_executable_probe(
                 schemas.append(
                     {
                         "nodeType": node_type,
-                        "schemaVersion": SCHEMA_WIRE_VERSION,
+                        "schemaVersion": schema.version,
+                        "schemaWireVersion": SCHEMA_WIRE_VERSION,
                         "schemaSignature": schema_signature(schema),
                         "role": "schema-only" if node_type in manifest.schema_only else "executing",
                         "schema": wire_schema,
