@@ -22,10 +22,19 @@ import sys
 import tempfile
 from pathlib import Path
 
-from aiohttp import web
+from aiohttp import web as web
 from dinkster_registry import RegistryError, ReleaseTemplate, artifact_digest
 from dinkster_registry.artifact import MANIFEST_FILENAME, ArtifactError, unpack_artifact
-from dinkster_sqlite_registry import (
+from dinkster_workers import (
+    ManifestError,
+    ProbeJail,
+    SandboxError,
+    detect_probe_jail,
+    diagnose,
+    load_manifest,
+)
+
+from dinkster_registry_sqlite import (
     ArtifactVault,
     ProbeError,
     Prober,
@@ -34,14 +43,6 @@ from dinkster_sqlite_registry import (
     StoreError,
     create_registry_app,
     utc_now,
-)
-from dinkster_workers import (
-    ManifestError,
-    ProbeJail,
-    SandboxError,
-    detect_probe_jail,
-    diagnose,
-    load_manifest,
 )
 
 

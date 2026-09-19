@@ -1,4 +1,4 @@
-"""dinkster-registry-service: durable registry state over the pure model.
+"""dinkster-registry-sqlite: durable registry state over the pure model.
 
 ``RegistryStore`` persists principals, grants, releases, and review
 lifecycles in one SQLite file; every mutation validates through the pure

@@ -24,7 +24,7 @@ from dinkster_registry import (
     Submission,
     artifact_digest,
 )
-from dinkster_sqlite_registry import RegistryStore, StoreError
+from dinkster_registry_sqlite import RegistryStore, StoreError
 
 T0 = "2026-07-01T00:00:00+00:00"
 T1 = "2026-07-02T00:00:00+00:00"

@@ -14,17 +14,16 @@ pending, rejected, and operator-review candidates are never visible through it.
 
 The self-hostable SQLite and aiohttp implementation is also distributed here.
 It uses the pure registry model pinned from Dinkster at the same revision as
-the hosted service's other core dependencies. Its storage and HTTP source tree
-is preserved in `packages/dinkster-registry-service`; the root build maps it to
-`dinkster_sqlite_registry` to keep it separate from the hosted FastAPI modules.
-The nested package metadata and README describe its original workspace layout;
-install and run it through this repository's root project instead:
+the hosted service's other core dependencies. The independent
+`dinkster-registry-sqlite` distribution lives in `packages/dinkster-registry-sqlite`
+and imports as `dinkster_registry_sqlite`. Its README preserves the original
+core service documentation; use these workspace commands to install and run it:
 
 ```sh
-uv sync --frozen
-uv run dinkster-registry-sqlite --data ./registry-data admin add-user local --operator
-uv run dinkster-registry-sqlite --data ./registry-data admin add-publisher local --owner local
-uv run dinkster-registry-sqlite --data ./registry-data serve
+uv sync --all-packages --frozen
+uv run --package dinkster-registry-sqlite dinkster-registry-sqlite --data ./registry-data admin add-user local --operator
+uv run --package dinkster-registry-sqlite dinkster-registry-sqlite --data ./registry-data admin add-publisher local --owner local
+uv run --package dinkster-registry-sqlite dinkster-registry-sqlite --data ./registry-data serve
 ```
 
 The default requires a Linux bubblewrap probe jail and refuses startup without
@@ -41,10 +40,19 @@ so the hosted service does not acquire the umbrella application's dependencies:
 git clone https://github.com/Kosinkadink/Dinkster.git .core-validation
 git -C .core-validation checkout 4258cb557cb684f8723c4dc0cf022b4a65e48baa
 uv sync --project .core-validation --locked --all-packages
-uv build --wheel
-uv pip install --python .core-validation/.venv/bin/python --no-deps dist/*.whl
+uv build --package dinkster-registry-sqlite --wheel
+uv pip install --python .core-validation/.venv/bin/python --no-deps dist/dinkster_registry_sqlite-*.whl
 .core-validation/.venv/bin/pyright
-.core-validation/.venv/bin/python -m pytest -q core-tests
+.core-validation/.venv/bin/python -m pytest -q packages/dinkster-registry-sqlite/tests
+```
+
+Verify the standalone wheel also supplies the API needed to probe native packs:
+
+```sh
+uv venv .core-validation/.sqlite-venv
+uv pip install --python .core-validation/.sqlite-venv/bin/python dist/dinkster_registry_sqlite-*.whl
+.core-validation/.sqlite-venv/bin/dinkster-registry-sqlite --help
+.core-validation/.sqlite-venv/bin/dinkster-doctor .core-validation/templates/pack/dinkster-pack.toml --json
 ```
 
 On Windows use `.core-validation/.venv/Scripts/python.exe`. CI runs this
@@ -311,7 +319,7 @@ uv run ruff check .
 uv run ruff format --check .
 uv run mypy src tests
 TEST_POSTGRES_URL=postgresql+psycopg://postgres:postgres@localhost/dinkster_registry_test uv run pytest -q
-uv build
+uv build --all-packages
 ```
 
 CI runs these checks against PostgreSQL 16, starts the HTTP conformance runner,

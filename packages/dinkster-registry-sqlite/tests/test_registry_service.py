@@ -37,7 +37,7 @@ from dinkster_registry import (
     artifact_digest,
 )
 from dinkster_registry.artifact import build_artifact
-from dinkster_sqlite_registry import (
+from dinkster_registry_sqlite import (
     ArtifactVault,
     ProbeError,
     Prober,
@@ -550,8 +550,7 @@ def test_artifact_prober_reads_claims_and_evidence_from_the_bytes(tmp_path: Path
     that unpacks but has no readable manifest raises ProbeError."""
     from dinkster_registry import DoctorEvidence
     from dinkster_registry.artifact import build_artifact
-
-    from dinkster_registry_service.sqlite_cli import artifact_prober
+    from dinkster_registry_sqlite.cli import artifact_prober
 
     pack_dir = tmp_path / "healthy"
     pack_dir.mkdir()
@@ -1268,10 +1267,9 @@ def test_artifact_prober_passes_the_jail_into_diagnose(
     that executes publisher code is the one that gets jailed, over the
     exact unpacked artifact bytes as before."""
     from dinkster_registry.artifact import build_artifact
+    from dinkster_registry_sqlite.cli import artifact_prober
     from dinkster_workers import ProbeJail
     from dinkster_workers.doctor import diagnose as real_diagnose
-
-    from dinkster_registry_service.sqlite_cli import artifact_prober
 
     pack_dir = tmp_path / "pack"
     pack_dir.mkdir()
@@ -1290,7 +1288,7 @@ def test_artifact_prober_passes_the_jail_into_diagnose(
         received.append(probe_jail)
         return real_diagnose(path)  # real report, unjailed - wiring under test
 
-    monkeypatch.setattr("dinkster_registry_service.sqlite_cli.diagnose", spy)
+    monkeypatch.setattr("dinkster_registry_sqlite.cli.diagnose", spy)
     result = artifact_prober(jail)(archive)
     assert received == [jail]
     assert result.pack_name == "jailed-pack"
@@ -1317,9 +1315,8 @@ def test_serve_required_refuses_startup_when_jail_unavailable(
     """--probe-sandbox required either serves jailed or does not serve:
     detection failure is a startup refusal, before the store opens, never
     a silent unjailed fallback."""
+    from dinkster_registry_sqlite import cli as registry_service
     from dinkster_workers import SandboxUnavailable
-
-    from dinkster_registry_service import sqlite_cli as registry_service
 
     def refuse() -> object:
         raise SandboxUnavailable("kernel blocks user namespaces")
@@ -1348,9 +1345,8 @@ def test_serve_required_probes_through_the_detected_jail(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from dinkster_registry_sqlite import cli as registry_service
     from dinkster_workers import ProbeJail
-
-    from dinkster_registry_service import sqlite_cli as registry_service
 
     jail = ProbeJail(bwrap="/fake/bwrap", user_namespaces=True)
     monkeypatch.setattr(registry_service, "detect_probe_jail", lambda: jail)
@@ -1372,7 +1368,7 @@ def test_serve_off_warns_loudly_and_probes_unjailed(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from dinkster_registry_service import sqlite_cli as registry_service
+    from dinkster_registry_sqlite import cli as registry_service
 
     monkeypatch.setattr(
         registry_service,
@@ -1400,7 +1396,7 @@ def test_serve_cli_defaults_to_required_with_off_as_explicit_opt_out(
     fail-closed jail while retaining an explicit lab-only opt-out."""
     import sys
 
-    from dinkster_registry_service import sqlite_cli as registry_service
+    from dinkster_registry_sqlite import cli as registry_service
 
     captured: list[str] = []
 
@@ -1437,7 +1433,7 @@ def test_registry_cli_lists_and_revokes_tokens(
 ) -> None:
     import sys
 
-    from dinkster_registry_service import sqlite_cli as registry_service
+    from dinkster_registry_sqlite import cli as registry_service
 
     data = tmp_path / "registry"
     store, token = store_with_token(data / "registry.db")
