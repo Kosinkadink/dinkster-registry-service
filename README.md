@@ -10,6 +10,46 @@ Lease-based scanner workers validate every candidate and promote accepted bytes
 to immutable artifact storage. The public HTTP API remains a read-only catalog:
 pending, rejected, and operator-review candidates are never visible through it.
 
+## SQLite registry
+
+The self-hostable SQLite and aiohttp implementation is also distributed here.
+It uses the pure registry model pinned from Dinkster at the same revision as
+the hosted service's other core dependencies. Its storage and HTTP source tree
+is preserved in `packages/dinkster-registry-service`; the root build maps it to
+`dinkster_sqlite_registry` to keep it separate from the hosted FastAPI modules.
+The nested package metadata and README describe its original workspace layout;
+install and run it through this repository's root project instead:
+
+```sh
+uv sync --frozen
+uv run dinkster-registry-sqlite --data ./registry-data admin add-user local --operator
+uv run dinkster-registry-sqlite --data ./registry-data admin add-publisher local --owner local
+uv run dinkster-registry-sqlite --data ./registry-data serve
+```
+
+The default requires a Linux bubblewrap probe jail and refuses startup without
+it. `--probe-sandbox off` is an explicit lab-only opt-out for trusted packs.
+The SQLite CLI retains the artifact, publish, browse, template, and review
+routes and offline token administration. The `dinkster-registry` command and
+the container's default command continue to run the hosted PostgreSQL service.
+
+The moved tests also exercise the actual Dinkster publish, browse, and download
+clients. Run them against the pinned core checkout in a separate environment
+so the hosted service does not acquire the umbrella application's dependencies:
+
+```sh
+git clone https://github.com/Kosinkadink/Dinkster.git .core-validation
+git -C .core-validation checkout 4258cb557cb684f8723c4dc0cf022b4a65e48baa
+uv sync --project .core-validation --locked --all-packages
+uv build --wheel
+uv pip install --python .core-validation/.venv/bin/python --no-deps dist/*.whl
+.core-validation/.venv/bin/pyright
+.core-validation/.venv/bin/python -m pytest -q core-tests
+```
+
+On Windows use `.core-validation/.venv/Scripts/python.exe`. CI runs this
+contract suite in addition to the hosted tests, conformance, and container gates.
+
 ## Run the fixture catalog
 
 Requirements are Docker with Compose, Python 3.12, uv, Git, GitHub CLI, and

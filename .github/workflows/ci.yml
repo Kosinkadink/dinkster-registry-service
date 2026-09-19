@@ -48,6 +48,34 @@ jobs:
       - run: uv run pytest -q
       - run: uv build
 
+  core-client-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.12"
+      - uses: actions/checkout@v7
+        with:
+          repository: Kosinkadink/Dinkster
+          ref: 4258cb557cb684f8723c4dc0cf022b4a65e48baa
+          path: .core-validation
+          token: ${{ secrets.DINKSTER_REPO_TOKEN }}
+      - name: Install the pinned core and registry wheel
+        env:
+          DINKSTER_REPO_TOKEN: ${{ secrets.DINKSTER_REPO_TOKEN }}
+        run: |
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0="url.https://x-access-token:${DINKSTER_REPO_TOKEN}@github.com/.insteadOf" \
+          GIT_CONFIG_VALUE_0="https://github.com/" \
+          env -u GITHUB_TOKEN uv sync --project .core-validation --locked --all-packages
+          uv build --wheel
+          uv pip install --python .core-validation/.venv/bin/python --no-deps dist/*.whl
+      - name: Run the moved storage and HTTP client contract tests
+        run: |
+          .core-validation/.venv/bin/pyright
+          .core-validation/.venv/bin/python -m pytest -q core-tests
+
   conformance:
     runs-on: ubuntu-latest
     env:

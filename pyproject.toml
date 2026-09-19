@@ -9,6 +9,7 @@ description = "Hosted catalog service for Dinkster node packs"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+  "aiohttp>=3.10",
   "alembic>=1.16,<2",
   "blake3>=1.0,<2",
   "dinkster-api @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-api",
@@ -17,6 +18,7 @@ dependencies = [
   "dinkster-inference @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-inference",
   "dinkster-memory @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-memory",
   "dinkster-protocol @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-protocol",
+  "dinkster-registry @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-registry",
   "dinkster-schema @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-schema",
   "dinkster-values @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-values",
   "dinkster-workers @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-workers",
@@ -30,6 +32,7 @@ dependencies = [
 
 [project.scripts]
 dinkster-registry = "dinkster_registry_service.cli:main"
+dinkster-registry-sqlite = "dinkster_registry_service.sqlite_cli:main"
 
 [dependency-groups]
 dev = [
@@ -41,6 +44,9 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dinkster_registry_service"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"packages/dinkster-registry-service/src/dinkster_registry_service" = "dinkster_sqlite_registry"
 
 [tool.hatch.metadata]
 allow-direct-references = true
@@ -56,6 +62,14 @@ select = ["B", "E", "F", "I", "UP"]
 python_version = "3.12"
 strict = true
 files = ["src", "tests"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+venvPath = ".core-validation"
+venv = ".venv"
+include = ["packages", "core-tests"]
+strict = ["packages"]
+typeCheckingMode = "standard"
 
 [tool.pytest.ini_options]
 addopts = "-ra"
