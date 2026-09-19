@@ -300,8 +300,9 @@ startup. Invalid values stop the process with an error naming the variable.
 
 ## Development
 
-The package targets Python 3.12 and commits `uv.lock`. Tests require a
-disposable PostgreSQL database because there is no SQLite implementation.
+The package targets Python 3.12 and commits `uv.lock`. The hosted service's
+tests require a disposable PostgreSQL database; the separate SQLite tests
+use temporary databases.
 
 ```sh
 env -u GITHUB_TOKEN uv sync --frozen
