@@ -1,62 +1,37 @@
 # Dinkster Registry
 
-The Dinkster Registry is a FastAPI service for browsing and downloading public
-Dinkster node packs. PostgreSQL is authoritative for catalog metadata. Immutable
-pack archives live behind an object-store interface; development uses the
-local filesystem implementation.
+The Dinkster Registry is a FastAPI service for publishing, browsing, and
+downloading Dinkster node packs. The same `dinkster-registry-service`
+distribution and `dinkster_registry_service` import run with PostgreSQL for a
+hosted catalog or SQLite for a self-hosted registry. Immutable pack archives
+live behind an object-store interface; development uses the local filesystem
+implementation.
 
 Operators can submit pack archives to quarantine through the in-process CLI.
 Lease-based scanner workers validate every candidate and promote accepted bytes
-to immutable artifact storage. The public HTTP API remains a read-only catalog:
-pending, rejected, and operator-review candidates are never visible through it.
+to immutable artifact storage. Bearer-authenticated HTTP routes accept publisher
+submissions and operator review decisions. Pending, rejected, and
+operator-review candidates are never visible through public catalog routes.
 
-## SQLite registry
+## Self-host with SQLite
 
-The self-hostable SQLite and aiohttp implementation is also distributed here.
-It uses the pure registry model pinned from Dinkster at the same revision as
-the hosted service's other core dependencies. The independent
-`dinkster-registry-sqlite` distribution lives in `packages/dinkster-registry-sqlite`
-and imports as `dinkster_registry_sqlite`. Its README preserves the original
-core service documentation; use these workspace commands to install and run it:
+One data directory can hold both SQLite metadata and artifact objects. The
+service creates the SQLite schema on first open. Use the same command and wire
+contract as a PostgreSQL deployment:
 
 ```sh
-uv sync --all-packages --frozen
-uv run --package dinkster-registry-sqlite dinkster-registry-sqlite --data ./registry-data admin add-user local --operator
-uv run --package dinkster-registry-sqlite dinkster-registry-sqlite --data ./registry-data admin add-publisher local --owner local
-uv run --package dinkster-registry-sqlite dinkster-registry-sqlite --data ./registry-data serve
+uv sync --frozen
+uv run dinkster-registry admin --database-url sqlite:///registry-data/registry.db add-user local --operator
+uv run dinkster-registry admin --database-url sqlite:///registry-data/registry.db add-publisher local --owner local
+DINKSTER_DATABASE_URL=sqlite:///registry-data/registry.db \
+  DINKSTER_OBJECT_STORE_ROOT=registry-data/objects \
+  uv run dinkster-registry serve --host 127.0.0.1 --port 8791
 ```
 
-The default requires a Linux bubblewrap probe jail and refuses startup without
-it. `--probe-sandbox off` is an explicit lab-only opt-out for trusted packs.
-The SQLite CLI retains the artifact, publish, browse, template, and review
-routes and offline token administration. The `dinkster-registry` command and
-the container's default command continue to run the hosted PostgreSQL service.
-
-The moved tests also exercise the actual Dinkster publish, browse, and download
-clients. Run them against the pinned core checkout in a separate environment
-so the hosted service does not acquire the umbrella application's dependencies:
-
-```sh
-git clone https://github.com/Kosinkadink/Dinkster.git .core-validation
-git -C .core-validation checkout 4258cb557cb684f8723c4dc0cf022b4a65e48baa
-uv sync --project .core-validation --locked --all-packages
-uv build --package dinkster-registry-sqlite --wheel
-uv pip install --python .core-validation/.venv/bin/python --no-deps dist/dinkster_registry_sqlite-*.whl
-.core-validation/.venv/bin/pyright
-.core-validation/.venv/bin/python -m pytest -q packages/dinkster-registry-sqlite/tests
-```
-
-Verify the standalone wheel also supplies the API needed to probe native packs:
-
-```sh
-uv venv .core-validation/.sqlite-venv
-uv pip install --python .core-validation/.sqlite-venv/bin/python dist/dinkster_registry_sqlite-*.whl
-.core-validation/.sqlite-venv/bin/dinkster-registry-sqlite --help
-.core-validation/.sqlite-venv/bin/dinkster-doctor .core-validation/templates/pack/dinkster-pack.toml --json
-```
-
-On Windows use `.core-validation/.venv/Scripts/python.exe`. CI runs this
-contract suite in addition to the hosted tests, conformance, and container gates.
+Run `conformance/run.py` against this deployment after seeding to verify the
+same catalog contract used by PostgreSQL. Publishing tokens, publisher and
+operator principals, namespace grants, quarantine scanning, and review
+resolution all use the shared schema and FastAPI routes on both backends.
 
 ## Run the fixture catalog
 
@@ -164,6 +139,11 @@ All catalog routes are under `/v1` and use camelCase JSON fields:
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/v1/health` | Check database access and fixture counts. |
+| POST | `/v1/publish/{name}/versions/{version}` | Submit archive bytes with a publisher token. |
+| GET | `/v1/publish/{candidateId}` | Read publisher-scoped admission status. |
+| POST | `/v1/reviews/{candidateId}` | Accept or reject a candidate as a registry operator. |
+| GET | `/v1/tokens` | List publisher token metadata as an owner. |
+| POST | `/v1/tokens/{tokenId}/revoke` | Revoke a publisher token. |
 | GET | `/v1/packs` | Search, filter, sort, and browse public packs. |
 | GET | `/v1/packs/{name}` | Read pack metadata. |
 | GET | `/v1/packs/{name}/versions` | List active releases, optionally including yanks. |

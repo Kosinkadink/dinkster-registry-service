@@ -43,9 +43,6 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/dinkster_registry_service"]
 
-[tool.uv.workspace]
-members = ["packages/dinkster-registry-sqlite"]
-
 [tool.hatch.metadata]
 allow-direct-references = true
 
@@ -65,8 +62,6 @@ files = ["src", "tests"]
 pythonVersion = "3.12"
 venvPath = ".core-validation"
 venv = ".venv"
-include = ["packages"]
-strict = ["packages/dinkster-registry-sqlite/src"]
 typeCheckingMode = "standard"
 
 [tool.pytest.ini_options]
