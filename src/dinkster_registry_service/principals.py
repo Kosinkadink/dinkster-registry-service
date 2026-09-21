@@ -200,6 +200,13 @@ class PrincipalRepository:
             _, operators = self._load(session)
             return user in operators
 
+    def record(self, actor: str, action: str, subject: str, at: str, details: str = "") -> None:
+        with self.database.session() as session, session.begin():
+            directory, _ = self._load(session)
+            audit_count = len(directory.audit())
+            directory.record(actor, action, subject, at, details)
+            self._append_audit(session, directory, audit_count)
+
     def audit(self) -> tuple[AuditRecord, ...]:
         with self.database.session() as session:
             directory, _ = self._load(session)

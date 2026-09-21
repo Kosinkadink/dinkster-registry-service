@@ -111,6 +111,9 @@ class PackRecord(Base):
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     name: Mapped[str] = mapped_column(String(64), unique=True)
+    publisher_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("publishers.id", ondelete="RESTRICT"), nullable=True
+    )
     display_name: Mapped[str] = mapped_column(String(200))
     description: Mapped[str] = mapped_column(String(500))
     long_description: Mapped[str] = mapped_column(Text)
@@ -136,6 +139,9 @@ class NamespaceGrantRecord(Base):
     claim: Mapped[str] = mapped_column(String(64), primary_key=True)
     pack_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("packs.id", ondelete="CASCADE")
+    )
+    publisher_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("publishers.id", ondelete="RESTRICT"), nullable=True
     )
     owner_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True))
 
@@ -302,6 +308,9 @@ class ReleaseCandidateRecord(Base):
         Uuid(as_uuid=True),
         ForeignKey("releases.id", ondelete="RESTRICT"),
         nullable=True,
+    )
+    publisher_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("publishers.id", ondelete="RESTRICT"), nullable=True
     )
     pack_name: Mapped[str] = mapped_column(String(64))
     version: Mapped[str] = mapped_column(String(128))

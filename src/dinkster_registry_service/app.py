@@ -4,10 +4,12 @@ import json
 import logging
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import UUID
 
 from blake3 import blake3
+from dinkster_registry import RegistryError, TokenRecord
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from packaging.version import InvalidVersion, Version
@@ -18,12 +20,14 @@ from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response, StreamingResponse
 
+from .admission import AdmissionError, AdmissionService, CandidateStatus
 from .cursors import CursorCodec, CursorError
-from .database import Database
+from .database import Database, ReleaseCandidateRecord
 from .digests import DigestError, require_blake3_digest
 from .identifiers import IdentifierError, require_canonical_pack_name
 from .ids import uuid7
-from .object_store import LocalFilesystemObjectStore, ObjectStoreError
+from .object_store import MAX_ARTIFACT_SIZE, LocalFilesystemObjectStore, ObjectStoreError
+from .principals import PrincipalRepository
 from .repository import CatalogDataError, CatalogRepository
 from .settings import ServerSettings
 from .versioning import VersionError, require_public_version
@@ -69,6 +73,15 @@ class ProvidersQuery(RequestModel):
 
 class BlocksQuery(RequestModel):
     since: str | None = Field(default=None, min_length=1, max_length=4096)
+
+
+class ReviewRequest(RequestModel):
+    decision: Literal["accept", "reject"]
+    reason: str = Field(min_length=1, max_length=1024)
+
+
+class RevokeTokenRequest(RequestModel):
+    reason: str = Field(min_length=1, max_length=1024)
 
 
 class ProtocolError(Exception):
@@ -222,11 +235,45 @@ def _not_found(message: str, **detail: object) -> ProtocolError:
     )
 
 
+def _authenticate(request: Request, principals: PrincipalRepository) -> TokenRecord:
+    scheme, _, credential = request.headers.get("authorization", "").partition(" ")
+    if scheme != "Bearer" or not credential:
+        raise ProtocolError(401, "unauthenticated", "A valid bearer token is required.")
+    try:
+        return principals.verify_token(credential, datetime.now(UTC).isoformat())
+    except RegistryError:
+        raise ProtocolError(401, "unauthenticated", "A valid bearer token is required.") from None
+
+
+def _candidate_payload(status: CandidateStatus) -> dict[str, object]:
+    return {
+        "candidateId": str(status.id),
+        "packName": status.pack_name,
+        "version": status.version,
+        "artifactDigest": status.digest,
+        "artifactSize": status.size,
+        "status": status.status,
+        "reason": status.reason,
+        "attempts": status.attempts,
+        "findings": [
+            {
+                "code": finding.code,
+                "severity": finding.severity,
+                "effect": finding.effect,
+                "message": finding.message,
+            }
+            for finding in status.findings
+        ],
+    }
+
+
 def create_app(settings: ServerSettings | None = None) -> FastAPI:
     configured = settings or ServerSettings.from_environment()
     database = Database(configured.database_url)
     object_store = LocalFilesystemObjectStore(configured.object_store_root)
     repository = CatalogRepository(database, CursorCodec(configured.cursor_secret))
+    principals = PrincipalRepository(database)
+    admission = AdmissionService(database, object_store, settings=configured)
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> Any:
@@ -306,6 +353,155 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             repository.health(),
             cache_control=PUBLIC_CACHE,
             etag_context={"endpoint": "health"},
+        )
+
+    @app.post("/v1/publish/{canonical_name}/versions/{canonical_version}")
+    async def publish(request: Request, canonical_name: str, canonical_version: str) -> Response:
+        _query(request, EmptyQuery)
+        name = _pack_name(canonical_name)
+        version = _version(canonical_version)
+        token = _authenticate(request, principals)
+        try:
+            principals.authorize(token.minted_by, token.publisher, "publish")
+            principals.authorize_token(token, token.publisher, name)
+        except RegistryError as exc:
+            raise ProtocolError(403, "forbidden", str(exc)) from None
+        archive = await request.body()
+        if not 1 <= len(archive) <= MAX_ARTIFACT_SIZE:
+            raise ProtocolError(
+                413,
+                "artifact_too_large",
+                f"Artifact size must be between 1 and {MAX_ARTIFACT_SIZE} bytes.",
+            )
+        try:
+            candidate_id = admission.submit(
+                archive,
+                pack_name=name,
+                version=version,
+                submitted_by=token.minted_by,
+                publisher=token.publisher,
+            )
+            principals.record(
+                token.minted_by,
+                "submit-release",
+                str(candidate_id),
+                datetime.now(UTC).isoformat(),
+                f"{name} {version}",
+            )
+        except (AdmissionError, RegistryError) as exc:
+            raise ProtocolError(409, "publish_in_progress", str(exc)) from None
+        return _json_response(
+            request,
+            {"candidateId": str(candidate_id), "status": "queued"},
+            cache_control=NO_STORE,
+            status_code=202,
+            conditional=False,
+            include_etag=False,
+        )
+
+    @app.get("/v1/publish/{candidate_id}")
+    def publish_status(request: Request, candidate_id: UUID) -> Response:
+        _query(request, EmptyQuery)
+        token = _authenticate(request, principals)
+        with database.session() as session:
+            candidate = session.get(ReleaseCandidateRecord, candidate_id)
+            if candidate is None:
+                raise _not_found("The requested publish candidate was not found.")
+            if candidate.publisher_id != token.publisher and not principals.is_operator(
+                token.minted_by
+            ):
+                raise ProtocolError(403, "forbidden", "The publish candidate is not accessible.")
+        return _json_response(
+            request,
+            _candidate_payload(admission.status(candidate_id)),
+            cache_control=NO_STORE,
+            conditional=False,
+            include_etag=False,
+        )
+
+    @app.post("/v1/reviews/{candidate_id}")
+    def resolve_review(request: Request, candidate_id: UUID, body: ReviewRequest) -> Response:
+        _query(request, EmptyQuery)
+        token = _authenticate(request, principals)
+        if token.pack is not None or not principals.is_operator(token.minted_by):
+            raise ProtocolError(403, "forbidden", "Registry operator authority is required.")
+        try:
+            status = admission.resolve_review(
+                candidate_id,
+                accepted=body.decision == "accept",
+                actor=token.minted_by,
+                reason=body.reason,
+            )
+            principals.record(
+                token.minted_by,
+                f"review-{body.decision}",
+                str(candidate_id),
+                datetime.now(UTC).isoformat(),
+                body.reason,
+            )
+        except (AdmissionError, RegistryError) as exc:
+            raise ProtocolError(409, "admission_rejected", str(exc)) from None
+        return _json_response(
+            request,
+            _candidate_payload(status),
+            cache_control=NO_STORE,
+            conditional=False,
+            include_etag=False,
+        )
+
+    @app.get("/v1/tokens")
+    def list_tokens(request: Request) -> Response:
+        _query(request, EmptyQuery)
+        token = _authenticate(request, principals)
+        if token.pack is not None:
+            raise ProtocolError(
+                403, "forbidden", "Token administration requires an unscoped token."
+            )
+        try:
+            records = principals.administered_tokens(token.publisher, token.minted_by)
+        except RegistryError as exc:
+            raise ProtocolError(403, "forbidden", str(exc)) from None
+        return _json_response(
+            request,
+            {
+                "tokens": [
+                    {
+                        "id": record.token_id,
+                        "publisher": record.publisher,
+                        "mintedBy": record.minted_by,
+                        "pack": record.pack,
+                        "createdAt": record.created_at,
+                        "expiresAt": record.expires_at,
+                        "revoked": record.revoked,
+                        "revokedReason": record.revoked_reason,
+                    }
+                    for record in records
+                ]
+            },
+            cache_control=NO_STORE,
+            conditional=False,
+            include_etag=False,
+        )
+
+    @app.post("/v1/tokens/{token_id}/revoke")
+    def revoke_token(request: Request, token_id: str, body: RevokeTokenRequest) -> Response:
+        _query(request, EmptyQuery)
+        token = _authenticate(request, principals)
+        try:
+            principals.revoke_token(
+                token_id,
+                token.minted_by,
+                datetime.now(UTC).isoformat(),
+                body.reason,
+            )
+        except RegistryError:
+            raise ProtocolError(403, "forbidden", "Token revocation is forbidden.") from None
+        return _json_response(
+            request,
+            {"revoked": token_id},
+            cache_control=NO_STORE,
+            conditional=False,
+            include_etag=False,
         )
 
     @app.get("/v1/packs")
