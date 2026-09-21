@@ -512,11 +512,12 @@ class AdmissionService:
         try:
             with self.database.session() as session, session.begin():
                 candidate = self._leased_candidate(session, claim)
-                session.execute(
-                    text("SELECT pg_advisory_xact_lock(hashtext(:pack_name))"),
-                    {"pack_name": candidate.pack_name},
-                )
-                session.execute(text("LOCK TABLE namespace_grants IN SHARE ROW EXCLUSIVE MODE"))
+                if self.database.is_postgresql:
+                    session.execute(
+                        text("SELECT pg_advisory_xact_lock(hashtext(:pack_name))"),
+                        {"pack_name": candidate.pack_name},
+                    )
+                    session.execute(text("LOCK TABLE namespace_grants IN SHARE ROW EXCLUSIVE MODE"))
                 pack = session.scalar(
                     select(PackRecord)
                     .where(PackRecord.name == candidate.pack_name)

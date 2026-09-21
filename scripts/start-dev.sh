@@ -4,7 +4,10 @@ set -eu
 mode="${1:-all}"
 
 prepare_database() {
-    alembic upgrade head
+    case "${DINKSTER_DATABASE_URL:-}" in
+        sqlite:*) ;;
+        *) alembic upgrade head ;;
+    esac
     if [ "${DINKSTER_SEED_FIXTURES:-1}" = "1" ]; then
         dinkster-registry seed
     fi

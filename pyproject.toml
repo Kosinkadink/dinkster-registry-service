@@ -17,6 +17,7 @@ dependencies = [
   "dinkster-inference @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-inference",
   "dinkster-memory @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-memory",
   "dinkster-protocol @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-protocol",
+  "dinkster-registry @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-registry",
   "dinkster-schema @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-schema",
   "dinkster-values @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-values",
   "dinkster-workers @ git+https://github.com/Kosinkadink/Dinkster.git@4258cb557cb684f8723c4dc0cf022b4a65e48baa#subdirectory=packages/dinkster-workers",
