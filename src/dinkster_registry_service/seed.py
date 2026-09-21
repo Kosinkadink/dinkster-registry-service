@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -46,6 +47,18 @@ class NodeFixture:
 
 
 @dataclass(frozen=True)
+class TemplateFixture:
+    id: str
+    name: str
+    path: str
+    description: str = ""
+    tags: tuple[str, ...] = ()
+    family: str = ""
+    models: tuple[str, ...] = ()
+    assets: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class PackFixture:
     pack_id: UUID
     release_id: UUID
@@ -72,6 +85,7 @@ class PackFixture:
     nodes: tuple[NodeFixture, ...]
     python_requirements: tuple[str, ...] = ()
     dependencies: tuple[tuple[str, str], ...] = ()
+    templates: tuple[TemplateFixture, ...] = ()
 
 
 FIXTURES = (
@@ -120,6 +134,17 @@ FIXTURES = (
             ),
         ),
         python_requirements=("pillow>=10,<12",),
+        templates=(
+            TemplateFixture(
+                id="starter",
+                name="Starter",
+                path="templates/starter.json",
+                description="Start here",
+                tags=("intro",),
+                family="example.image",
+                models=("example.safetensors",),
+            ),
+        ),
     ),
     PackFixture(
         pack_id=UUID("01990000-0000-7000-8000-000000000022"),
@@ -196,7 +221,7 @@ def _validate_cross_fixture_claims() -> None:
                         )
 
 
-def _manifest(fixture: PackFixture) -> dict[str, Any]:
+def _manifest(fixture: PackFixture, source: Path) -> dict[str, Any]:
     return {
         "dinkster": ">=0.9rc1,<1",
         "license": "Apache-2.0",
@@ -211,6 +236,24 @@ def _manifest(fixture: PackFixture) -> dict[str, Any]:
         "dependencies": [
             {"packName": pack_name, "versionRange": version_range}
             for pack_name, version_range in fixture.dependencies
+        ],
+        "templates": [
+            {
+                "id": template.id,
+                "name": template.name,
+                "digest": "sha256:"
+                + hashlib.sha256((source / template.path).read_bytes()).hexdigest(),
+                "path": template.path,
+                "description": template.description,
+                "tags": list(template.tags),
+                "family": template.family,
+                "models": list(template.models),
+                "assets": list(template.assets),
+                "thumbnailDigest": "",
+                "thumbnailMediaType": "",
+                "thumbnailPath": "",
+            }
+            for template in fixture.templates
         ],
     }
 
@@ -361,7 +404,7 @@ def seed_fixtures(database: Database, object_store: ObjectStore) -> SeedResult:
                     ),
                     published_by_principal_id=fixture.principal_id,
                     artifact_digest=digest,
-                    manifest=_manifest(fixture),
+                    manifest=_manifest(fixture, source),
                 )
                 session.add(release)
                 session.flush()
