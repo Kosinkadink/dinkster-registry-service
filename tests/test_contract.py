@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import timedelta
 from typing import Any, cast
@@ -97,6 +98,41 @@ def test_pack_release_and_schema_contracts(client: TestClient) -> None:
         "example.save",
     ]
     assert_public_metadata(schemas_response)
+
+
+def test_template_catalog_and_immutable_body_contract(
+    client: TestClient,
+) -> None:
+    body = b'{"nodes":[]}\n'
+
+    response = client.get("/index/templates?q=start&tag=intro&pack=example-pack")
+    assert response.status_code == 200
+    assert response.json() == {
+        "templates": [
+            {
+                "pack": "example-pack",
+                "version": "1.2.3",
+                "id": "starter",
+                "name": "Starter",
+                "description": "Start here",
+                "family": "example.image",
+                "tags": ["intro"],
+                "models": ["example.safetensors"],
+                "digest": "sha256:" + hashlib.sha256(body).hexdigest(),
+            }
+        ]
+    }
+    assert "path" not in response.text
+
+    url = "/index/packs/example-pack/versions/1.2.3/templates/starter"
+    document = client.get(url)
+    assert document.status_code == 200
+    assert document.content == body
+    assert document.headers["etag"] == f'"sha256:{hashlib.sha256(body).hexdigest()}"'
+    assert "immutable" in document.headers["cache-control"]
+    conditional = client.get(url, headers={"If-None-Match": document.headers["etag"]})
+    assert conditional.status_code == 304
+    assert client.get(url.removesuffix("starter") + "missing").status_code == 404
 
 
 @pytest.mark.parametrize(

@@ -6,12 +6,6 @@ resolution-markers = [
     "python_full_version < '3.15'",
 ]
 
-[manifest]
-members = [
-    "dinkster-registry-service",
-    "dinkster-registry-sqlite",
-]
-
 [[package]]
 name = "aiohappyeyeballs"
 version = "2.7.1"
@@ -312,7 +306,7 @@ wheels = [
 [[package]]
 name = "dinkster-api"
 version = "0.0.1"
-source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa#4258cb557cb684f8723c4dc0cf022b4a65e48baa" }
+source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=976174e850e6e04ba32d95c163836842be405938#976174e850e6e04ba32d95c163836842be405938" }
 dependencies = [
     { name = "dinkster-assets" },
     { name = "dinkster-inference" },
@@ -326,7 +320,7 @@ dependencies = [
 [[package]]
 name = "dinkster-assets"
 version = "0.0.1"
-source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-assets&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa#4258cb557cb684f8723c4dc0cf022b4a65e48baa" }
+source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-assets&rev=976174e850e6e04ba32d95c163836842be405938#976174e850e6e04ba32d95c163836842be405938" }
 dependencies = [
     { name = "blake3" },
     { name = "dinkster-values" },
@@ -335,7 +329,7 @@ dependencies = [
 [[package]]
 name = "dinkster-caches"
 version = "0.0.1"
-source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-caches&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa#4258cb557cb684f8723c4dc0cf022b4a65e48baa" }
+source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-caches&rev=976174e850e6e04ba32d95c163836842be405938#976174e850e6e04ba32d95c163836842be405938" }
 dependencies = [
     { name = "dinkster-assets" },
     { name = "dinkster-memory" },
@@ -346,7 +340,7 @@ dependencies = [
 [[package]]
 name = "dinkster-image-document"
 version = "0.0.1"
-source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-image-document&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa#4258cb557cb684f8723c4dc0cf022b4a65e48baa" }
+source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-image-document&rev=976174e850e6e04ba32d95c163836842be405938#976174e850e6e04ba32d95c163836842be405938" }
 dependencies = [
     { name = "dinkster-assets" },
     { name = "dinkster-values" },
@@ -358,7 +352,7 @@ dependencies = [
 [[package]]
 name = "dinkster-inference"
 version = "0.0.1"
-source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-inference&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa#4258cb557cb684f8723c4dc0cf022b4a65e48baa" }
+source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-inference&rev=976174e850e6e04ba32d95c163836842be405938#976174e850e6e04ba32d95c163836842be405938" }
 dependencies = [
     { name = "aiohttp" },
     { name = "dinkster-protocol" },
@@ -369,7 +363,7 @@ dependencies = [
 [[package]]
 name = "dinkster-memory"
 version = "0.0.1"
-source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-memory&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa#4258cb557cb684f8723c4dc0cf022b4a65e48baa" }
+source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-memory&rev=976174e850e6e04ba32d95c163836842be405938#976174e850e6e04ba32d95c163836842be405938" }
 dependencies = [
     { name = "dinkster-values" },
     { name = "psutil" },
@@ -378,7 +372,7 @@ dependencies = [
 [[package]]
 name = "dinkster-protocol"
 version = "0.0.1"
-source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-protocol&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa#4258cb557cb684f8723c4dc0cf022b4a65e48baa" }
+source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-protocol&rev=976174e850e6e04ba32d95c163836842be405938#976174e850e6e04ba32d95c163836842be405938" }
 dependencies = [
     { name = "dinkster-schema" },
     { name = "dinkster-values" },
@@ -387,9 +381,11 @@ dependencies = [
 [[package]]
 name = "dinkster-registry"
 version = "0.0.1"
-source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-registry&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa#4258cb557cb684f8723c4dc0cf022b4a65e48baa" }
+source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-registry&rev=976174e850e6e04ba32d95c163836842be405938#976174e850e6e04ba32d95c163836842be405938" }
 dependencies = [
+    { name = "blake3" },
     { name = "dinkster-schema" },
+    { name = "packaging" },
 ]
 
 [[package]]
@@ -405,6 +401,7 @@ dependencies = [
     { name = "dinkster-inference" },
     { name = "dinkster-memory" },
     { name = "dinkster-protocol" },
+    { name = "dinkster-registry" },
     { name = "dinkster-schema" },
     { name = "dinkster-values" },
     { name = "dinkster-workers" },
@@ -428,15 +425,16 @@ dev = [
 requires-dist = [
     { name = "alembic", specifier = ">=1.16,<2" },
     { name = "blake3", specifier = ">=1.0,<2" },
-    { name = "dinkster-api", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa" },
-    { name = "dinkster-assets", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-assets&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa" },
-    { name = "dinkster-caches", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-caches&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa" },
-    { name = "dinkster-inference", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-inference&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa" },
-    { name = "dinkster-memory", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-memory&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa" },
-    { name = "dinkster-protocol", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-protocol&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa" },
-    { name = "dinkster-schema", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-schema&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa" },
-    { name = "dinkster-values", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-values&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa" },
-    { name = "dinkster-workers", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-workers&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa" },
+    { name = "dinkster-api", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=976174e850e6e04ba32d95c163836842be405938" },
+    { name = "dinkster-assets", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-assets&rev=976174e850e6e04ba32d95c163836842be405938" },
+    { name = "dinkster-caches", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-caches&rev=976174e850e6e04ba32d95c163836842be405938" },
+    { name = "dinkster-inference", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-inference&rev=976174e850e6e04ba32d95c163836842be405938" },
+    { name = "dinkster-memory", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-memory&rev=976174e850e6e04ba32d95c163836842be405938" },
+    { name = "dinkster-protocol", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-protocol&rev=976174e850e6e04ba32d95c163836842be405938" },
+    { name = "dinkster-registry", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-registry&rev=976174e850e6e04ba32d95c163836842be405938" },
+    { name = "dinkster-schema", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-schema&rev=976174e850e6e04ba32d95c163836842be405938" },
+    { name = "dinkster-values", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-values&rev=976174e850e6e04ba32d95c163836842be405938" },
+    { name = "dinkster-workers", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-workers&rev=976174e850e6e04ba32d95c163836842be405938" },
     { name = "fastapi", specifier = ">=0.116,<1" },
     { name = "packaging", specifier = ">=25,<26" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
@@ -454,42 +452,9 @@ dev = [
 ]
 
 [[package]]
-name = "dinkster-registry-sqlite"
-version = "0.0.1"
-source = { editable = "packages/dinkster-registry-sqlite" }
-dependencies = [
-    { name = "aiohttp" },
-    { name = "dinkster-api" },
-    { name = "dinkster-assets" },
-    { name = "dinkster-caches" },
-    { name = "dinkster-inference" },
-    { name = "dinkster-memory" },
-    { name = "dinkster-protocol" },
-    { name = "dinkster-registry" },
-    { name = "dinkster-schema" },
-    { name = "dinkster-values" },
-    { name = "dinkster-workers" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aiohttp", specifier = ">=3.10" },
-    { name = "dinkster-api", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa" },
-    { name = "dinkster-assets", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-assets&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa" },
-    { name = "dinkster-caches", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-caches&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa" },
-    { name = "dinkster-inference", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-inference&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa" },
-    { name = "dinkster-memory", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-memory&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa" },
-    { name = "dinkster-protocol", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-protocol&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa" },
-    { name = "dinkster-registry", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-registry&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa" },
-    { name = "dinkster-schema", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-schema&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa" },
-    { name = "dinkster-values", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-values&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa" },
-    { name = "dinkster-workers", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-workers&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa" },
-]
-
-[[package]]
 name = "dinkster-schema"
 version = "0.0.1"
-source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-schema&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa#4258cb557cb684f8723c4dc0cf022b4a65e48baa" }
+source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-schema&rev=976174e850e6e04ba32d95c163836842be405938#976174e850e6e04ba32d95c163836842be405938" }
 dependencies = [
     { name = "dinkster-values" },
 ]
@@ -497,12 +462,12 @@ dependencies = [
 [[package]]
 name = "dinkster-values"
 version = "0.0.1"
-source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-values&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa#4258cb557cb684f8723c4dc0cf022b4a65e48baa" }
+source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-values&rev=976174e850e6e04ba32d95c163836842be405938#976174e850e6e04ba32d95c163836842be405938" }
 
 [[package]]
 name = "dinkster-video"
 version = "0.0.1"
-source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-video&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa#4258cb557cb684f8723c4dc0cf022b4a65e48baa" }
+source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-video&rev=976174e850e6e04ba32d95c163836842be405938#976174e850e6e04ba32d95c163836842be405938" }
 dependencies = [
     { name = "av" },
     { name = "dinkster-image-document" },
@@ -515,7 +480,7 @@ dependencies = [
 [[package]]
 name = "dinkster-workers"
 version = "0.0.1"
-source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-workers&rev=4258cb557cb684f8723c4dc0cf022b4a65e48baa#4258cb557cb684f8723c4dc0cf022b4a65e48baa" }
+source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-workers&rev=976174e850e6e04ba32d95c163836842be405938#976174e850e6e04ba32d95c163836842be405938" }
 dependencies = [
     { name = "dinkster-assets" },
     { name = "dinkster-caches" },

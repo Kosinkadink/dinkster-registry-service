@@ -725,3 +725,79 @@ def test_rescan_records_new_evidence_without_changing_bytes(
             )
             == 2
         )
+
+
+def _assert_reviewed_rescan_decision(
+    database: Database,
+    database_url: str,
+    tmp_path: Path,
+    *,
+    accepted: bool,
+) -> None:
+    nested = io.BytesIO()
+    with zipfile.ZipFile(nested, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("native.so", b"\x7fELF synthetic nested executable")
+    source = _fixture_source(tmp_path, "reviewed-rescan-pack")
+    (source / "payload.bin").write_bytes(nested.getvalue())
+    service = _service(database, tmp_path)
+    candidate_id = service.submit(
+        build_registry_fixture_archive(source),
+        pack_name="reviewed-rescan-pack",
+        version="1.2.3",
+    )
+    assert service.run_once()
+    assert service.status(candidate_id).status == "review"
+    assert (
+        service.resolve_review(
+            candidate_id,
+            accepted=True,
+            actor="operator",
+            reason="initial artifact reviewed",
+        ).status
+        == "accepted"
+    )
+
+    rescan_id = service.schedule_rescan("reviewed-rescan-pack", "1.2.3")
+    assert service.run_once()
+    assert service.status(rescan_id).status == "review"
+    status = service.resolve_review(
+        rescan_id,
+        accepted=accepted,
+        actor="operator",
+        reason="rescan reviewed",
+    )
+
+    assert status.status == ("accepted" if accepted else "rejected")
+    assert status.reason == (None if accepted else "rescan reviewed")
+    assert all(finding.code != "manifest.version-conflict" for finding in status.findings)
+    with database.session() as session:
+        release = session.scalar(select(ReleaseRecord))
+        assert release is not None
+        assert release.state == ("active" if accepted else "quarantined")
+        assert release.state_reason == (None if accepted else "rescan reviewed")
+        assert session.scalar(select(func.count()).select_from(OutboxRecord)) == 1
+    with _client(database_url, tmp_path / "objects") as client:
+        response = client.get("/v1/packs/reviewed-rescan-pack")
+        assert response.status_code == (200 if accepted else 404)
+
+
+@pytest.mark.parametrize("accepted", (True, False), ids=("accept", "reject"))
+def test_postgresql_reviewed_rescan_decision_controls_release_visibility(
+    database: Database,
+    database_url: str,
+    tmp_path: Path,
+    accepted: bool,
+) -> None:
+    _assert_reviewed_rescan_decision(database, database_url, tmp_path, accepted=accepted)
+
+
+@pytest.mark.parametrize("accepted", (True, False), ids=("accept", "reject"))
+def test_sqlite_reviewed_rescan_decision_controls_release_visibility(
+    tmp_path: Path, accepted: bool
+) -> None:
+    database_url = f"sqlite:///{tmp_path / 'registry.db'}"
+    database = Database(database_url)
+    try:
+        _assert_reviewed_rescan_decision(database, database_url, tmp_path, accepted=accepted)
+    finally:
+        database.dispose()

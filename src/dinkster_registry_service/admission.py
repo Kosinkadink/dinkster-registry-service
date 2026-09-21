@@ -164,6 +164,7 @@ class AdmissionService:
         pack_name: str,
         version: str,
         submitted_by: str = "operator",
+        publisher: str | None = None,
         declared_digest: str | None = None,
         declared_size: int | None = None,
     ) -> UUID:
@@ -186,6 +187,7 @@ class AdmissionService:
                         id=candidate_id,
                         kind="upload",
                         release_id=None,
+                        publisher_id=publisher,
                         pack_name=pack_name,
                         version=version,
                         version_key=public_version_key(version),
@@ -241,7 +243,7 @@ class AdmissionService:
             ).one_or_none()
             if row is None:
                 raise AdmissionError("rescan requires an active release")
-            release, _, artifact = row
+            release, pack, artifact = row
             candidate_id = uuid7()
             now = datetime.now(UTC)
             session.add(
@@ -249,6 +251,7 @@ class AdmissionService:
                     id=candidate_id,
                     kind="rescan",
                     release_id=release.id,
+                    publisher_id=pack.publisher_id,
                     pack_name=pack_name,
                     version=version,
                     version_key=release.version_key,
@@ -438,28 +441,12 @@ class AdmissionService:
                 candidate.lease_token = None
                 candidate.lease_expires_at = None
                 if candidate.kind == "rescan" and candidate.release_id is not None:
-                    release = session.get(ReleaseRecord, candidate.release_id)
-                    if release is not None:
-                        release.state = "quarantined"
-                        release.state_reason = candidate.status_reason
-                        release.state_changed_at = now
-                        pack = session.get(PackRecord, release.pack_id)
-                        if pack is not None and pack.latest_version == release.version:
-                            alternatives = session.scalars(
-                                select(ReleaseRecord).where(
-                                    ReleaseRecord.pack_id == release.pack_id,
-                                    ReleaseRecord.id != release.id,
-                                    ReleaseRecord.state == "active",
-                                )
-                            )
-                            replacement = max(
-                                alternatives,
-                                key=lambda value: Version(value.version),
-                                default=None,
-                            )
-                            if replacement is not None:
-                                pack.latest_version = replacement.version
-                            pack.updated_at = now
+                    self._quarantine_release(
+                        session,
+                        candidate.release_id,
+                        reason=candidate.status_reason,
+                        now=now,
+                    )
                 return False
             return True
 
@@ -499,6 +486,35 @@ class AdmissionService:
             statement = statement.where(ReleaseScanRunRecord.attempt == attempt)
         return list(session.scalars(statement))
 
+    @staticmethod
+    def _quarantine_release(
+        session: Session, release_id: UUID, *, reason: str, now: datetime
+    ) -> None:
+        release = session.get(ReleaseRecord, release_id, with_for_update=True)
+        if release is None:
+            return
+        release.state = "quarantined"
+        release.state_reason = reason
+        release.state_changed_at = now
+        pack = session.get(PackRecord, release.pack_id)
+        if pack is None or pack.latest_version != release.version:
+            return
+        alternatives = session.scalars(
+            select(ReleaseRecord).where(
+                ReleaseRecord.pack_id == release.pack_id,
+                ReleaseRecord.id != release.id,
+                ReleaseRecord.state == "active",
+            )
+        )
+        replacement = max(
+            alternatives,
+            key=lambda value: Version(value.version),
+            default=None,
+        )
+        if replacement is not None:
+            pack.latest_version = replacement.version
+        pack.updated_at = now
+
     def _record_promotion_conflict(self, claim: CandidateClaim, message: str) -> None:
         self._record_stage(
             claim,
@@ -512,17 +528,25 @@ class AdmissionService:
         try:
             with self.database.session() as session, session.begin():
                 candidate = self._leased_candidate(session, claim)
-                session.execute(
-                    text("SELECT pg_advisory_xact_lock(hashtext(:pack_name))"),
-                    {"pack_name": candidate.pack_name},
-                )
-                session.execute(text("LOCK TABLE namespace_grants IN SHARE ROW EXCLUSIVE MODE"))
+                if self.database.is_postgresql:
+                    session.execute(
+                        text("SELECT pg_advisory_xact_lock(hashtext(:pack_name))"),
+                        {"pack_name": candidate.pack_name},
+                    )
+                    session.execute(text("LOCK TABLE namespace_grants IN SHARE ROW EXCLUSIVE MODE"))
                 pack = session.scalar(
                     select(PackRecord)
                     .where(PackRecord.name == candidate.pack_name)
                     .with_for_update()
                 )
                 if pack is not None:
+                    if (
+                        candidate.publisher_id is not None
+                        and pack.publisher_id != candidate.publisher_id
+                    ):
+                        raise PromotionConflict(
+                            f"pack {candidate.pack_name!r} belongs to another publisher"
+                        )
                     conflict = session.scalar(
                         select(ReleaseRecord.id).where(
                             ReleaseRecord.pack_id == pack.id,
@@ -547,13 +571,14 @@ class AdmissionService:
                     pack = PackRecord(
                         id=pack_id,
                         name=candidate.pack_name,
+                        publisher_id=candidate.publisher_id,
                         display_name=candidate.pack_name.replace("-", " ").title(),
                         description=f"Dinkster pack {candidate.pack_name}.",
                         long_description="",
-                        owner_type="user",
+                        owner_type="org" if candidate.publisher_id is not None else "user",
                         owner_id=owner_id,
-                        owner_slug="operator",
-                        owner_display_name="Registry Operator",
+                        owner_slug=candidate.publisher_id or "operator",
+                        owner_display_name=(candidate.publisher_id or "Registry Operator"),
                         visibility="public",
                         homepage=None,
                         repository=cast("str | None", manifest.get("repository")),
@@ -578,10 +603,14 @@ class AdmissionService:
                             NamespaceGrantRecord(
                                 claim=claim_name,
                                 pack_id=pack.id,
+                                publisher_id=candidate.publisher_id,
                                 owner_id=pack.owner_id,
                             )
                         )
-                    elif grant.pack_id != pack.id:
+                    elif grant.pack_id != pack.id or (
+                        candidate.publisher_id is not None
+                        and grant.publisher_id != candidate.publisher_id
+                    ):
                         raise PromotionConflict(f"namespace claim {claim_name!r} is unavailable")
 
                 final_key = artifact_object_key(candidate.declared_digest)
@@ -976,6 +1005,66 @@ class AdmissionService:
                 continue
             if not worked:
                 time.sleep(poll_seconds)
+
+    def resolve_review(
+        self, candidate_id: UUID, *, accepted: bool, actor: str, reason: str
+    ) -> CandidateStatus:
+        if not actor or not reason:
+            raise AdmissionError("review resolution requires an actor and reason")
+        claim: CandidateClaim | None = None
+        with self.database.session() as session, session.begin():
+            candidate = session.get(ReleaseCandidateRecord, candidate_id, with_for_update=True)
+            if candidate is None:
+                raise AdmissionError(f"candidate {candidate_id} was not found")
+            if candidate.status != "review":
+                raise AdmissionError("only a candidate awaiting review can be resolved")
+            now = datetime.now(UTC)
+            session.add(
+                AuditEventRecord(
+                    id=uuid7(),
+                    created_at=now,
+                    event_type=(
+                        "release_candidate.review_accepted"
+                        if accepted
+                        else "release_candidate.review_rejected"
+                    ),
+                    subject_type="release_candidate",
+                    subject_id=str(candidate.id),
+                    data={"actor": actor, "reason": reason},
+                )
+            )
+            if not accepted:
+                candidate.status = "rejected"
+                candidate.status_reason = reason
+                if candidate.kind == "rescan" and candidate.release_id is not None:
+                    self._quarantine_release(session, candidate.release_id, reason=reason, now=now)
+            elif candidate.kind == "rescan":
+                candidate.status = "accepted"
+                candidate.status_reason = None
+            else:
+                token = uuid7()
+                candidate.status = "scanning"
+                candidate.status_reason = None
+                candidate.lease_owner = actor
+                candidate.lease_token = token
+                candidate.lease_version += 1
+                candidate.lease_expires_at = now + timedelta(seconds=self.lease_seconds)
+                claim = CandidateClaim(
+                    id=candidate.id,
+                    kind=candidate.kind,
+                    release_id=candidate.release_id,
+                    pack_name=candidate.pack_name,
+                    version=candidate.version,
+                    declared_digest=candidate.declared_digest,
+                    declared_size=candidate.declared_size,
+                    object_key=candidate.object_key,
+                    lease_token=token,
+                    attempt=candidate.attempt_count,
+                )
+        if claim is not None:
+            data = self.object_store.read(claim.object_key, max_size=MAX_ARTIFACT_SIZE)
+            self._prepare_promotion(claim, data)
+        return self.status(candidate_id)
 
     def status(self, candidate_id: UUID) -> CandidateStatus:
         with self.database.session() as session:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any, cast
 from uuid import UUID
 
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -414,6 +415,131 @@ class CatalogRepository:
                         for node in self._nodes(session, release.id)
                     ],
                 }
+            )
+
+    @staticmethod
+    def _template_wire(template: dict[str, Any]) -> dict[str, object]:
+        try:
+            payload: dict[str, object] = {
+                "id": cast(str, template["id"]),
+                "name": cast(str, template["name"]),
+                "digest": cast(str, template["digest"]),
+            }
+        except (KeyError, TypeError) as exc:
+            raise CatalogDataError("release template metadata is incomplete") from exc
+        for key in ("description", "family"):
+            if value := template.get(key):
+                payload[key] = cast(str, value)
+        for key in ("tags", "models", "assets"):
+            if value := template.get(key):
+                payload[key] = cast(list[str], value)
+        if thumbnail_digest := template.get("thumbnailDigest"):
+            payload["thumbnail"] = {
+                "digest": cast(str, thumbnail_digest),
+                "mediaType": cast(str, template.get("thumbnailMediaType", "")),
+            }
+        return payload
+
+    def templates(
+        self,
+        *,
+        q: str,
+        tag: str,
+        pack_filter: str,
+        limit: int,
+        cursor: str | None,
+    ) -> dict[str, object]:
+        query: dict[str, object] = {"q": q, "tag": tag, "pack": pack_filter, "limit": limit}
+        offset = 0 if cursor is None else self.cursors.verify(cursor, "templates", query)
+        with self.database.session() as session:
+            rows: list[tuple[str, dict[str, object]]] = []
+            packs = session.scalars(select(PackRecord).where(PackRecord.visibility == "public"))
+            for pack in packs:
+                if pack_filter and pack.name != pack_filter:
+                    continue
+                release = self._release(session, pack.id, pack.latest_version)
+                if release is None or release.state != "active":
+                    continue
+                templates = release.manifest.get("templates", [])
+                if not isinstance(templates, list):
+                    raise CatalogDataError("release templates must be a list")
+                for value in templates:
+                    if not isinstance(value, dict):
+                        raise CatalogDataError("release template must be an object")
+                    template = cast(dict[str, Any], value)
+                    try:
+                        template_id = cast(str, template["id"])
+                        searchable = (
+                            template_id,
+                            cast(str, template["name"]),
+                            cast(str, template.get("description", "")),
+                            *cast(list[str], template.get("tags", [])),
+                        )
+                    except (KeyError, TypeError) as exc:
+                        raise CatalogDataError("release template metadata is incomplete") from exc
+                    if tag and tag not in template.get("tags", []):
+                        continue
+                    if q and not any(q in item.casefold() for item in searchable):
+                        continue
+                    rows.append(
+                        (
+                            f"{pack.name}/{template_id}",
+                            {
+                                "pack": pack.name,
+                                "version": release.version,
+                                **self._template_wire(template),
+                            },
+                        )
+                    )
+            rows.sort(key=lambda item: item[0])
+            page = rows[offset : offset + limit]
+            next_offset = offset + len(page)
+            payload: dict[str, object] = {"templates": [row for _, row in page]}
+            if next_offset < len(rows):
+                payload["cursor"] = self.cursors.issue("templates", query, next_offset)
+            return payload
+
+    def template_asset(
+        self, name: str, version: str, template_id: str, *, thumbnail: bool = False
+    ) -> tuple[dict[str, Any], ArtifactRecord] | None:
+        with self.database.session() as session:
+            pack = self._pack(session, name)
+            if pack is None or pack.visibility != "public":
+                return None
+            release = self._release(session, pack.id, version)
+            if release is None or release.state not in {"active", "yanked"}:
+                return None
+            templates = release.manifest.get("templates", [])
+            if not isinstance(templates, list):
+                raise CatalogDataError("release templates must be a list")
+            template = next(
+                (
+                    cast(dict[str, Any], value)
+                    for value in templates
+                    if isinstance(value, dict) and value.get("id") == template_id
+                ),
+                None,
+            )
+            if template is None:
+                return None
+            path_key = "thumbnailPath" if thumbnail else "path"
+            digest_key = "thumbnailDigest" if thumbnail else "digest"
+            media_type_key = "thumbnailMediaType" if thumbnail else None
+            path = template.get(path_key)
+            digest = template.get(digest_key)
+            if not isinstance(path, str) or not path or not isinstance(digest, str) or not digest:
+                return None
+            return (
+                {
+                    "path": path,
+                    "digest": digest,
+                    "mediaType": (
+                        template.get(media_type_key, "application/octet-stream")
+                        if media_type_key
+                        else "application/json"
+                    ),
+                },
+                self._artifact(session, release.artifact_digest),
             )
 
     def providers(
