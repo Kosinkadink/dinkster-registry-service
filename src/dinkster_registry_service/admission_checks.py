@@ -239,6 +239,23 @@ def _manifest_payload(manifest: PackManifest, release: dict[str, object]) -> dic
         ],
         "repository": release.get("repository"),
         "namespaces": list(manifest.namespaces),
+        "templates": [
+            {
+                "id": template.id,
+                "name": template.name,
+                "digest": template.digest,
+                "path": template.path.as_posix(),
+                "description": template.description,
+                "tags": list(template.tags),
+                "family": template.family,
+                "models": list(template.models),
+                "assets": list(template.assets),
+                "thumbnailDigest": template.thumbnail.digest if template.thumbnail else "",
+                "thumbnailMediaType": template.thumbnail.media_type if template.thumbnail else "",
+                "thumbnailPath": template.thumbnail.path.as_posix() if template.thumbnail else "",
+            }
+            for template in manifest.templates
+        ],
     }
 
 
@@ -677,7 +694,7 @@ def run_executable_probe(
                         "schema": wire_schema,
                     }
                 )
-        probe_findings = dinkster_doctor._probe_findings(doctor_report, manifest.name)
+        probe_findings = dinkster_doctor._probe_findings(doctor_report, manifest)
         probe_findings.extend(
             dinkster_doctor._check_namespace_coverage(
                 manifest, tuple(cast("str", schema["nodeType"]) for schema in schemas)

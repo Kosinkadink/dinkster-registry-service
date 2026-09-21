@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import logging
+import zipfile
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -39,6 +42,7 @@ PUBLIC_CACHE = "public, max-age=60, stale-while-revalidate=300"
 NEGATIVE_CACHE = "public, max-age=30"
 ARTIFACT_CACHE = "public, max-age=31536000, immutable"
 NO_STORE = "no-store"
+MAX_TEMPLATE_ASSET_SIZE = 1024 * 1024
 
 
 class RequestModel(BaseModel):
@@ -73,6 +77,14 @@ class ProvidersQuery(RequestModel):
 
 class BlocksQuery(RequestModel):
     since: str | None = Field(default=None, min_length=1, max_length=4096)
+
+
+class TemplatesQuery(RequestModel):
+    q: str = Field(default="", max_length=200)
+    tag: str = Field(default="", max_length=128)
+    pack: str = Field(default="", max_length=64)
+    limit: int = Field(default=50, ge=1, le=200)
+    cursor: str | None = Field(default=None, min_length=1, max_length=4096)
 
 
 class ReviewRequest(RequestModel):
@@ -602,6 +614,94 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             payload,
             cache_control=PUBLIC_CACHE,
             etag_context={"endpoint": "schemas", "name": name, "version": version},
+        )
+
+    @app.get("/index/templates")
+    def templates(request: Request) -> Response:
+        query = _query(request, TemplatesQuery)
+        try:
+            payload = repository.templates(
+                q=query.q.strip().casefold(),
+                tag=query.tag,
+                pack_filter=query.pack,
+                limit=query.limit,
+                cursor=query.cursor,
+            )
+        except CursorError as exc:
+            raise ProtocolError(400, "invalid_request", str(exc)) from exc
+        return _json_response(
+            request,
+            payload,
+            cache_control=PUBLIC_CACHE,
+            etag_context={"endpoint": "templates", "query": query.model_dump(by_alias=True)},
+        )
+
+    def template_asset_response(
+        request: Request,
+        canonical_name: str,
+        canonical_version: str,
+        template_id: str,
+        *,
+        thumbnail: bool,
+    ) -> Response:
+        _query(request, EmptyQuery)
+        name = _pack_name(canonical_name)
+        version = _version(canonical_version)
+        result = repository.template_asset(name, version, template_id, thumbnail=thumbnail)
+        if result is None:
+            raise _not_found(
+                "The requested release template asset was not found.",
+                packName=name,
+                version=version,
+                templateId=template_id,
+            )
+        template, artifact = result
+        try:
+            archive_bytes = b"".join(
+                object_store.open(
+                    artifact.object_key,
+                    expected_size=artifact.size,
+                    expected_digest=artifact.digest,
+                )
+            )
+            with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+                member = archive.getinfo(template["path"])
+                if member.file_size > MAX_TEMPLATE_ASSET_SIZE:
+                    raise ObjectStoreError("template asset exceeds its size limit")
+                data = archive.read(member)
+        except FileNotFoundError as exc:
+            raise ProtocolError(
+                500, "internal", "The artifact is not currently available."
+            ) from exc
+        except (KeyError, OSError, zipfile.BadZipFile, ObjectStoreError) as exc:
+            raise ProtocolError(500, "internal", "The template artifact is invalid.") from exc
+        digest = "sha256:" + hashlib.sha256(data).hexdigest()
+        if digest != template["digest"]:
+            raise ProtocolError(
+                500, "internal", "The template asset failed integrity verification."
+            )
+        etag = f'"{digest}"'
+        headers = {"Cache-Control": ARTIFACT_CACHE, "ETag": etag}
+        if _etag_matches(request.headers.get("if-none-match", ""), etag):
+            return Response(status_code=304, headers=headers)
+        return Response(content=data, media_type=str(template["mediaType"]), headers=headers)
+
+    @app.get("/index/packs/{canonical_name}/versions/{canonical_version}/templates/{template_id}")
+    def template_document(
+        request: Request, canonical_name: str, canonical_version: str, template_id: str
+    ) -> Response:
+        return template_asset_response(
+            request, canonical_name, canonical_version, template_id, thumbnail=False
+        )
+
+    @app.get(
+        "/index/packs/{canonical_name}/versions/{canonical_version}/templates/{template_id}/thumbnail"
+    )
+    def template_thumbnail(
+        request: Request, canonical_name: str, canonical_version: str, template_id: str
+    ) -> Response:
+        return template_asset_response(
+            request, canonical_name, canonical_version, template_id, thumbnail=True
         )
 
     @app.get("/v1/nodes/{node_type}/providers")
