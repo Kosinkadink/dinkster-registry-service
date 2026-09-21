@@ -441,28 +441,12 @@ class AdmissionService:
                 candidate.lease_token = None
                 candidate.lease_expires_at = None
                 if candidate.kind == "rescan" and candidate.release_id is not None:
-                    release = session.get(ReleaseRecord, candidate.release_id)
-                    if release is not None:
-                        release.state = "quarantined"
-                        release.state_reason = candidate.status_reason
-                        release.state_changed_at = now
-                        pack = session.get(PackRecord, release.pack_id)
-                        if pack is not None and pack.latest_version == release.version:
-                            alternatives = session.scalars(
-                                select(ReleaseRecord).where(
-                                    ReleaseRecord.pack_id == release.pack_id,
-                                    ReleaseRecord.id != release.id,
-                                    ReleaseRecord.state == "active",
-                                )
-                            )
-                            replacement = max(
-                                alternatives,
-                                key=lambda value: Version(value.version),
-                                default=None,
-                            )
-                            if replacement is not None:
-                                pack.latest_version = replacement.version
-                            pack.updated_at = now
+                    self._quarantine_release(
+                        session,
+                        candidate.release_id,
+                        reason=candidate.status_reason,
+                        now=now,
+                    )
                 return False
             return True
 
@@ -501,6 +485,35 @@ class AdmissionService:
         if attempt is not None:
             statement = statement.where(ReleaseScanRunRecord.attempt == attempt)
         return list(session.scalars(statement))
+
+    @staticmethod
+    def _quarantine_release(
+        session: Session, release_id: UUID, *, reason: str, now: datetime
+    ) -> None:
+        release = session.get(ReleaseRecord, release_id, with_for_update=True)
+        if release is None:
+            return
+        release.state = "quarantined"
+        release.state_reason = reason
+        release.state_changed_at = now
+        pack = session.get(PackRecord, release.pack_id)
+        if pack is None or pack.latest_version != release.version:
+            return
+        alternatives = session.scalars(
+            select(ReleaseRecord).where(
+                ReleaseRecord.pack_id == release.pack_id,
+                ReleaseRecord.id != release.id,
+                ReleaseRecord.state == "active",
+            )
+        )
+        replacement = max(
+            alternatives,
+            key=lambda value: Version(value.version),
+            default=None,
+        )
+        if replacement is not None:
+            pack.latest_version = replacement.version
+        pack.updated_at = now
 
     def _record_promotion_conflict(self, claim: CandidateClaim, message: str) -> None:
         self._record_stage(
@@ -1023,6 +1036,11 @@ class AdmissionService:
             if not accepted:
                 candidate.status = "rejected"
                 candidate.status_reason = reason
+                if candidate.kind == "rescan" and candidate.release_id is not None:
+                    self._quarantine_release(session, candidate.release_id, reason=reason, now=now)
+            elif candidate.kind == "rescan":
+                candidate.status = "accepted"
+                candidate.status_reason = None
             else:
                 token = uuid7()
                 candidate.status = "scanning"
