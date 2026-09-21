@@ -23,8 +23,11 @@ from sqlalchemy import (
     create_engine,
     event,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+
+JSON_STORAGE = JSON().with_variant(JSONB(), "postgresql")
 
 
 class Base(DeclarativeBase):
@@ -119,12 +122,12 @@ class PackRecord(Base):
     homepage: Mapped[str | None] = mapped_column(Text, nullable=True)
     repository: Mapped[str | None] = mapped_column(Text, nullable=True)
     support: Mapped[str | None] = mapped_column(Text, nullable=True)
-    tags: Mapped[list[str]] = mapped_column(JSON)
+    tags: Mapped[list[str]] = mapped_column(JSON_STORAGE)
     latest_version: Mapped[str] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     download_count: Mapped[int] = mapped_column(BigInteger)
-    pack_notice: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    pack_notice: Mapped[dict[str, Any] | None] = mapped_column(JSON_STORAGE, nullable=True)
 
 
 class NamespaceGrantRecord(Base):
@@ -185,7 +188,7 @@ class ReleaseRecord(Base):
     artifact_digest: Mapped[str] = mapped_column(
         String(71), ForeignKey("artifacts.digest", ondelete="RESTRICT")
     )
-    manifest: Mapped[dict[str, Any]] = mapped_column(JSON)
+    manifest: Mapped[dict[str, Any]] = mapped_column(JSON_STORAGE)
     next_scan_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
@@ -208,7 +211,7 @@ class ReleaseNodeRecord(Base):
     schema_wire_version: Mapped[int] = mapped_column(Integer)
     schema_signature: Mapped[str] = mapped_column(String(512))
     role: Mapped[str] = mapped_column(String(16))
-    schema: Mapped[dict[str, Any]] = mapped_column(JSON)
+    schema: Mapped[dict[str, Any]] = mapped_column(JSON_STORAGE)
 
 
 class ReleaseScanRunRecord(Base):
@@ -242,11 +245,11 @@ class ReleaseScanRunRecord(Base):
     stage: Mapped[str] = mapped_column(String(32), default="catalog_seed")
     attempt: Mapped[int] = mapped_column(Integer, default=1)
     policy_version: Mapped[str] = mapped_column(String(128), default="registry-scan/1")
-    operator_details: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    doctor: Mapped[dict[str, Any]] = mapped_column(JSON)
-    scan: Mapped[dict[str, Any]] = mapped_column(JSON)
-    provenance: Mapped[dict[str, Any]] = mapped_column(JSON)
-    vulnerabilities: Mapped[dict[str, Any]] = mapped_column(JSON)
+    operator_details: Mapped[dict[str, Any] | None] = mapped_column(JSON_STORAGE, nullable=True)
+    doctor: Mapped[dict[str, Any]] = mapped_column(JSON_STORAGE)
+    scan: Mapped[dict[str, Any]] = mapped_column(JSON_STORAGE)
+    provenance: Mapped[dict[str, Any]] = mapped_column(JSON_STORAGE)
+    vulnerabilities: Mapped[dict[str, Any]] = mapped_column(JSON_STORAGE)
 
 
 class ReleaseFindingRecord(Base):
@@ -317,10 +320,10 @@ class ReleaseCandidateRecord(Base):
         DateTime(timezone=True), nullable=True
     )
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
-    manifest: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    schemas: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
-    doctor: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    scan: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    manifest: Mapped[dict[str, Any] | None] = mapped_column(JSON_STORAGE, nullable=True)
+    schemas: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON_STORAGE, nullable=True)
+    doctor: Mapped[dict[str, Any] | None] = mapped_column(JSON_STORAGE, nullable=True)
+    scan: Mapped[dict[str, Any] | None] = mapped_column(JSON_STORAGE, nullable=True)
 
 
 class ReleaseDependencyRecord(Base):
@@ -343,7 +346,7 @@ class AuditEventRecord(Base):
     event_type: Mapped[str] = mapped_column(String(128))
     subject_type: Mapped[str] = mapped_column(String(64))
     subject_id: Mapped[str] = mapped_column(String(128))
-    data: Mapped[dict[str, Any]] = mapped_column(JSON)
+    data: Mapped[dict[str, Any]] = mapped_column(JSON_STORAGE)
 
 
 class OutboxRecord(Base):
@@ -359,7 +362,7 @@ class OutboxRecord(Base):
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     topic: Mapped[str] = mapped_column(String(128))
     event_key: Mapped[str] = mapped_column(String(128), unique=True)
-    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON_STORAGE)
     state: Mapped[str] = mapped_column(String(16))
     attempts: Mapped[int] = mapped_column(Integer)
 
@@ -395,7 +398,7 @@ class ReleaseCloudEvaluationRecord(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     registry_eligible: Mapped[bool] = mapped_column(Boolean)
-    reason_codes: Mapped[list[str]] = mapped_column(JSON)
+    reason_codes: Mapped[list[str]] = mapped_column(JSON_STORAGE)
     policy_version: Mapped[str] = mapped_column(String(128))
 
 
