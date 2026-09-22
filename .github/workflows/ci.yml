@@ -8,6 +8,7 @@ on:
 jobs:
   checks:
     runs-on: ${{ fromJSON(vars.CI_RUNNERS).linux }}
+    timeout-minutes: 10
     services:
       postgres:
         image: postgres:16-alpine
@@ -50,6 +51,7 @@ jobs:
 
   conformance:
     runs-on: ${{ fromJSON(vars.CI_RUNNERS).linux }}
+    timeout-minutes: 10
     env:
       DINKSTER_OBJECT_STORE_ROOT: .data/conformance-objects
       DINKSTER_PUBLIC_BASE_URL: http://127.0.0.1:8000
@@ -122,6 +124,7 @@ jobs:
 
   container:
     runs-on: ${{ fromJSON(vars.CI_RUNNERS).linux }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - name: Build container

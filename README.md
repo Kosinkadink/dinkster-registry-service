@@ -14,8 +14,9 @@ submissions and operator review decisions. Pending, rejected, and
 operator-review candidates are never visible through public catalog routes.
 
 Pull requests and main pushes run checks, HTTP conformance, and container
-validation in GitHub Actions. The required `CI_RUNNERS` repository variable
-routes all three CPU-only jobs to the repository's one temporary X570 runner:
+validation in GitHub Actions. Each job has a 10-minute bound. The required
+`CI_RUNNERS` repository variable routes all three CPU-only jobs to the
+repository's one temporary X570 runner:
 
 ```json
 {"linux":["self-hosted","linux","x64"],"windows":["windows-latest"],"macos":["macos-latest"],"forkLinux":["ubuntu-latest"]}
