@@ -13,6 +13,16 @@ to immutable artifact storage. Bearer-authenticated HTTP routes accept publisher
 submissions and operator review decisions. Pending, rejected, and
 operator-review candidates are never visible through public catalog routes.
 
+Pull requests and main pushes run checks, HTTP conformance, and container
+validation in GitHub Actions. The required `CI_RUNNERS` repository variable
+routes all three CPU-only jobs to the repository's one temporary X570 runner:
+
+```json
+{"linux":["self-hosted","linux","x64"],"windows":["windows-latest"],"macos":["macos-latest"],"forkLinux":["ubuntu-latest"]}
+```
+
+The runner has no `gpu` label, and the workflows do not run GPU validation.
+
 ## Self-host with SQLite
 
 One data directory can hold both SQLite metadata and artifact objects. The

@@ -7,7 +7,7 @@ on:
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNERS).linux }}
     env:
       TEST_POSTGRES_URL: postgresql+psycopg://postgres:postgres@localhost:5432/dinkster_test
     services:
@@ -49,7 +49,7 @@ jobs:
       - run: uv build
 
   conformance:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNERS).linux }}
     env:
       DINKSTER_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/dinkster_conformance
       DINKSTER_OBJECT_STORE_ROOT: .data/conformance-objects
@@ -120,7 +120,7 @@ jobs:
           uv run python conformance/run.py http://127.0.0.1:8000
 
   container:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNERS).linux }}
     steps:
       - uses: actions/checkout@v7
       - name: Build container
