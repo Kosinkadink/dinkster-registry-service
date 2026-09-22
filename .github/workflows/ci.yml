@@ -9,7 +9,7 @@ jobs:
   checks:
     runs-on: ${{ fromJSON(vars.CI_RUNNERS).linux }}
     env:
-      TEST_POSTGRES_URL: postgresql+psycopg://postgres:postgres@localhost:5432/dinkster_test
+      TEST_POSTGRES_URL: postgresql+psycopg://postgres:postgres@localhost:${{ job.services.postgres.ports[5432] }}/dinkster_test
     services:
       postgres:
         image: postgres:16-alpine
@@ -17,7 +17,7 @@ jobs:
           POSTGRES_DB: dinkster_test
           POSTGRES_PASSWORD: postgres
         ports:
-          - 5432:5432
+          - 5432
         options: >-
           --health-cmd "pg_isready -U postgres -d dinkster_test"
           --health-interval 5s
@@ -51,7 +51,7 @@ jobs:
   conformance:
     runs-on: ${{ fromJSON(vars.CI_RUNNERS).linux }}
     env:
-      DINKSTER_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/dinkster_conformance
+      DINKSTER_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:${{ job.services.postgres.ports[5432] }}/dinkster_conformance
       DINKSTER_OBJECT_STORE_ROOT: .data/conformance-objects
       DINKSTER_PUBLIC_BASE_URL: http://127.0.0.1:8000
       DINKSTER_CURSOR_SECRET: conformance-cursor-secret-at-least-32-bytes
@@ -62,7 +62,7 @@ jobs:
           POSTGRES_DB: dinkster_conformance
           POSTGRES_PASSWORD: postgres
         ports:
-          - 5432:5432
+          - 5432
         options: >-
           --health-cmd "pg_isready -U postgres -d dinkster_conformance"
           --health-interval 5s
