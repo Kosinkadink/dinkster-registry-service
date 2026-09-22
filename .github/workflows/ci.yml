@@ -8,8 +8,6 @@ on:
 jobs:
   checks:
     runs-on: ${{ fromJSON(vars.CI_RUNNERS).linux }}
-    env:
-      TEST_POSTGRES_URL: postgresql+psycopg://postgres:postgres@localhost:${{ job.services.postgres.ports[5432] }}/dinkster_test
     services:
       postgres:
         image: postgres:16-alpine
@@ -46,12 +44,13 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run mypy src tests
       - run: uv run pytest -q
+        env:
+          TEST_POSTGRES_URL: postgresql+psycopg://postgres:postgres@localhost:${{ job.services.postgres.ports[5432] }}/dinkster_test
       - run: uv build
 
   conformance:
     runs-on: ${{ fromJSON(vars.CI_RUNNERS).linux }}
     env:
-      DINKSTER_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:${{ job.services.postgres.ports[5432] }}/dinkster_conformance
       DINKSTER_OBJECT_STORE_ROOT: .data/conformance-objects
       DINKSTER_PUBLIC_BASE_URL: http://127.0.0.1:8000
       DINKSTER_CURSOR_SECRET: conformance-cursor-secret-at-least-32-bytes
@@ -88,6 +87,8 @@ jobs:
           test -z "$(git config --global --get-regexp '^url\.' || true)"
           echo "global_url_rewrites=none"
       - name: Run HTTP conformance suite
+        env:
+          DINKSTER_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:${{ job.services.postgres.ports[5432] }}/dinkster_conformance
         run: |
           uv run alembic upgrade head
           uv run dinkster-registry seed
