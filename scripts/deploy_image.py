@@ -29,7 +29,11 @@ def main() -> int:
                 ["fly", "machine", "list", "--app", args.app, "--json"], text=True
             )
         )
-        images = {machine["config"]["image"] for machine in machines}
+        images = {
+            machine["config"]["image"]
+            for machine in machines
+            if machine["config"].get("metadata", {}).get("fly_platform_version") == "v2"
+        }
         if len(images) != 1:
             raise RuntimeError(
                 "Need one previously deployed image; bootstrap or reconcile the app first"

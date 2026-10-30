@@ -18,7 +18,9 @@ args = sys.argv[1:]
 state_path = pathlib.Path(os.environ["FLY_TEST_STATE"])
 state = json.loads(state_path.read_text())
 if args[:2] == ["machine", "list"]:
-    print(json.dumps([{"config": {"image": state["image"]}}] if state["image"] else []))
+    managed = {"image": state["image"], "metadata": {"fly_platform_version": "v2"}}
+    unmanaged = {"image": "old-backup-image", "metadata": {}}
+    print(json.dumps([{"config": c} for c in [managed, unmanaged]]))
 elif args[:2] == ["config", "save"]:
     pathlib.Path(args[args.index("--config") + 1]).write_text(state["config"])
 elif args[0] == "deploy":
