@@ -24,7 +24,7 @@ jobs:
     if: >-
       github.event_name == 'push' && github.ref == 'refs/heads/main' &&
       vars.FLY_DEPLOY_ENABLED == 'true'
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: production
     env:
@@ -38,7 +38,6 @@ jobs:
           persist-credentials: false
       - name: Validate production prerequisites
         run: |
-          test "$(hostname | tr '[:upper:]' '[:lower:]')" = kosin-x570-aorus-ultra
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test -n "$FLY_API_TOKEN"
           case "$FLY_REGION" in iad|sjc) ;; *) exit 1 ;; esac
@@ -50,7 +49,7 @@ jobs:
       - uses: superfly/flyctl-actions/setup-flyctl@98172f70657cb3e15db199af139be99bd3e61200
         with:
           version: 0.3.234
-      - name: Build the pushed commit on X570 and push its image
+      - name: Build the pushed commit and push its image
         env:
           DINKSTER_REPO_TOKEN: ${{ secrets.DINKSTER_REPO_TOKEN }}
         run: |

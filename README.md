@@ -15,14 +15,14 @@ operator-review candidates are never visible through public catalog routes.
 
 Pull requests and main pushes run checks, HTTP conformance, and container
 validation in GitHub Actions. Each job has a 10-minute bound. The required
-`CI_RUNNERS` repository variable routes all three CPU-only jobs to the
-repository's one temporary X570 runner:
+`CI_RUNNERS` repository variable routes all three CPU-only jobs. Hosted Actions
+billing is enabled; the hosted Linux configuration is:
 
 ```json
-{"linux":["self-hosted","linux","x64"],"windows":["windows-latest"],"macos":["macos-latest"],"forkLinux":["ubuntu-latest"]}
+{"linux":["ubuntu-latest"],"windows":["windows-latest"],"macos":["macos-latest"],"forkLinux":["ubuntu-latest"]}
 ```
 
-The runner has no `gpu` label, and the workflows do not run GPU validation.
+The workflows do not require a self-hosted runner or GPU.
 
 ## Fly foundations preparation
 
@@ -40,9 +40,9 @@ prepares two shared-cpu-1x 512 MB instances with TLS and health checks, but
 creates no resource. Inject `DINKSTER_DATABASE_URL`, `DINKSTER_CURSOR_SECRET`
 and storage credentials through environment secrets, never the image.
 
-The [CI workflow](https://github.com/Kosinkadink/dinkster-registry/actions/workflows/ci.yml)
+The [CI workflow](https://github.com/Kosinkadink/dinkster-registry-service/actions/workflows/ci.yml)
 calls the repository-local reusable workflow after all checks pass on main.
-It builds the exact pushed commit on X570, pushes an immutable image digest,
+It builds the exact pushed commit on GitHub-hosted Ubuntu, pushes an immutable image digest,
 then runs `fly deploy --image`. Set `FLY_REGION` to the approved `iad` or `sjc`,
 and leave `FLY_DEPLOY_ENABLED` unset until storage, database and owner prerequisites
 are complete. Production secrets supply `FLY_API_TOKEN` and the private build
@@ -52,8 +52,8 @@ The deploy helper saves the previous image and Fly configuration. On failure
 it restores both, skips release commands, and remains failed. Bootstrap has
 no previous release and must be supervised separately. Migrate independently
 with code compatible with rollback; image rollback cannot undo schema, data
-or secret changes. The owner performs the repository rename separately; the
-Fly application stays `dinkster-registry` after that rename.
+or secret changes. The repository is named `dinkster-registry-service`; the
+Fly application remains `dinkster-registry`.
 
 ## Self-host with SQLite
 
