@@ -26,7 +26,7 @@ def main() -> int:
         previous_config = Path(directory) / "fly.toml"
         machines = json.loads(
             subprocess.check_output(
-                ["fly", "machine", "list", "--app", args.app, "--json"], text=True
+                ["flyctl", "machine", "list", "--app", args.app, "--json"], text=True
             )
         )
         images = {
@@ -42,13 +42,22 @@ def main() -> int:
         if not previous_image:
             raise RuntimeError("Previous image is missing; refusing deployment without rollback")
         subprocess.run(
-            ["fly", "config", "save", "--app", args.app, "--config", str(previous_config), "--yes"],
+            [
+                "flyctl",
+                "config",
+                "save",
+                "--app",
+                args.app,
+                "--config",
+                str(previous_config),
+                "--yes",
+            ],
             check=True,
             stdout=subprocess.DEVNULL,
         )
         os.chmod(previous_config, 0o600)
         common = [
-            "fly",
+            "flyctl",
             "deploy",
             "--app",
             args.app,

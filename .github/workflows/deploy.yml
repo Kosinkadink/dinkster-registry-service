@@ -53,7 +53,7 @@ jobs:
         env:
           DINKSTER_REPO_TOKEN: ${{ secrets.DINKSTER_REPO_TOKEN }}
         run: |
-          fly auth docker
+          flyctl auth docker
           image="registry.fly.io/${FLY_APP}:${GITHUB_SHA}"
           DOCKER_BUILDKIT=1 docker build \
             --secret id=dinkster_repo_token,env=DINKSTER_REPO_TOKEN \

@@ -41,7 +41,7 @@ else:
 def test_deployment_keeps_the_new_release_or_restores_the_last_healthy_config(
     tmp_path: Path, failed_health: bool, failed_rollback: bool
 ) -> None:
-    fly = tmp_path / "fly"
+    fly = tmp_path / "flyctl"
     fly.write_text(FLY)
     fly.chmod(0o700)
     state = tmp_path / "state.json"
