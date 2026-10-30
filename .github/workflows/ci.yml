@@ -46,7 +46,7 @@ jobs:
       - run: uv run mypy src tests
       - run: uv run pytest -q
         env:
-          TEST_POSTGRES_URL: postgresql+psycopg://postgres:postgres@localhost:${{ job.services.postgres.ports[5432] }}/dinkster_test
+          TEST_POSTGRES_URL: postgresql+psycopg://postgres:postgres@localhost:${{ job.services.postgres.ports['5432'] }}/dinkster_test
       - run: uv build
 
   conformance:
@@ -90,14 +90,14 @@ jobs:
           echo "global_url_rewrites=none"
       - name: Run HTTP conformance suite
         env:
-          DINKSTER_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:${{ job.services.postgres.ports[5432] }}/dinkster_conformance
+          DINKSTER_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:${{ job.services.postgres.ports['5432'] }}/dinkster_conformance
         run: |
           uv run alembic upgrade head
           uv run dinkster-registry seed
           uv run dinkster-registry serve --host 127.0.0.1 --port 8000 &
           server_pid=$!
           trap 'kill "$server_pid"' EXIT
-          for attempt in $(seq 1 30); do
+          for _attempt in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:8000/v1/health >/dev/null; then
               break
             fi
@@ -114,7 +114,7 @@ jobs:
           uv run dinkster-registry serve --host 127.0.0.1 --port 8000 &
           server_pid=$!
           trap 'kill "$server_pid"' EXIT
-          for attempt in $(seq 1 30); do
+          for _attempt in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:8000/v1/health >/dev/null; then
               break
             fi
@@ -163,7 +163,7 @@ jobs:
             --env POSTGRES_PASSWORD=postgres \
             postgres:16-alpine
           trap 'docker rm --force dinkster-registry-test dinkster-registry-postgres >/dev/null 2>&1 || true; docker network rm dinkster-registry-test >/dev/null 2>&1 || true' EXIT
-          for attempt in $(seq 1 30); do
+          for _attempt in $(seq 1 30); do
             if docker exec dinkster-registry-postgres pg_isready -U postgres -d dinkster_registry; then
               break
             fi
@@ -176,10 +176,18 @@ jobs:
             --env DINKSTER_CURSOR_SECRET=container-conformance-secret-at-least-32-bytes \
             dinkster-registry:test \
             /app/scripts/start-dev.sh
-          for attempt in $(seq 1 30); do
+          for _attempt in $(seq 1 30); do
             if docker exec dinkster-registry-test python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/health', timeout=2)"; then
               break
             fi
             sleep 1
           done
           docker exec dinkster-registry-test python conformance/run.py http://127.0.0.1:8000
+
+  deploy:
+    needs: [checks, conformance, container]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.FLY_DEPLOY_ENABLED == 'true'
+    uses: ./.github/workflows/deploy.yml
+    with:
+      app: dinkster-registry
+    secrets: inherit

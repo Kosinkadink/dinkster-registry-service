@@ -12,9 +12,11 @@ COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
 RUN --mount=type=secret,id=dinkster_repo_token \
     token="$(cat /run/secrets/dinkster_repo_token)" \
-    && git config --global url."https://x-access-token:${token}@github.com/".insteadOf "https://github.com/" \
-    && uv sync --frozen --no-dev --no-editable \
-    && rm -rf /root/.cache/uv /root/.gitconfig
+    && GIT_CONFIG_COUNT=1 \
+       GIT_CONFIG_KEY_0="url.https://x-access-token:${token}@github.com/.insteadOf" \
+       GIT_CONFIG_VALUE_0="https://github.com/" \
+       uv sync --frozen --no-dev --no-editable \
+    && rm -rf /root/.cache/uv
 
 FROM python:3.12-slim AS runtime
 
@@ -41,4 +43,4 @@ ENV PATH="/app/.venv/bin:${PATH}" \
 USER dinkster
 EXPOSE 8000
 VOLUME ["/data"]
-CMD ["dinkster-registry", "serve", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["dinkster-registry", "serve", "--host", "::", "--port", "8000"]
