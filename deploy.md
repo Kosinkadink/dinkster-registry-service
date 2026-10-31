@@ -69,6 +69,14 @@ registry, and resolves an immutable `registry.fly.io/dinkster-registry@sha256:..
 digest. No repository credential is supplied to the build. Registry Docker
 credentials use a private per-run directory that is removed afterward.
 
+Before image push, migration or deployment, the workflow reads only
+`flyctl secrets list --json` metadata for the existing app. It prints required
+names and known deployment-status labels, not values, digests or raw JSON.
+Missing database, cursor or any S3 secret name stops the job. Staged secrets
+are allowed for the first real deployment; absent or unrecognized status is
+reported as `Unknown`. Presence alone does not prove credential validity or
+cursor entropy: normal production startup and live acceptance still apply.
+
 `scripts/migrate_image.py --image <digest>` reads the approved cluster inventory
 and short-lived `fly-user` credentials through the authenticated MPG API. It
 opens a bounded loopback-only MPG proxy and runs Alembic from that exact image

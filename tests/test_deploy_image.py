@@ -28,6 +28,9 @@ if args[:2] == ["machine", "list"]:
     if not state.get("bootstrap", False):
         machines.append({"id": "unmanaged", "config": unmanaged})
     print(json.dumps(machines))
+elif args[:2] == ["secrets", "list"]:
+    print(json.dumps(state["secrets"]))
+    sys.exit(state.get("inventory_exit", 0))
 elif args[:2] == ["config", "save"]:
     pathlib.Path(args[args.index("--config") + 1]).write_text(state["config"])
 elif args[:2] == ["machine", "destroy"]:
@@ -219,3 +222,62 @@ def test_workflow_rollback_drill_requires_failed_health_and_successful_restorati
         assert summary.read_text() == (
             "Deliberate failed-health deployment restored the healthy immutable release.\n"
         )
+
+
+@pytest.mark.parametrize("missing", ("", "DINKSTER_CURSOR_SECRET", "S3_SECRET_ACCESS_KEY", "api"))
+def test_workflow_secret_inventory_requires_names_and_never_prints_raw_metadata(
+    tmp_path: Path, missing: str
+) -> None:
+    root = DEPLOY.parents[1]
+    workflow = (root / ".github/workflows/deploy.yml").read_text()
+    step = workflow.split(
+        "      - name: Verify required Fly secret names without reading values\n", 1
+    )[1].split("      - name: Build the exact pushed commit and push its image\n", 1)[0]
+    script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+    names = (
+        "DINKSTER_DATABASE_URL",
+        "DINKSTER_CURSOR_SECRET",
+        "S3_ENDPOINT_URL",
+        "S3_BUCKET",
+        "S3_ACCESS_KEY_ID",
+        "S3_SECRET_ACCESS_KEY",
+        "S3_REGION",
+    )
+    entries = [
+        {"name": name, "digest": "unprinted-fixture-digest", "status": "Staged"}
+        for name in names
+        if name != missing
+    ]
+    entries[0].pop("status")
+    entries[-1]["status"] = "unprinted-fixture-status"
+    state = tmp_path / "state.json"
+    before = json.dumps({"secrets": entries, "inventory_exit": int(missing == "api")})
+    state.write_text(before)
+    fly = tmp_path / "flyctl"
+    fly.write_text(FLY)
+    fly.chmod(0o700)
+    result = subprocess.run(
+        ["bash", "-eo", "pipefail", "-c", script],
+        cwd=root,
+        env={
+            **os.environ,
+            "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+            "FLY_TEST_STATE": str(state),
+        },
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert (result.returncode == 0) == (not missing), result.stdout + result.stderr
+    assert state.read_text() == before
+    assert "unprinted-fixture" not in result.stdout + result.stderr
+    if missing == "api":
+        assert "Fly secret names inventory failed" in result.stderr
+    else:
+        assert "DINKSTER_DATABASE_URL: Unknown" in result.stdout
+        assert "S3_REGION: Unknown" in result.stdout
+        if missing:
+            assert f"Missing required Fly secrets: {missing}" in result.stderr
+        else:
+            assert "DINKSTER_CURSOR_SECRET: Staged" in result.stdout
