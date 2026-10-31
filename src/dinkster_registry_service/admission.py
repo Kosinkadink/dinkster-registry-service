@@ -951,6 +951,13 @@ class AdmissionService:
                 return
             review |= doctor.review
             if claim.kind == "upload":
+                with self.database.session() as session, session.begin():
+                    candidate = self._leased_candidate(session, claim)
+                    candidate.lease_expires_at = datetime.now(UTC) + timedelta(
+                        seconds=self.lease_seconds
+                        + self.settings.probe_dependency_timeout_seconds
+                        + self.settings.probe_timeout_seconds
+                    )
                 probe = run_executable_probe(
                     root,
                     settings=self.settings,

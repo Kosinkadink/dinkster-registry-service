@@ -87,7 +87,11 @@ checks in order:
 4. `executable_probe`: imports the pack in a fresh process under bubblewrap
    with no network, read-only binds, and CPU, memory, process, file-size, and
    wall-time limits. The scanner requires full user and PID namespaces and
-   refuses the degraded bubblewrap rung or any host without isolation.
+   refuses the degraded bubblewrap rung or any host without isolation. Declared
+   `requires` are installed as wheels in a disposable per-submission environment
+   before the network-disabled probe. Resolution failures are named findings;
+   source builds and direct URL requirements are refused. The API image does not
+   carry pack-specific dependencies, and the environment is removed after probing.
 5. `fast_security`: scans for confirmed secrets and known-bad file hashes and
    inventories native, executable, bytecode-only, and obfuscated content.
 
@@ -313,9 +317,15 @@ startup. Invalid values stop the process with an error naming the variable.
 | Variable | Default | Valid range |
 | --- | ---: | ---: |
 | `DINKSTER_PROBE_TIMEOUT_SECONDS` | 30 | 1-600 seconds |
+| `DINKSTER_PROBE_DEPENDENCY_TIMEOUT_SECONDS` | 300 | 1-1800 seconds |
 | `DINKSTER_PROBE_OUTPUT_LIMIT_BYTES` | 262144 | 4096-4194304 bytes per stream |
 | `DINKSTER_PROBE_OPERATOR_TAIL_BYTES` | 8192 | 512 bytes through the configured output limit |
 | `DINKSTER_SCANNER_MAX_ATTEMPTS` | 3 | 1-10 claims |
+
+`DINKSTER_PROBE_PACKAGE_INDEX_URL` selects the operator-controlled package index
+(default `https://pypi.org/simple`). Installer subprocesses do not inherit host
+credentials or configuration. The scanner image includes uv; host-process
+scanners must also have uv on PATH.
 
 ## Development
 

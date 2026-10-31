@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import io
+import json
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import zipfile
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from uuid import UUID
 
@@ -156,6 +161,93 @@ def test_configured_probe_timeout_is_honored(tmp_path: Path) -> None:
     assert result.blocked
     assert result.findings[0].code == "probe.timeout"
     assert result.findings[0].message == "Executable probe exceeded 1s."
+
+
+@pytest.fixture
+def probe_package_index(tmp_path: Path) -> Iterator[str]:
+    package = tmp_path / "index" / "probe-dependency"
+    package.mkdir(parents=True)
+    wheel = package / "probe_dependency-1.0-py3-none-any.whl"
+    files = {
+        "probe_dependency.py": "VALUE = 83\n",
+        "probe_dependency-1.0.dist-info/METADATA": (
+            "Metadata-Version: 2.1\nName: probe-dependency\nVersion: 1.0\n"
+        ),
+        "probe_dependency-1.0.dist-info/WHEEL": (
+            "Wheel-Version: 1.0\nGenerator: registry-test\nRoot-Is-Purelib: true\n"
+            "Tag: py3-none-any\n"
+        ),
+    }
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name, data in files.items():
+            archive.writestr(name, data)
+        archive.writestr(
+            "probe_dependency-1.0.dist-info/RECORD",
+            "".join(f"{name},,\n" for name in files) + "probe_dependency-1.0.dist-info/RECORD,,\n",
+        )
+    package.joinpath("index.html").write_text(f'<a href="{wheel.name}">{wheel.name}</a>')
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0), partial(SimpleHTTPRequestHandler, directory=str(package.parent))
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.parametrize("version", ("1.0", "9.9"))
+def test_probe_installs_declared_dependencies_and_cleans_environment(
+    tmp_path: Path, probe_package_index: str, version: str
+) -> None:
+    source = _fixture_source(tmp_path)
+    manifest = source / "dinkster-pack.toml"
+    manifest.write_text(
+        manifest.read_text().replace(
+            "[pack]\n", f'[pack]\nrequires = ["probe-dependency=={version}"]\n'
+        )
+    )
+    nodes = source / "nodes.py"
+    nodes.write_text(
+        "import sys\nprint('PROBE_INTERPRETER=' + sys.executable)\n"
+        "from probe_dependency import VALUE\n"
+        + nodes.read_text().replace("version=2,", "version=VALUE,")
+    )
+    result = run_executable_probe(
+        source,
+        settings=ServerSettings(probe_package_index_url=probe_package_index),
+        require_isolation=False,
+    )
+    if version == "9.9":
+        assert result.blocked
+        assert result.findings[0].code == "probe.dependencies-unresolved"
+    else:
+        assert not result.blocked, result
+        assert result.data is not None
+        assert result.data["schemas"][0]["schemaVersion"] == 83
+        assert result.operator_details is not None
+        payload = json.loads(result.operator_details["stdoutTail"])
+        output = payload["doctorReport"]["import_stdout"]
+        interpreter = Path(output.split("PROBE_INTERPRETER=", 1)[1].splitlines()[0])
+        assert interpreter != Path(sys.executable)
+        assert not interpreter.parent.parent.exists()
+    assert "probe_dependency" not in sys.modules
+
+
+def test_probe_rejects_direct_dependency_urls(tmp_path: Path) -> None:
+    source = _fixture_source(tmp_path)
+    manifest = source / "dinkster-pack.toml"
+    manifest.write_text(
+        manifest.read_text().replace(
+            "[pack]\n", '[pack]\nrequires = ["example @ file:///outside-probe.whl"]\n'
+        )
+    )
+    result = run_executable_probe(source, require_isolation=False)
+    assert result.blocked
+    assert result.findings[0].code == "probe.dependencies-invalid"
 
 
 def test_probe_output_limit_blocks_without_buffering_unbounded_output(tmp_path: Path) -> None:

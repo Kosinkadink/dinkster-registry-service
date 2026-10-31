@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -34,6 +35,7 @@ from dinkster_workers import doctor as dinkster_doctor
 from dinkster_workers.manifest import ManifestError, PackManifest, load_manifest
 from dinkster_workers.sandbox import SandboxError, detect_probe_jail
 from packaging.licenses import InvalidLicenseExpression, canonicalize_license_expression
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import Version
 from sqlalchemy import select
@@ -580,6 +582,93 @@ def run_executable_probe(
     require_isolation: bool = True,
 ) -> StageResult:
     configured = settings or ServerSettings()
+    try:
+        manifest = load_manifest(root / MANIFEST_NAME)
+        requirements = [Requirement(value) for value in manifest.requires]
+    except (ManifestError, InvalidRequirement):
+        return StageResult(
+            (_block("probe.dependencies-invalid", "Pack requirements are invalid."),)
+        )
+    if any(requirement.url is not None for requirement in requirements):
+        return StageResult(
+            (
+                _block(
+                    "probe.dependencies-invalid", "Probe dependencies must use the package index."
+                ),
+            )
+        )
+    if not requirements:
+        return _run_executable_probe(root, configured, require_isolation, sys.executable)
+    installer = shutil.which("uv")
+    if installer is None:
+        return StageResult(
+            (_block("probe.dependencies-unavailable", "The dependency installer is unavailable."),)
+        )
+    with tempfile.TemporaryDirectory(prefix="dinkster-registry-probe-") as directory:
+        environment = Path(directory) / "environment"
+        interpreter = environment / "bin" / "python"
+        common = [installer, "--no-config", "--no-cache", "--no-python-downloads", "--no-progress"]
+        commands = [
+            [*common, "venv", "--no-project", "--python", sys.executable, str(environment)],
+            [
+                *common,
+                "pip",
+                "install",
+                "--python",
+                str(interpreter),
+                "--only-binary",
+                ":all:",
+                "--keyring-provider",
+                "disabled",
+                "--index-url",
+                configured.probe_package_index_url,
+                "--no-sources",
+                *[str(requirement) for requirement in requirements],
+            ],
+        ]
+        deadline = time.monotonic() + configured.probe_dependency_timeout_seconds
+        for command in commands:
+            remaining = max(1, int(deadline - time.monotonic()))
+            try:
+                completed = _run_probe_process(
+                    command,
+                    timeout_seconds=remaining,
+                    output_limit_bytes=configured.probe_output_limit_bytes,
+                )
+            except OSError:
+                return StageResult(
+                    (_block("probe.dependencies-unavailable", "Dependency provisioning failed."),)
+                )
+            if completed.returncode or completed.timed_out or completed.output_limit:
+                return StageResult(
+                    (
+                        _block(
+                            "probe.dependencies-unresolved",
+                            "Declared dependencies could not be provisioned as wheels "
+                            "within the limits.",
+                        ),
+                    ),
+                )
+        # Only the jailed interpreter starts after wheel installation: .pth files
+        # from dependencies must never execute in the scanner's host environment.
+        site_packages = (
+            environment
+            / "lib"
+            / f"python{sys.version_info.major}.{sys.version_info.minor}"
+            / "site-packages"
+        )
+        site_packages.joinpath("registry-probe-host.pth").write_text(
+            "\n".join(path for path in sys.path if path and Path(path).is_absolute()) + "\n"
+        )
+        return _run_executable_probe(root, configured, require_isolation, str(interpreter))
+
+
+def _run_executable_probe(
+    root: Path,
+    configured: ServerSettings,
+    require_isolation: bool,
+    interpreter: str,
+) -> StageResult:
     manifest_path = root / MANIFEST_NAME
     jail = None
     if require_isolation:
@@ -600,7 +689,7 @@ def run_executable_probe(
     probe_module = (
         "dinkster_registry_service.probe" if jail is None else "dinkster_workers._doctor_probe"
     )
-    command = [sys.executable, "-m", probe_module, str(manifest_path)]
+    command = [interpreter, "-m", probe_module, str(manifest_path)]
     try:
         if jail is None:
             completed = _run_probe_process(

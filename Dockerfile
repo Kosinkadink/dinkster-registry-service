@@ -20,6 +20,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY --from=ghcr.io/astral-sh/uv:0.12.8 /uv /usr/local/bin/uv
 COPY --from=builder /app/.venv ./.venv
 COPY alembic.ini ./
 COPY migrations ./migrations

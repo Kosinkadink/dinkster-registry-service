@@ -43,12 +43,20 @@ class ServerSettings:
     s3_region: str | None = None
     cursor_secret: bytes = b"local-cursor-secret-change-in-production"
     probe_timeout_seconds: int = 30
+    probe_dependency_timeout_seconds: int = 300
+    probe_package_index_url: str = "https://pypi.org/simple"
     probe_output_limit_bytes: int = 256 * 1024
     probe_operator_tail_bytes: int = 8 * 1024
     scanner_max_attempts: int = 3
 
     def __post_init__(self) -> None:
         _require_range("DINKSTER_PROBE_TIMEOUT_SECONDS", self.probe_timeout_seconds, 1, 600)
+        _require_range(
+            "DINKSTER_PROBE_DEPENDENCY_TIMEOUT_SECONDS",
+            self.probe_dependency_timeout_seconds,
+            1,
+            1800,
+        )
         _require_range(
             "DINKSTER_PROBE_OUTPUT_LIMIT_BYTES",
             self.probe_output_limit_bytes,
@@ -92,6 +100,13 @@ class ServerSettings:
             ).encode("utf-8"),
             probe_timeout_seconds=_environment_integer(
                 "DINKSTER_PROBE_TIMEOUT_SECONDS", defaults.probe_timeout_seconds
+            ),
+            probe_dependency_timeout_seconds=_environment_integer(
+                "DINKSTER_PROBE_DEPENDENCY_TIMEOUT_SECONDS",
+                defaults.probe_dependency_timeout_seconds,
+            ),
+            probe_package_index_url=os.getenv(
+                "DINKSTER_PROBE_PACKAGE_INDEX_URL", defaults.probe_package_index_url
             ),
             probe_output_limit_bytes=_environment_integer(
                 "DINKSTER_PROBE_OUTPUT_LIMIT_BYTES", defaults.probe_output_limit_bytes

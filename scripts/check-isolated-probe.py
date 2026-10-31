@@ -5,12 +5,93 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+import zipfile
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from dinkster_schema import SCHEMA_WIRE_VERSION, schema_from_wire, schema_signature
 
 from dinkster_registry_service.admission_checks import run_executable_probe
 from dinkster_registry_service.seed import FIXTURE_ROOT
+from dinkster_registry_service.settings import ServerSettings
+
+
+def check_dependency_environment() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        package = root / "index" / "probe-dependency"
+        package.mkdir(parents=True)
+        wheel = package / "probe_dependency-1.0-py3-none-any.whl"
+        marker = root / "outside-jail"
+        files = {
+            "probe_dependency.py": "VALUE = 83\n",
+            "probe_dependency-1.0.dist-info/METADATA": (
+                "Metadata-Version: 2.1\nName: probe-dependency\nVersion: 1.0\n"
+            ),
+            "probe_dependency-1.0.dist-info/WHEEL": (
+                "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+            ),
+            "dependency-startup.pth": (
+                "import builtins, pathlib; builtins.DEPENDENCY_STARTUP = 'jailed'; exec("
+                + repr(
+                    f"try:\n pathlib.Path({str(marker)!r}).write_text('escaped')\n"
+                    "except OSError:\n pass"
+                )
+                + ")\n"
+            ),
+        }
+        with zipfile.ZipFile(wheel, "w") as archive:
+            for name, data in files.items():
+                archive.writestr(name, data)
+            archive.writestr(
+                "probe_dependency-1.0.dist-info/RECORD",
+                "".join(f"{name},,\n" for name in files)
+                + "probe_dependency-1.0.dist-info/RECORD,,\n",
+            )
+        package.joinpath("index.html").write_text(f'<a href="{wheel.name}">wheel</a>')
+        server = ThreadingHTTPServer(
+            ("127.0.0.1", 0), partial(SimpleHTTPRequestHandler, directory=str(package.parent))
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            pack = root / "pack"
+            shutil.copytree(FIXTURE_ROOT / "example-pack", pack)
+            manifest = pack / "dinkster-pack.toml"
+            manifest.write_text(
+                manifest.read_text().replace(
+                    "[pack]\n", '[pack]\nrequires = ["probe-dependency==1.0"]\n'
+                )
+            )
+            nodes = pack / "nodes.py"
+            nodes.write_text(
+                "from probe_dependency import VALUE\nimport builtins, socket\n"
+                "assert builtins.DEPENDENCY_STARTUP == 'jailed'\n"
+                "try:\n"
+                f" socket.create_connection(('127.0.0.1', {server.server_port}), timeout=1)\n"
+                "except OSError:\n pass\n"
+                "else:\n raise RuntimeError('probe reached host network')\n"
+                + nodes.read_text().replace("version=2,", "version=VALUE,")
+            )
+            result = run_executable_probe(
+                pack,
+                settings=ServerSettings(
+                    probe_package_index_url=f"http://127.0.0.1:{server.server_port}"
+                ),
+            )
+            if result.blocked or result.data is None:
+                raise SystemExit(f"dependency probe failed: {result}")
+            versions = {item["nodeType"]: item["schemaVersion"] for item in result.data["schemas"]}
+            if versions.get("example.resize") != 83:
+                raise SystemExit("probe did not use its declared dependency")
+            if marker.exists():
+                raise SystemExit("dependency startup code ran outside the jail")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
 
 def check_controlled_probe_environment() -> None:
@@ -81,7 +162,8 @@ def main() -> None:
         if record["schemaSignature"] != schema_signature(schema):
             raise SystemExit(f"isolated probe returned an invalid schema signature for {node_type}")
     check_controlled_probe_environment()
-    print("isolated_probe=passed schemas=2 environment=controlled")
+    check_dependency_environment()
+    print("isolated_probe=passed schemas=2 environment=controlled dependencies=isolated")
 
 
 if __name__ == "__main__":
