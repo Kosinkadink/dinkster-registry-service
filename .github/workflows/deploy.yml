@@ -61,6 +61,37 @@ jobs:
         run: >-
           python3 scripts/deploy_image.py --app dinkster-registry --region sjc
           --image "$FLY_IMAGE"
+      - name: Verify automatic rollback after a deliberate failed health check
+        if: vars.FLY_VERIFY_ROLLBACK == 'true'
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          scratch=$(mktemp -d)
+          trap 'rm -rf -- "$scratch"' EXIT
+          python3 - "$scratch/failed-health.toml" <<'PY'
+          import sys
+          from pathlib import Path
+          source = Path("fly.toml").read_text()
+          health = 'path = "/healthz"'
+          if source.count(health) != 1:
+              raise SystemExit("Expected exactly one registry health check")
+          Path(sys.argv[1]).write_text(source.replace(health, 'path = "/__registry-broken-health-check__"'))
+          PY
+          status=0
+          python3 scripts/deploy_image.py --app dinkster-registry --region sjc \
+            --image "$FLY_IMAGE" --config "$scratch/failed-health.toml" \
+            >"$scratch/deploy.log" 2>&1 || status=$?
+          cat "$scratch/deploy.log"
+          if test "$status" -eq 0; then
+            echo "ERROR: the deliberate failed-health deployment unexpectedly succeeded" >&2
+            python3 scripts/deploy_image.py --app dinkster-registry --region sjc \
+              --image "$FLY_IMAGE" --config fly.toml
+            exit 1
+          fi
+          grep -Fx 'Rollback passed Fly and public health checks; deployment remains failed' \
+            "$scratch/deploy.log"
+          printf 'Deliberate failed-health deployment restored the healthy immutable release.\n' \
+            >> "$GITHUB_STEP_SUMMARY"
       - name: Record deployment evidence
         if: always()
         run: |

@@ -137,11 +137,39 @@ unchanged default fixture checks for disposable CI stacks.
 Public conformance and the deliberate failed-health deploy
 are mandatory remaining acceptance evidence, not implied by a health200.
 
-For the rollback exercise, first confirm a healthy exact-image deployment.
-Use a temporary copy of `fly.toml` with only the health path changed to a
-nonexistent endpoint, and pass that copy to `scripts/deploy_image.py --config`
-with the same immutable image. Require a nonzero deployment result followed by
-`Rollback passed Fly and public health checks; deployment remains failed`, then confirm
-public health and the restored image/configuration. Preserve the run link on
-issue586 and remove the temporary config. Never weaken or disable the health
-check to make this exercise pass, and never dispatch a workflow for the drill.
+## Deliberate failed-health rollback run
+
+The main-push deployment workflow includes an opt-in rollback exercise after
+the normal immutable deployment passes both Fly and public health checks.
+`FLY_VERIFY_ROLLBACK` is off unless explicitly set to `true`; it does not bypass
+`FLY_DEPLOY_ENABLED`, the main-only condition or any prerequisite. Enable it
+only for an eligible real deployment, never to start a placeholder Machine.
+The operator sets the nonsecret repository variable before the natural main
+push that should supply the receipt:
+
+```bash
+gh variable set FLY_VERIFY_ROLLBACK --repo Kosinkadink/dinkster-registry-service --body true
+```
+
+The workflow copies `fly.toml` into a temporary directory and changes only the
+`/healthz` path to `/__registry-broken-health-check__`. It attempts that config
+with the same immutable image through `scripts/deploy_image.py`. Success
+requires the attempt to fail and automatic rollback to report
+`Rollback passed Fly and public health checks; deployment remains failed`.
+Failed restoration fails the workflow. Unexpected acceptance of the bad config
+also fails the workflow, after attempting recovery with the healthy checked-in
+config; it never counts as a successful drill. Temporary configs and logs are
+removed on exit. No normal health check is weakened or disabled.
+
+Preserve the workflow run link, landed commit and digest on issue586, then
+confirm public health, both Machine images and restored health configuration.
+After the receipt, disable repeat drills before another main push:
+
+```bash
+gh variable set FLY_VERIFY_ROLLBACK --repo Kosinkadink/dinkster-registry-service --body false
+```
+
+Both commands should exit zero without printing credentials. Stop on a wrong
+repository, failed command or unready deployment prerequisite. Never dispatch,
+rerun or cancel a workflow for this exercise. Local simulator results prove
+the control flow only, not the required live Fly rollback receipt.

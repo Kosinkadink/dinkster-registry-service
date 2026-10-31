@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -39,7 +40,9 @@ elif args[0] == "deploy":
     image = args[args.index("--image") + 1]
     state.update(image=image, config=config, empty=False)
     state_path.write_text(json.dumps(state))
-    if "broken-health" in config or ("--skip-release-command" in args and state["fail_rollback"]):
+    if ("broken-health" in config and not state.get("ignore_failed_health", False)) or (
+        "--skip-release-command" in args and state["fail_rollback"]
+    ):
         sys.exit(1)
 else:
     sys.exit(99)
@@ -157,3 +160,62 @@ def test_deploy_refuses_a_mutable_image_before_contacting_fly() -> None:
     )
     assert result.returncode == 2
     assert "immutable Fly registry digest" in result.stderr
+
+
+@pytest.mark.parametrize("failure", ("", "rollback", "unexpected-success"))
+def test_workflow_rollback_drill_requires_failed_health_and_successful_restoration(
+    tmp_path: Path, failure: str
+) -> None:
+    root = DEPLOY.parents[1]
+    workflow = (root / ".github/workflows/deploy.yml").read_text()
+    step = workflow.split(
+        "      - name: Verify automatic rollback after a deliberate failed health check\n", 1
+    )[1].split("      - name: Record deployment evidence\n", 1)[0]
+    script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+    for name, source in (("flyctl", FLY), ("curl", CURL)):
+        executable = tmp_path / name
+        executable.write_text(source)
+        executable.chmod(0o700)
+    config = (root / "fly.toml").read_text()
+    state = tmp_path / "state.json"
+    state.write_text(
+        json.dumps(
+            {
+                "image": NEW_IMAGE,
+                "config": config,
+                "fail_rollback": failure == "rollback",
+                "ignore_failed_health": failure == "unexpected-success",
+                "failed_public": "",
+            }
+        )
+    )
+    summary = tmp_path / "summary"
+    result = subprocess.run(
+        ["bash", "-eo", "pipefail", "-c", script],
+        cwd=root,
+        env={
+            **os.environ,
+            "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+            "FLY_TEST_STATE": str(state),
+            "FLY_IMAGE": NEW_IMAGE,
+            "GITHUB_STEP_SUMMARY": str(summary),
+        },
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert (result.returncode == 0) == (not failure), result.stdout + result.stderr
+    final = json.loads(state.read_text())
+    assert final["image"] == NEW_IMAGE
+    assert final["config"] == config
+    if failure:
+        assert not summary.exists()
+        if failure == "rollback":
+            assert "ROLLBACK FAILED" in result.stdout
+        else:
+            assert "unexpectedly succeeded" in result.stderr
+    else:
+        assert summary.read_text() == (
+            "Deliberate failed-health deployment restored the healthy immutable release.\n"
+        )
