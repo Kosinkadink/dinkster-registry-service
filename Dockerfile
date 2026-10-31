@@ -28,15 +28,12 @@ COPY fixtures ./fixtures
 COPY conformance ./conformance
 COPY scripts ./scripts
 
-RUN useradd --create-home --uid 10001 dinkster \
-    && mkdir --parents /data/objects \
-    && chown --recursive dinkster:dinkster /data
+RUN useradd --create-home --uid 10001 dinkster
 
 ENV PATH="/app/.venv/bin:${PATH}" \
-    DINKSTER_OBJECT_STORE_ROOT="/data/objects" \
+    DINKSTER_OBJECT_STORE_ROOT="/home/dinkster/objects" \
     PYTHONUNBUFFERED=1
 
 USER dinkster
 EXPOSE 8000
-VOLUME ["/data"]
 CMD ["dinkster-registry", "serve", "--host", "0.0.0.0", "--port", "8000"]

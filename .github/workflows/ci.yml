@@ -117,7 +117,7 @@ jobs:
       - name: Run command help smoke test
         run: docker run --rm --network none dinkster-registry:test dinkster-registry --help
       - name: Run isolated executable probe
-        run: docker run --rm --network none --privileged --user root dinkster-registry:test python scripts/check-isolated-probe.py
+        run: docker run --rm --network none --privileged dinkster-registry:test python scripts/check-isolated-probe.py
       - name: Run container conformance suite
         run: |
           bash scripts/with-test-postgres.sh bash -e <<'SH'
@@ -125,14 +125,15 @@ jobs:
           export DINKSTER_PUBLIC_BASE_URL="http://127.0.0.1:$http_port"
           name="registry-conformance-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
           trap 'docker rm --force "$name" >/dev/null' EXIT
-          docker run --detach --name "$name" \
+          docker run --detach --privileged --name "$name" \
             --network host \
             --env DINKSTER_DATABASE_URL \
             --env DINKSTER_PUBLIC_BASE_URL \
+            --env HTTP_HOST=127.0.0.1 \
             --env HTTP_PORT="$http_port" \
             --env DINKSTER_CURSOR_SECRET=container-conformance-secret-at-least-32-bytes \
             dinkster-registry:test \
-            sh -ec 'alembic upgrade head; dinkster-registry seed; dinkster-registry scanner & exec dinkster-registry serve --host 127.0.0.1 --port "$HTTP_PORT"'
+            bash -ec 'alembic upgrade head; dinkster-registry seed; exec bash scripts/start-service.sh'
           for attempt in $(seq 1 30); do
             test "$(docker inspect --format '{{.State.Running}}' "$name")" = true
             if docker exec "$name" python -c 'import os, urllib.request; urllib.request.urlopen(os.environ["DINKSTER_PUBLIC_BASE_URL"] + "/v1/health", timeout=2)'; then
@@ -143,3 +144,9 @@ jobs:
           test "$(docker inspect --format '{{.State.Running}}' "$name")" = true
           docker exec "$name" python conformance/run.py "$DINKSTER_PUBLIC_BASE_URL"
           SH
+
+  deploy:
+    needs: [checks, conformance, container]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.FLY_DEPLOY_ENABLED == 'true'
+    uses: ./.github/workflows/deploy.yml
+    secrets: inherit

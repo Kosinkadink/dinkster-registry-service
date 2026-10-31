@@ -357,6 +357,12 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             ),
         )
 
+    @app.get("/healthz")
+    def readiness() -> Response:
+        with database.engine.connect() as connection:
+            connection.exec_driver_sql("SELECT 1")
+        return Response(status_code=200, headers={"Cache-Control": NO_STORE})
+
     @app.get("/v1/health")
     def health(request: Request) -> Response:
         _query(request, EmptyQuery)

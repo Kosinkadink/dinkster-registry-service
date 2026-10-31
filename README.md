@@ -51,8 +51,26 @@ uv run dinkster-registry rebuild-indexes
 Seeding development fixtures does not simulate publish acceptance. Run the
 rebuild command after `seed` to expose fixtures through the static indexes.
 
+## Production deployment
+
+Two replicas share PostgreSQL metadata, fenced scanner leases and durable
+outbox events, plus R2 quarantine/artifacts/indexes. This makes local artifact
+volumes unnecessary; the image declares none. The Fly configuration keeps two
+512 MB shared-cpu-1x Machines in sjc, each with supervised nonroot API/scanner
+processes and full probe-isolation preflight. See [deploy.md](deploy.md) for
+secret prerequisites, migration/runtime credential separation, first deploy,
+health-checked rollback and the required live evidence.
+
+The [immutable-image deploy workflow](.github/workflows/deploy.yml) runs on X570
+after main's CI gates and only when production is enabled. The successful
+landed-commit deployment run and deliberate failed-health rollback receipt are
+not yet available; [issue586](https://github.com/Kosinkadink/comfy-vibe-station/issues/586)
+tracks them. Neither the workflow file nor local simulations claim live
+acceptance. Do not enable a health-only deployment while admission is blocked.
+
 Pull requests and main pushes run checks, HTTP conformance, and container
-validation in GitHub Actions. Each job has a 10-minute bound. The required
+validation in GitHub Actions. Each validation job has a 10-minute bound;
+the enabled main-only deployment has a separate 30-minute bound. The required
 `CI_RUNNERS` repository variable routes all three CPU-only jobs to the
 repository's one temporary X570 runner:
 

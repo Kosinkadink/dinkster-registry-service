@@ -9,10 +9,21 @@ def test_every_ci_job_uses_the_cpu_runner_contract_and_timeout() -> None:
     jobs_source = source.split("\njobs:\n", 1)[1]
     jobs = re.findall(r"(?ms)^  ([a-z][a-z-]*):\n(.*?)(?=^  [a-z][a-z-]*:\n|\Z)", jobs_source)
 
-    assert [name for name, _ in jobs] == ["checks", "conformance", "container"]
-    for name, body in jobs:
+    assert [name for name, _ in jobs] == ["checks", "conformance", "container", "deploy"]
+    for name, body in jobs[:3]:
         assert "    runs-on: ${{ fromJSON(vars.CI_RUNNERS).linux }}\n" in body, name
         assert "    timeout-minutes: 10\n" in body, name
+    deploy = jobs[3][1]
+    assert "    needs: [checks, conformance, container]\n" in deploy
+    assert "    uses: ./.github/workflows/deploy.yml\n" in deploy
+    assert "github.event_name == 'push' && github.ref == 'refs/heads/main'" in deploy
+    assert "vars.FLY_DEPLOY_ENABLED == 'true'" in deploy
+    deployment = WORKFLOW.with_name("deploy.yml").read_text()
+    assert "    runs-on: ${{ fromJSON(vars.CI_RUNNERS).linux }}\n" in deployment
+    assert "ref: ${{ github.sha }}" in deployment
+    assert '--image "$FLY_IMAGE"' in deployment
+    assert "--network host" in deployment
+    assert "DINKSTER_REPO_TOKEN" not in deployment
     assert "continue-on-error" not in source
     assert "gpu" not in source.lower()
 
