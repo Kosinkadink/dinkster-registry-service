@@ -62,9 +62,10 @@ def main() -> None:
     assert os.environ.get("DINKSTER_DATABASE_URL"), "a disposable migrated database is required"
     cli("admin", "add-user", "release-check")
     cli("admin", "add-publisher", "dinkster", "--owner", "release-check")
-    accepted: set[str] = set()
+    completed: set[str] = set()
+    failures = []
     while pending:
-        available = sorted(name for name, (_, _, deps) in pending.items() if deps <= accepted)
+        available = sorted(name for name, (_, _, deps) in pending.items() if deps <= completed)
         assert available, f"unresolved release dependencies: {sorted(pending)}"
         for name in available:
             pack, archive, _ = pending.pop(name)
@@ -85,10 +86,13 @@ def main() -> None:
                 status = json.loads(cli("status", candidate))
                 if status["status"] in {"accepted", "rejected", "review"}:
                     break
-            assert status["status"] == "accepted", {
+            result = {
                 "pack": name,
+                "version": pack["version"],
                 "status": status["status"],
                 "reason": status["reason"],
+                "digest": status["digest"],
+                "lockDigestMatches": status["digest"] == pack["artifactDigest"],
                 "blockingCodes": sorted(
                     {
                         finding["code"]
@@ -97,10 +101,12 @@ def main() -> None:
                     }
                 ),
             }
-            assert status["digest"] == pack["artifactDigest"], status
-            accepted.add(name)
-            print(f"accepted {name} {pack['version']} {status['digest']}", flush=True)
-    assert len(accepted) == 14
+            completed.add(name)
+            print(json.dumps(result, sort_keys=True), flush=True)
+            if status["status"] != "accepted" or not result["lockDigestMatches"]:
+                failures.append(result)
+    assert len(completed) == 14
+    assert not failures, failures
 
 
 if __name__ == "__main__":
