@@ -28,6 +28,7 @@ jobs:
         with:
           enable-cache: true
           python-version: "3.12"
+          save-cache: false
       - name: Sync private Dinkster dependency
         env:
           DINKSTER_REPO_TOKEN: ${{ secrets.DINKSTER_REPO_TOKEN }}
