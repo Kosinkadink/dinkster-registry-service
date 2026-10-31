@@ -16,7 +16,7 @@ from dinkster_registry_service.digests import artifact_digest
 from dinkster_registry_service.identifiers import require_canonical_pack_name
 from dinkster_registry_service.versioning import require_public_version
 
-RELEASE_TAG = "main-fcd73e73234f92f7784164dc2609da1c6e03a4d2"
+RELEASE_TAG = "main-215fb8ed53c2efac18e8f121d92e9de6cc5f165d"
 RELEASE_URL = f"https://github.com/Kosinkadink/Dinkster/releases/download/{RELEASE_TAG}"
 
 
