@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
-from dinkster_schema import canonical_claim, canonical_name
+from dinkster_schema import canonical_claim, canonical_name, claims_conflict
 from packaging.version import Version
 from sqlalchemy import and_, or_, select, text
 from sqlalchemy.orm import Session
@@ -603,6 +603,16 @@ class AdmissionService:
                         for value in cast("list[str]", manifest["namespaces"])
                     ),
                 }
+                grants = list(session.scalars(select(NamespaceGrantRecord)))
+                for claim_name in sorted(claims):
+                    for held_grant in grants:
+                        if claims_conflict(claim_name, held_grant.claim) and (
+                            held_grant.publisher_id != candidate.publisher_id
+                            or (candidate.publisher_id is None and held_grant.pack_id != pack.id)
+                        ):
+                            raise PromotionConflict(
+                                f"namespace claim {claim_name!r} is unavailable"
+                            )
                 for claim_name in sorted(claims):
                     grant = session.get(NamespaceGrantRecord, claim_name)
                     if grant is None:
@@ -614,10 +624,6 @@ class AdmissionService:
                                 owner_id=pack.owner_id,
                             )
                         )
-                    elif grant.publisher_id != candidate.publisher_id or (
-                        candidate.publisher_id is None and grant.pack_id != pack.id
-                    ):
-                        raise PromotionConflict(f"namespace claim {claim_name!r} is unavailable")
 
                 final_key = artifact_object_key(candidate.declared_digest)
                 with zipfile.ZipFile(io.BytesIO(data)) as archive:

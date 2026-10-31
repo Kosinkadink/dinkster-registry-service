@@ -627,6 +627,61 @@ def test_namespace_overlap_is_exclusive_to_a_publisher(
             assert any(finding.code == "manifest.invalid" for finding in status.findings)
 
 
+@pytest.mark.parametrize("publisher", ("example-org", "other-org", None))
+@pytest.mark.parametrize(
+    ("first_claim", "second_claim"),
+    (("shared", "shared"), ("shared", "shared.child"), ("shared.child", "shared")),
+)
+def test_promotion_rechecks_namespace_grants_after_both_candidates_scan(
+    database: Database,
+    tmp_path: Path,
+    publisher: str | None,
+    first_claim: str,
+    second_claim: str,
+) -> None:
+    principals = PrincipalRepository(database)
+    principals.register_user("operator")
+    for name in ("example-org", "other-org"):
+        principals.register_publisher(name, "operator", datetime.now(UTC).isoformat())
+    service = _service(database, tmp_path)
+    candidates = []
+    for name, owner, namespace in (
+        ("first-pack", "example-org", first_claim),
+        ("second-pack", publisher, second_claim),
+    ):
+        source = _fixture_source(tmp_path, name)
+        manifest = source / "dinkster-pack.toml"
+        manifest.write_text(
+            manifest.read_text().replace(
+                f'namespaces = ["{name}"]', f'namespaces = ["{name}", "{namespace}"]'
+            )
+        )
+        (source / "extension.so").write_bytes(b"synthetic native inventory fixture")
+        candidate = service.submit(
+            build_registry_fixture_archive(source),
+            pack_name=name,
+            version="1.0",
+            publisher=owner,
+        )
+        assert service.run_once()
+        assert service.status(candidate).status == "review"
+        candidates.append(candidate)
+
+    first = service.resolve_review(
+        candidates[0], accepted=True, actor="operator", reason="reviewed"
+    )
+    assert first.status == "accepted"
+    second = service.resolve_review(
+        candidates[1], accepted=True, actor="operator", reason="reviewed"
+    )
+    if publisher == "example-org":
+        assert second.status == "accepted", second
+    else:
+        assert second.status == "rejected", second
+        assert any(finding.code == "manifest.version-conflict" for finding in second.findings)
+    assert service.status(candidates[0]).status == "accepted"
+
+
 def test_node_outside_declared_namespace_rejects(database: Database, tmp_path: Path) -> None:
     source = _fixture_source(tmp_path)
     manifest = source / "dinkster-pack.toml"
