@@ -28,6 +28,7 @@ from dinkster_schema import (
     reserved_root,
     schema_from_wire,
     schema_signature,
+    validate_claim,
 )
 from dinkster_workers import doctor as dinkster_doctor
 from dinkster_workers.manifest import ManifestError, PackManifest, load_manifest
@@ -199,28 +200,21 @@ def extracted_archive(data: bytes) -> Iterator[Path]:
         yield root
 
 
-def _release_table(manifest_path: Path) -> dict[str, object]:
+def _pack_metadata(manifest_path: Path) -> dict[str, object]:
     with manifest_path.open("rb") as source:
         document = tomllib.load(source)
     pack = document.get("pack")
     if not isinstance(pack, dict):
         raise ValueError("manifest is missing [pack]")
-    release = cast("dict[str, object]", pack).get("release")
-    if not isinstance(release, dict):
-        raise ValueError("manifest is missing [pack.release]")
-    table = cast("dict[str, object]", release)
-    unknown = sorted(set(table) - {"version", "dinkster", "license", "repository"})
-    if unknown:
-        raise ValueError(f"[pack.release] has unknown fields: {', '.join(unknown)}")
-    return table
+    return cast("dict[str, object]", pack)
 
 
 def _manifest_payload(manifest: PackManifest, release: dict[str, object]) -> dict[str, Any]:
     contracts = manifest.contracts
     assert contracts is not None
     return {
-        "dinkster": release["dinkster"],
-        "license": release["license"],
+        "dinkster": release.get("dinkster", ""),
+        "license": release.get("license", ""),
         "contracts": {
             "host": contracts.host,
             "api": contracts.api,
@@ -266,45 +260,40 @@ def run_manifest_admission(
     session: Session,
     *,
     rescan: bool = False,
+    publisher: str | None = None,
 ) -> StageResult:
     try:
         manifest = load_manifest(root / MANIFEST_NAME)
-        release = _release_table(root / MANIFEST_NAME)
+        release = _pack_metadata(root / MANIFEST_NAME)
         require_canonical_pack_name(manifest.name)
         require_public_version(release_version)
-        declared_version = release.get("version")
-        if not isinstance(declared_version, str):
-            raise ValueError("[pack.release] version must be a string")
-        require_public_version(declared_version)
         if manifest.name != pack_name:
             raise ValueError(
                 f"manifest pack name {manifest.name!r} does not match submission {pack_name!r}"
             )
-        if declared_version != release_version:
-            raise ValueError(
-                f"manifest version {declared_version!r} does not match submission "
-                f"{release_version!r}"
-            )
-        dinkster_range = release.get("dinkster")
-        if not isinstance(dinkster_range, str) or not dinkster_range:
-            raise ValueError("[pack.release] dinkster must be a nonempty version range")
-        if not str(SpecifierSet(dinkster_range)):
-            raise ValueError("[pack.release] dinkster must constrain the engine version")
+        dinkster_range = release.get("dinkster", "")
+        if not isinstance(dinkster_range, str):
+            raise ValueError("[pack] dinkster must be a version range")
+        SpecifierSet(dinkster_range)
         license_expression = release.get("license")
-        if not isinstance(license_expression, str):
-            raise ValueError("[pack.release] license must be an SPDX expression")
-        normalized_license = canonicalize_license_expression(license_expression)
-        if "LicenseRef-" in normalized_license and not (root / "LICENSE").is_file():
-            raise ValueError("a LicenseRef license requires a root LICENSE file")
+        if license_expression is not None:
+            if not isinstance(license_expression, str):
+                raise ValueError("[pack] license must be an SPDX expression")
+            normalized_license = canonicalize_license_expression(license_expression)
+            if "LicenseRef-" in normalized_license and not (root / "LICENSE").is_file():
+                raise ValueError("a LicenseRef license requires a root LICENSE file")
         repository = release.get("repository")
         if repository is not None and (
             not isinstance(repository, str) or not repository.startswith("https://")
         ):
-            raise ValueError("[pack.release] repository must be an HTTPS URL")
+            raise ValueError("[pack] repository must be an HTTPS URL")
         if manifest.contracts is None:
             raise ValueError("manifest is missing [pack.contracts]")
         for claim in (manifest.name, *manifest.namespaces):
-            if reserved_root(claim) is not None:
+            problem = validate_claim(claim)
+            if problem is not None:
+                raise ValueError(f"invalid namespace claim {claim!r}: {problem}")
+            if reserved_root(claim) is not None and publisher != "dinkster":
                 raise ValueError(f"namespace claim is reserved: {claim!r}")
         pack = session.scalar(select(PackRecord).where(PackRecord.name == pack_name))
         if pack is not None and not rescan:
@@ -411,7 +400,7 @@ def run_doctor_static(root: Path) -> StageResult:
         mapped,
         {
             "status": "failed" if errors else "warning" if warnings else "passed",
-            "doctorVersion": distribution_version("dinkster-workers"),
+            "doctorVersion": distribution_version("dinkster-api"),
             "reportVersion": dinkster_doctor.DOCTOR_REPORT_VERSION,
             "errorCount": errors,
             "warningCount": warnings,

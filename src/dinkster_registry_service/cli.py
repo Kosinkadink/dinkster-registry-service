@@ -42,6 +42,7 @@ def _parser() -> argparse.ArgumentParser:
     submit_parser.add_argument("--pack", required=True)
     submit_parser.add_argument("--version", required=True)
     submit_parser.add_argument("--submitted-by", default="operator")
+    submit_parser.add_argument("--publisher", help="existing registry-local publisher id")
     submit_parser.add_argument("--database-url")
     submit_parser.add_argument("--object-store-root")
 
@@ -182,6 +183,7 @@ def main() -> None:
                 pack_name=args.pack,
                 version=args.version,
                 submitted_by=args.submitted_by,
+                publisher=args.publisher,
             )
             print(candidate_id)
         elif args.command == "status":

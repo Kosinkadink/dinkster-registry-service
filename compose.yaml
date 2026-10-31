@@ -17,8 +17,6 @@ services:
     image: dinkster-registry:local
     build:
       context: .
-      secrets:
-        - dinkster_repo_token
     depends_on:
       postgres:
         condition: service_healthy
@@ -70,7 +68,3 @@ services:
 volumes:
   object-data:
   postgres-data:
-
-secrets:
-  dinkster_repo_token:
-    environment: DINKSTER_REPO_TOKEN

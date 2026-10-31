@@ -30,6 +30,7 @@ from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
 from dinkster_registry_service.database import (
     Database,
+    NamespaceGrantRecord,
     OutboxRecord,
     PackRecord,
     ReleaseCandidateRecord,
@@ -39,26 +40,26 @@ from dinkster_registry_service.database import (
 )
 from dinkster_registry_service.digests import artifact_digest
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore, ObjectStoreError
+from dinkster_registry_service.principals import PrincipalRepository
 from dinkster_registry_service.seed import FIXTURE_ROOT, seed_fixtures
 from dinkster_registry_service.settings import ServerSettings
 
 
-def _fixture_source(tmp_path: Path, name: str = "example-pack", version: str = "1.2.3") -> Path:
+def _fixture_source(tmp_path: Path, name: str = "example-pack") -> Path:
     source = tmp_path / name
     shutil.copytree(FIXTURE_ROOT / "example-pack", source)
     manifest_path = source / "dinkster-pack.toml"
     manifest = manifest_path.read_text()
     manifest = manifest.replace('name = "example-pack"', f'name = "{name}"')
     manifest = manifest.replace('namespaces = ["example"]', f'namespaces = ["{name}"]')
-    manifest = manifest.replace('version = "1.2.3"', f'version = "{version}"')
     manifest_path.write_text(manifest)
     nodes_path = source / "nodes.py"
     nodes_path.write_text(nodes_path.read_text().replace("example.", f"{name}."))
     return source
 
 
-def _archive(tmp_path: Path, name: str = "example-pack", version: str = "1.2.3") -> bytes:
-    return build_registry_fixture_archive(_fixture_source(tmp_path, name, version))
+def _archive(tmp_path: Path, name: str = "example-pack") -> bytes:
+    return build_registry_fixture_archive(_fixture_source(tmp_path, name))
 
 
 def _service(
@@ -396,26 +397,78 @@ def test_path_traversal_entry_rejects(database: Database, tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize(
-    ("submitted_name", "submitted_version"),
-    (("other-pack", "1.2.3"), ("example-pack", "1.2.4")),
+    ("submitted_name", "submitted_version", "accepted"),
+    (("other-pack", "1.2.3", False), ("example-pack", "1.2.4", True)),
 )
-def test_manifest_name_or_version_mismatch_rejects(
+def test_manifest_name_matches_and_submission_owns_version(
     database: Database,
     tmp_path: Path,
     submitted_name: str,
     submitted_version: str,
+    accepted: bool,
 ) -> None:
     service = _service(database, tmp_path)
     archive = _archive(tmp_path)
     candidate_id = service.submit(archive, pack_name=submitted_name, version=submitted_version)
-    _assert_rejected(service, candidate_id, "manifest.invalid")
+    if accepted:
+        assert service.run_once()
+        assert service.status(candidate_id).status == "accepted"
+        with database.session() as session:
+            release = session.scalar(select(ReleaseRecord))
+            assert release is not None and release.version == submitted_version
+    else:
+        _assert_rejected(service, candidate_id, "manifest.invalid")
+
+
+@pytest.mark.parametrize("publisher", (None, "dinkster"))
+def test_official_claims_require_registry_publisher_and_keep_exact_ids(
+    database: Database, tmp_path: Path, publisher: str | None
+) -> None:
+    principals = PrincipalRepository(database)
+    principals.register_user("operator")
+    principals.register_publisher("dinkster", "operator", datetime.now(UTC).isoformat())
+    source = _fixture_source(tmp_path, "official-pack")
+    manifest = source / "dinkster-pack.toml"
+    manifest.write_text(
+        manifest.read_text().replace(
+            'namespaces = ["official-pack"]',
+            'publisher = "dinkster"\nnamespaces = ["std", "ExampleResize", "ExampleSave"]',
+        )
+    )
+    nodes = source / "nodes.py"
+    nodes.write_text(
+        nodes.read_text()
+        .replace("official-pack.resize", "ExampleResize")
+        .replace("official-pack.save", "ExampleSave")
+    )
+    service = _service(database, tmp_path)
+    candidate_id = service.submit(
+        build_registry_fixture_archive(source),
+        pack_name="official-pack",
+        version="2.0",
+        publisher=publisher,
+    )
+    if publisher is None:
+        _assert_rejected(service, candidate_id, "manifest.invalid")
+    else:
+        assert service.run_once()
+        assert service.status(candidate_id).status == "accepted"
+        with database.session() as session:
+            assert set(session.scalars(select(NamespaceGrantRecord.claim))) == {
+                "official-pack",
+                "std",
+                "ExampleResize",
+                "ExampleSave",
+            }
 
 
 def test_node_outside_declared_namespace_rejects(database: Database, tmp_path: Path) -> None:
     source = _fixture_source(tmp_path)
     manifest = source / "dinkster-pack.toml"
     manifest.write_text(
-        manifest.read_text().replace('namespaces = ["example-pack"]', 'namespaces = ["other"]')
+        manifest.read_text().replace(
+            'namespaces = ["example-pack"]', 'namespaces = ["example-pack.other"]'
+        )
     )
     service = _service(database, tmp_path)
     candidate_id = service.submit(
@@ -428,7 +481,7 @@ def test_duplicate_semantic_version_rejects(database: Database, tmp_path: Path) 
     store = LocalFilesystemObjectStore(tmp_path / "objects")
     seed_fixtures(database, store)
     service = AdmissionService(database, store, require_isolation=False)
-    archive = _archive(tmp_path, version="1.2.3.0")
+    archive = _archive(tmp_path)
     candidate_id = service.submit(archive, pack_name="example-pack", version="1.2.3.0")
     _assert_rejected(service, candidate_id, "manifest.invalid")
     with database.session() as session:

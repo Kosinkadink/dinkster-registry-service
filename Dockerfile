@@ -10,11 +10,8 @@ RUN apt-get update \
 WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
-RUN --mount=type=secret,id=dinkster_repo_token \
-    token="$(cat /run/secrets/dinkster_repo_token)" \
-    && git config --global url."https://x-access-token:${token}@github.com/".insteadOf "https://github.com/" \
-    && uv sync --frozen --no-dev --no-editable \
-    && rm -rf /root/.cache/uv /root/.gitconfig
+RUN uv sync --frozen --no-dev --no-editable \
+    && rm -rf /root/.cache/uv
 
 FROM python:3.12-slim AS runtime
 

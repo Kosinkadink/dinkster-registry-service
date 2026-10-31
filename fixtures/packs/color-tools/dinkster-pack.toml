@@ -2,6 +2,9 @@
 name = "color-tools"
 namespaces = ["color"]
 platforms = ["darwin", "linux", "win32"]
+dinkster = ">=0.9,<1"
+license = "Apache-2.0"
+repository = "https://github.com/example-author/dinkster-color-tools"
 
 [pack.entry]
 nodes = "nodes:PACK_NODES"
@@ -14,9 +17,3 @@ api = "dinkster-api/v1"
 gpu = false
 network = false
 writable-mounts = false
-
-[pack.release]
-version = "0.4.0"
-dinkster = ">=0.9,<1"
-license = "Apache-2.0"
-repository = "https://github.com/example-author/dinkster-color-tools"

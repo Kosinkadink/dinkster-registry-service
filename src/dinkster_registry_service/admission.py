@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
-from dinkster_schema import canonical_name
+from dinkster_schema import canonical_claim, canonical_name
 from packaging.version import Version
 from sqlalchemy import and_, or_, select, text
 from sqlalchemy.orm import Session
@@ -594,7 +594,10 @@ class AdmissionService:
                     session.flush()
                 claims = {
                     canonical_name(candidate.pack_name),
-                    *(canonical_name(value) for value in cast("list[str]", manifest["namespaces"])),
+                    *(
+                        canonical_claim(value)
+                        for value in cast("list[str]", manifest["namespaces"])
+                    ),
                 }
                 for claim_name in sorted(claims):
                     grant = session.get(NamespaceGrantRecord, claim_name)
@@ -932,7 +935,14 @@ class AdmissionService:
         with extracted_archive(data) as root:
             if claim.kind == "upload":
                 with self.database.session() as session:
-                    manifest = run_manifest_admission(root, claim.pack_name, claim.version, session)
+                    candidate = self._leased_candidate(session, claim)
+                    manifest = run_manifest_admission(
+                        root,
+                        claim.pack_name,
+                        claim.version,
+                        session,
+                        publisher=candidate.publisher_id,
+                    )
                 if not self._record_stage(claim, "manifest", manifest):
                     return
                 review |= manifest.review

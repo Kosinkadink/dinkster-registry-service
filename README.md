@@ -46,14 +46,14 @@ resolution all use the shared schema and FastAPI routes on both backends.
 
 ## Run the fixture catalog
 
-Requirements are Docker with Compose, Python 3.12, uv, Git, GitHub CLI, and
-authenticated read access to the private Dinkster repository. The second command
+Requirements are Docker with Compose, Python 3.12, uv, and Git. The pinned
+Dinkster source is public and needs no repository token. The second command
 starts PostgreSQL 16, migrates and seeds the database, starts the service on
 port 18041, and starts one isolated scanner worker.
 
 ```sh
-env -u GITHUB_TOKEN uv sync --frozen
-DOCKER_BUILDKIT=1 DINKSTER_REPO_TOKEN="$(env -u GITHUB_TOKEN gh auth token)" docker-compose up --build --wait
+env -u GH_TOKEN -u GITHUB_TOKEN uv sync --frozen
+DOCKER_BUILDKIT=1 docker-compose up --build --wait
 uv run python conformance/run.py http://127.0.0.1:18041
 docker-compose down --volumes --remove-orphans --rmi local
 ```
@@ -70,9 +70,10 @@ are rootless, uncompressed ZIP files with sorted paths, ZIP epoch timestamps,
 
 ## Release admission
 
-Submission, status, and re-scan commands connect directly to PostgreSQL and the
-object store. There is no public HTTP mutation route and no unauthenticated
-publishing path. The scanner runs these mandatory checks in order:
+Submission, status, and re-scan commands connect directly to the database and
+object store. HTTP publishing and review routes require bearer authentication;
+there is no unauthenticated publishing path. The scanner runs these mandatory
+checks in order:
 
 1. `ingest_integrity`: verifies size, BLAKE3, ZIP structure and CRCs, safe
    paths, regular files, limits, stored compression, and deterministic bytes.
@@ -86,6 +87,14 @@ publishing path. The scanner runs these mandatory checks in order:
    refuses the degraded bubblewrap rung or any host without isolation.
 5. `fast_security`: scans for confirmed secrets and known-bad file hashes and
    inventories native, executable, bytecode-only, and obfuscated content.
+
+The submission URL or CLI version is the release version; `[pack.release]` is
+not required or read. Optional `dinkster`, `license`, and `repository` metadata
+comes from `[pack]`. Missing version ranges and licenses are reported as empty
+strings, not invented compatibility or license claims. Dinkster's host/API
+contracts remain mandatory. Reserved namespaces require the registry-local
+`dinkster` publisher, not merely a publisher string in the submitted manifest.
+Exact node-ID claims retain their spelling using Dinkster's shared grammar.
 
 The development Compose scanner runs as root in a privileged container so
 bubblewrap can create full user, PID, mount, and network namespaces on Docker
@@ -123,7 +132,7 @@ registry, build the registry's deterministic test fixture inside the container,
 and submit it:
 
 ```sh
-DOCKER_BUILDKIT=1 DINKSTER_REPO_TOKEN="$(env -u GITHUB_TOKEN gh auth token)" DINKSTER_SEED_FIXTURES=0 docker-compose up --build --wait
+DOCKER_BUILDKIT=1 DINKSTER_SEED_FIXTURES=0 docker-compose up --build --wait
 docker-compose exec -T registry python -c 'from pathlib import Path; from dinkster_registry_service.artifacts import build_registry_fixture_archive; from dinkster_registry_service.seed import FIXTURE_ROOT; Path("/tmp/example-pack.zip").write_bytes(build_registry_fixture_archive(FIXTURE_ROOT / "example-pack"))'
 candidate_id="$(docker-compose exec -T registry dinkster-registry submit /tmp/example-pack.zip --pack example-pack --version 1.2.3)"
 docker-compose exec -T registry dinkster-registry status "$candidate_id"
@@ -283,8 +292,8 @@ uv run dinkster-registry scanner
 
 Configuration uses `DINKSTER_DATABASE_URL`, `DINKSTER_OBJECT_STORE_ROOT`,
 `DINKSTER_PUBLIC_BASE_URL`, and `DINKSTER_CURSOR_SECRET`. Development startup also
-accepts `DINKSTER_SEED_FIXTURES=0` to keep the catalog empty. Only PostgreSQL URLs
-are accepted. Production deployments must provide a shared unpredictable
+accepts `DINKSTER_SEED_FIXTURES=0` to keep the catalog empty. PostgreSQL and SQLite
+URLs are accepted. Production deployments must provide a shared unpredictable
 cursor secret and a public base URL that clients can reach.
 
 Probe and scanner limits use integer environment variables validated at
@@ -314,6 +323,5 @@ uv build --all-packages
 ```
 
 CI runs these checks against PostgreSQL 16, starts the HTTP conformance runner,
-builds the container with the private dependency credential as a BuildKit
-secret, inspects image contents, runs the isolated probe under bubblewrap, and
-runs conformance against the image.
+builds the container without dependency credentials, inspects image contents,
+runs the isolated probe under bubblewrap, and runs conformance against the image.

@@ -28,14 +28,8 @@ jobs:
         with:
           enable-cache: true
           python-version: "3.12"
-      - name: Sync private Dinkster dependency
-        env:
-          DINKSTER_REPO_TOKEN: ${{ secrets.DINKSTER_REPO_TOKEN }}
-        run: |
-          GIT_CONFIG_COUNT=1 \
-          GIT_CONFIG_KEY_0="url.https://x-access-token:${DINKSTER_REPO_TOKEN}@github.com/.insteadOf" \
-          GIT_CONFIG_VALUE_0="https://github.com/" \
-          env -u GITHUB_TOKEN uv sync --frozen
+      - name: Sync public Dinkster dependency without credentials
+        run: env -u GH_TOKEN -u GITHUB_TOKEN uv sync --frozen
       - name: Verify no global Git URL rewrites
         run: |
           test -z "$(git config --global --get-regexp '^url\.' || true)"
@@ -76,14 +70,8 @@ jobs:
           enable-cache: true
           python-version: "3.12"
           save-cache: false
-      - name: Sync private Dinkster dependency
-        env:
-          DINKSTER_REPO_TOKEN: ${{ secrets.DINKSTER_REPO_TOKEN }}
-        run: |
-          GIT_CONFIG_COUNT=1 \
-          GIT_CONFIG_KEY_0="url.https://x-access-token:${DINKSTER_REPO_TOKEN}@github.com/.insteadOf" \
-          GIT_CONFIG_VALUE_0="https://github.com/" \
-          env -u GITHUB_TOKEN uv sync --frozen
+      - name: Sync public Dinkster dependency without credentials
+        run: env -u GH_TOKEN -u GITHUB_TOKEN uv sync --frozen
       - name: Verify no global Git URL rewrites
         run: |
           test -z "$(git config --global --get-regexp '^url\.' || true)"
@@ -128,9 +116,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Build container
-        env:
-          DINKSTER_REPO_TOKEN: ${{ secrets.DINKSTER_REPO_TOKEN }}
-        run: DOCKER_BUILDKIT=1 docker build --secret id=dinkster_repo_token,env=DINKSTER_REPO_TOKEN --tag dinkster-registry:test .
+        run: DOCKER_BUILDKIT=1 docker build --tag dinkster-registry:test .
       - name: Inspect container contents
         run: |
           image_size_bytes=$(docker image inspect --format '{{.Size}}' dinkster-registry:test)
