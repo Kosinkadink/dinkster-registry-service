@@ -41,6 +41,8 @@ def main() -> int:
         previous_image = images.pop()
         if not previous_image:
             raise RuntimeError("Previous image is missing; refusing deployment without rollback")
+        # flyctl resolves --config as an existing input before saving the remote config.
+        previous_config.touch(mode=0o600)
         subprocess.run(
             [
                 "flyctl",
