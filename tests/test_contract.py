@@ -41,6 +41,13 @@ from dinkster_registry_service.wire import (
 PUBLIC_CACHE = "public, max-age=60, stale-while-revalidate=300"
 
 
+def test_healthz_is_uncached_database_readiness(client: TestClient) -> None:
+    response = client.get("/healthz")
+    assert response.status_code == 200
+    assert response.content == b""
+    assert response.headers["cache-control"] == "no-store"
+
+
 def assert_public_metadata(response: Response) -> None:
     headers = response.headers
     assert headers["cache-control"] == PUBLIC_CACHE

@@ -15,14 +15,45 @@ operator-review candidates are never visible through public catalog routes.
 
 Pull requests and main pushes run checks, HTTP conformance, and container
 validation in GitHub Actions. Each job has a 10-minute bound. The required
-`CI_RUNNERS` repository variable routes all three CPU-only jobs to the
-repository's one temporary X570 runner:
+`CI_RUNNERS` repository variable routes all three CPU-only jobs. Hosted Actions
+billing is enabled; the hosted Linux configuration is:
 
 ```json
-{"linux":["self-hosted","linux","x64"],"windows":["windows-latest"],"macos":["macos-latest"],"forkLinux":["ubuntu-latest"]}
+{"linux":["ubuntu-latest"],"windows":["windows-latest"],"macos":["macos-latest"],"forkLinux":["ubuntu-latest"]}
 ```
 
-The runner has no `gpu` label, and the workflows do not run GPU validation.
+The workflows do not require a self-hosted runner or GPU.
+
+## Fly foundations preparation
+
+Production deployment remains disabled. The current object store writes pack
+archives and quarantine data to local disk, and polled catalog lists still
+query the database. Shared R2/S3 storage and publish-time static JSON indexes
+must replace those paths before two hosted replicas can serve production.
+The image's `/data` directory and volume remain for existing local deployments;
+they are not production durability. Official pack compatibility, publishing
+and installation work are separate from these health/deploy foundations.
+
+`/healthz` checks database connectivity without caching. `/v1/health` retains
+its protocol response. The plain nonroot image binds to IPv6. `fly.toml`
+prepares two shared-cpu-1x 512 MB instances with TLS and health checks, but
+creates no resource. Inject `DINKSTER_DATABASE_URL`, `DINKSTER_CURSOR_SECRET`
+and storage credentials through environment secrets, never the image.
+
+The [CI workflow](https://github.com/Kosinkadink/dinkster-registry-service/actions/workflows/ci.yml)
+calls the repository-local reusable workflow after all checks pass on main.
+It builds the exact pushed commit on GitHub-hosted Ubuntu, pushes an immutable image digest,
+then runs `fly deploy --image`. Set `FLY_REGION` to the approved `iad` or `sjc`,
+and leave `FLY_DEPLOY_ENABLED` unset until storage, database and owner prerequisites
+are complete. Production secrets supply `FLY_API_TOKEN` and the private build
+credential. No production run exists yet; record its URL here after live proof.
+
+The deploy helper saves the previous image and Fly configuration. On failure
+it restores both, skips release commands, and remains failed. Bootstrap has
+no previous release and must be supervised separately. Migrate independently
+with code compatible with rollback; image rollback cannot undo schema, data
+or secret changes. The repository is named `dinkster-registry-service`; the
+Fly application remains `dinkster-registry`.
 
 ## Self-host with SQLite
 
