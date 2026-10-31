@@ -12,6 +12,7 @@ from botocore.exceptions import BotoCoreError, ClientError  # type: ignore[impor
 
 MAX_ARTIFACT_SIZE = 64 * 1024 * 1024
 READ_CHUNK_SIZE = 64 * 1024
+INDEX_KEYS = frozenset({"packs/index.json", "translations/index.json"})
 
 
 class ObjectStoreError(RuntimeError):
@@ -46,6 +47,8 @@ class StoredObject:
 class ObjectStore(Protocol):
     def put(self, key: str, data: bytes) -> None: ...
 
+    def replace_index(self, key: str, data: bytes) -> None: ...
+
     def read(self, key: str, *, max_size: int = MAX_ARTIFACT_SIZE) -> bytes: ...
 
     def open(self, key: str, *, expected_size: int, expected_digest: str) -> StoredObject: ...
@@ -73,6 +76,14 @@ class LocalFilesystemObjectStore:
             if not self._matches(destination, data):
                 raise ObjectStoreError(f"object {key!r} already exists with different bytes")
             return
+        self._write(destination, data)
+
+    def replace_index(self, key: str, data: bytes) -> None:
+        _validate_index(key, data)
+        self._write(self._path(key), data)
+
+    @staticmethod
+    def _write(destination: Path, data: bytes) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as temporary:
             temporary.write(data)
@@ -169,6 +180,19 @@ class S3ObjectStore:
         if not self._matches(key, data):
             raise ObjectStoreError(f"object {key!r} already exists with different bytes")
 
+    def replace_index(self, key: str, data: bytes) -> None:
+        _validate_index(key, data)
+        try:
+            self._client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=data,
+                ContentType="application/json",
+                CacheControl="public, max-age=60",
+            )
+        except (BotoCoreError, ClientError) as error:
+            self._raise_storage_error(error)
+
     def read(self, key: str, *, max_size: int = MAX_ARTIFACT_SIZE) -> bytes:
         if max_size < 1:
             raise ObjectStoreError("object read limit must be positive")
@@ -260,3 +284,10 @@ class S3ObjectStore:
     def _raise_storage_error(error: BotoCoreError | ClientError) -> None:
         del error
         raise ObjectStoreError("S3 object storage operation failed") from None
+
+
+def _validate_index(key: str, data: bytes) -> None:
+    if key not in INDEX_KEYS:
+        raise ObjectStoreError("only public static indexes may be replaced")
+    if not 1 <= len(data) <= MAX_ARTIFACT_SIZE:
+        raise ObjectStoreError(f"index size must be between 1 and {MAX_ARTIFACT_SIZE} bytes")

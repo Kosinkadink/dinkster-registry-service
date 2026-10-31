@@ -872,7 +872,14 @@ service.run_once()
             )
         )
         assert attempts == {1, 2}
-        assert session.scalar(select(func.count()).select_from(OutboxRecord)) == 1
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(OutboxRecord)
+                .where(OutboxRecord.topic == "artifact.promote")
+            )
+            == 1
+        )
         candidate = session.get(ReleaseCandidateRecord, candidate_id)
         assert candidate is not None and candidate.release_id is not None
 
@@ -916,7 +923,14 @@ def test_two_workers_promote_ten_candidates_without_duplicates(
 
     with database.session() as session:
         assert session.scalar(select(func.count()).select_from(ReleaseRecord)) == 10
-        assert session.scalar(select(func.count()).select_from(OutboxRecord)) == 10
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(OutboxRecord)
+                .where(OutboxRecord.topic == "artifact.promote")
+            )
+            == 10
+        )
         assert (
             session.scalar(
                 select(func.count(func.distinct(ReleaseRecord.pack_id))).select_from(ReleaseRecord)
@@ -999,10 +1013,25 @@ def _assert_reviewed_rescan_decision(
         assert release is not None
         assert release.state == ("active" if accepted else "quarantined")
         assert release.state_reason == (None if accepted else "rescan reviewed")
-        assert session.scalar(select(func.count()).select_from(OutboxRecord)) == 1
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(OutboxRecord)
+                .where(OutboxRecord.topic == "artifact.promote")
+            )
+            == 1
+        )
     with _client(database_url, tmp_path / "objects") as client:
         response = client.get("/v1/packs/reviewed-rescan-pack")
         assert response.status_code == (200 if accepted else 404)
+        if not accepted:
+            assert service.run_once()
+        for key in ("packs/index.json", "translations/index.json"):
+            index = client.get(f"/{key}")
+            assert index.status_code == 200
+            assert [item["name"] for item in index.json()["items"]] == (
+                ["reviewed-rescan-pack"] if accepted else []
+            )
 
 
 @pytest.mark.parametrize("accepted", (True, False), ids=("accept", "reject"))

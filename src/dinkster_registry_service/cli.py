@@ -16,6 +16,7 @@ from dinkster_registry import RegistryError
 from .admission import AdmissionService
 from .app import create_app
 from .database import Database
+from .indexes import StaticIndexes
 from .object_store import MAX_ARTIFACT_SIZE
 from .principals import PrincipalRepository
 from .seed import seed_fixtures
@@ -28,6 +29,12 @@ def _parser() -> argparse.ArgumentParser:
     seed_parser = subparsers.add_parser("seed", help="load the two public fixture packs")
     seed_parser.add_argument("--database-url")
     seed_parser.add_argument("--object-store-root")
+
+    indexes_parser = subparsers.add_parser(
+        "rebuild-indexes", help="publish both public static indexes"
+    )
+    indexes_parser.add_argument("--database-url")
+    indexes_parser.add_argument("--object-store-root")
 
     serve_parser = subparsers.add_parser("serve", help="run the registry HTTP service")
     serve_parser.add_argument("--host", default="127.0.0.1")
@@ -107,7 +114,17 @@ def main() -> None:
     if getattr(args, "database_url", None) is not None:
         settings = replace(settings, database_url=args.database_url)
     if getattr(args, "object_store_root", None) is not None:
-        settings = replace(settings, object_store_root=args.object_store_root)
+        settings = replace(settings, object_store_root=Path(args.object_store_root))
+    if args.command == "rebuild-indexes":
+        database = Database(settings.database_url)
+        try:
+            count = StaticIndexes(
+                database, settings.create_object_store(), settings.public_base_url
+            ).rebuild()
+            print(f"Published pack and translation indexes for {count} releases.")
+        finally:
+            database.dispose()
+        return
     if args.command == "seed":
         database = Database(settings.database_url)
         try:

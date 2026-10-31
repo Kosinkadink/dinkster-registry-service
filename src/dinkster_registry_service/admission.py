@@ -45,6 +45,7 @@ from .database import (
 from .digests import artifact_digest, artifact_object_key
 from .identifiers import require_canonical_pack_name
 from .ids import uuid7
+from .indexes import StaticIndexes, queue_index_rebuild
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStore, ObjectStoreError
 from .seed import MEDIA_TYPE
 from .settings import ServerSettings
@@ -154,6 +155,7 @@ class AdmissionService:
         self.database = database
         self.object_store = object_store
         self.settings = settings or ServerSettings()
+        self.indexes = StaticIndexes(database, object_store, self.settings.public_base_url)
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
         self.require_isolation = require_isolation
@@ -497,6 +499,7 @@ class AdmissionService:
         release.state = "quarantined"
         release.state_reason = reason
         release.state_changed_at = now
+        queue_index_rebuild(session)
         pack = session.get(PackRecord, release.pack_id)
         if pack is None or pack.latest_version != release.version:
             return
@@ -840,6 +843,7 @@ class AdmissionService:
                 outbox.state = "delivered"
                 outbox.delivered_at = now
                 outbox.attempts += 1
+                queue_index_rebuild(session)
                 session.add(
                     AuditEventRecord(
                         id=uuid7(),
@@ -852,6 +856,7 @@ class AdmissionService:
                 )
         if failure is not None:
             return True
+        self.indexes.deliver_one()
         self.object_store.remove(source_key)
         return True
 
@@ -1007,6 +1012,8 @@ class AdmissionService:
             )
 
     def run_once(self) -> bool:
+        if self.indexes.deliver_one():
+            return True
         if self.deliver_one_promotion():
             return True
         claim = self.claim()

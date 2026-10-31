@@ -367,6 +367,20 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             etag_context={"endpoint": "health"},
         )
 
+    @app.get("/packs/index.json")
+    @app.get("/translations/index.json")
+    def static_index(request: Request) -> Response:
+        _query(request, EmptyQuery)
+        try:
+            body = object_store.read(request.url.path.lstrip("/"))
+        except FileNotFoundError:
+            raise _not_found("The static index has not been published.") from None
+        etag = f'"{blake3(body).hexdigest()}"'
+        headers = {"ETag": etag, "Cache-Control": PUBLIC_CACHE}
+        if _etag_matches(request.headers.get("if-none-match", ""), etag):
+            return Response(status_code=304, headers=headers)
+        return Response(body, media_type="application/json", headers=headers)
+
     @app.post("/v1/publish/{canonical_name}/versions/{canonical_version}")
     async def publish(request: Request, canonical_name: str, canonical_version: str) -> Response:
         _query(request, EmptyQuery)

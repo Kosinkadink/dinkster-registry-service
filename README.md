@@ -13,6 +13,44 @@ to immutable artifact storage. Bearer-authenticated HTTP routes accept publisher
 submissions and operator review decisions. Pending, rejected, and
 operator-review candidates are never visible through public catalog routes.
 
+## Static public indexes
+
+Every accepted publish queues a durable rebuild of `packs/index.json` and
+`translations/index.json` in the configured object store and immediately
+attempts delivery. Both contain deterministic JSON with `schemaVersion: 1` and
+an `items` array of active public releases, ordered by pack name and version
+text. Each entry includes `name`, `version`, BLAKE3 `digest`, byte `size`, and
+the artifact download `url`. Translation entries also contain `catalogs`, an
+array of locale, SHA-256 digest, and path within the same ZIP. An empty array
+means the release carries no locale catalog. Quarantine queues a rebuild to
+remove the release from both lists.
+
+The service serves the stored bytes at `/packs/index.json` and
+`/translations/index.json`, with content-derived ETags and `If-None-Match`
+support (304). The object-store indexes have a 60-second public cache lifetime.
+Artifact bytes remain immutable; only these two index keys can be replaced.
+Production stores all three in R2 through the S3 API, not on local disk.
+
+Index delivery is eventually consistent with SQL acceptance. A storage outage
+does not undo an accepted artifact: the scanner retries the durable event after
+five seconds. Each object replacement is atomic, but the pair is not a single
+transaction; a failure between writes can temporarily expose different
+snapshots. A retry rebuilds both from current catalog state. PostgreSQL advisory
+transaction locks serialize snapshot reads and writes across replicas; SQLite
+uses an immediate transaction. A slower writer cannot overwrite a newer
+snapshot after another writer completes. Before any publish or rebuild, index
+requests return 404 rather than synthesizing a different database view.
+
+Operators can rebuild both indexes from current catalog state with the same
+database and object-store environment settings used by the service:
+
+```sh
+uv run dinkster-registry rebuild-indexes
+```
+
+Seeding development fixtures does not simulate publish acceptance. Run the
+rebuild command after `seed` to expose fixtures through the static indexes.
+
 Pull requests and main pushes run checks, HTTP conformance, and container
 validation in GitHub Actions. Each job has a 10-minute bound. The required
 `CI_RUNNERS` repository variable routes all three CPU-only jobs to the

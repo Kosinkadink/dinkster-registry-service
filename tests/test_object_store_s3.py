@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import os
+import shutil
 from collections.abc import Iterator
 from pathlib import Path
 from uuid import uuid4
@@ -10,6 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 from moto.server import ThreadedMotoServer
 
+from dinkster_registry_service.admission import AdmissionService
 from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
 from dinkster_registry_service.database import Database
@@ -88,6 +91,12 @@ def test_s3_store_is_immutable_and_streams_verified_objects(s3_store: S3ObjectSt
 
     with pytest.raises(ObjectStoreError, match="different bytes"):
         s3_store.put(key, b"replacement bytes")
+    s3_store.replace_index("packs/index.json", b'{"items":[]}')
+    s3_store.replace_index("packs/index.json", b'{"items":[1]}')
+    assert s3_store.read("packs/index.json") == b'{"items":[1]}'
+    with pytest.raises(ObjectStoreError, match="only public static indexes"):
+        s3_store.replace_index(key, b"replacement bytes")
+    assert s3_store.read(key) == data
     with pytest.raises(ObjectStoreError, match="exceeds its declared size"):
         s3_store.open(key, expected_size=len(data) - 1, expected_digest=artifact_digest(data))
     with pytest.raises(ObjectStoreError, match="digest differs"):
@@ -134,3 +143,69 @@ def test_production_api_downloads_from_s3_without_local_artifacts(
     assert response.content == expected
     assert response.headers["X-Dinkster-Artifact-Digest"] == artifact_digest(expected)
     assert not local_root.exists()
+
+
+def test_accepted_publish_updates_both_s3_indexes_with_conditional_get(
+    database: Database,
+    database_url: str,
+    s3_store: S3ObjectStore,
+    s3_endpoint_url: str,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "pack"
+    shutil.copytree(FIXTURE_ROOT / "example-pack", source)
+    source.joinpath("locales").mkdir()
+    catalog = b'{"nodes":{"example.resize":{"displayName":"Resize"}}}'
+    source.joinpath("locales/en.json").write_bytes(catalog)
+    archive = build_registry_fixture_archive(source)
+    settings = ServerSettings(
+        database_url=database_url,
+        environment="production",
+        public_base_url="http://testserver",
+        object_store_root=tmp_path / "unused-artifacts",
+        s3_endpoint_url=s3_endpoint_url,
+        s3_bucket=s3_store.bucket,
+        s3_access_key_id=TEST_S3_ACCESS_KEY_ID,
+        s3_secret_access_key=TEST_S3_SECRET_ACCESS_KEY,
+        s3_region=TEST_S3_REGION,
+    )
+    service = AdmissionService(database, s3_store, settings=settings, require_isolation=False)
+    with TestClient(create_app(settings)) as client:
+        assert client.get("/packs/index.json").status_code == 404
+        candidate = service.submit(archive, pack_name="example-pack", version="1.2.3")
+        assert service.run_once()
+        assert service.status(candidate).status == "accepted"
+        etags = {}
+        for key in ("packs/index.json", "translations/index.json"):
+            response = client.get(f"/{key}")
+            assert response.status_code == 200
+            assert response.content == s3_store.read(key)
+            assert response.json()["schemaVersion"] == 1
+            items = response.json()["items"]
+            assert len(items) == 1
+            assert (items[0]["name"], items[0]["version"], items[0]["digest"]) == (
+                "example-pack",
+                "1.2.3",
+                artifact_digest(archive),
+            )
+            assert client.get(items[0]["url"]).content == archive
+            etags[key] = response.headers["ETag"]
+            conditional = client.get(f"/{key}", headers={"If-None-Match": etags[key]})
+            assert conditional.status_code == 304
+            assert conditional.content == b""
+            if key == "translations/index.json":
+                assert items[0]["catalogs"] == [
+                    {
+                        "locale": "en",
+                        "path": "locales/en.json",
+                        "digest": "sha256:" + hashlib.sha256(catalog).hexdigest(),
+                    }
+                ]
+        second = service.submit(archive, pack_name="example-pack", version="1.2.4")
+        assert service.run_once()
+        assert service.status(second).status == "accepted"
+        for key, etag in etags.items():
+            response = client.get(f"/{key}", headers={"If-None-Match": etag})
+            assert response.status_code == 200
+            assert [item["version"] for item in response.json()["items"]] == ["1.2.3", "1.2.4"]
+    assert not settings.object_store_root.exists()

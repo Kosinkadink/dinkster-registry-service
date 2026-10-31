@@ -235,6 +235,14 @@ def _manifest_payload(manifest: PackManifest, release: dict[str, object]) -> dic
         ],
         "repository": release.get("repository"),
         "namespaces": list(manifest.namespaces),
+        "localeCatalogs": [
+            {
+                "locale": catalog.locale,
+                "digest": catalog.digest,
+                "path": f"locales/{catalog.locale}.json",
+            }
+            for catalog in manifest.locale_catalogs
+        ],
         "templates": [
             {
                 "id": template.id,
