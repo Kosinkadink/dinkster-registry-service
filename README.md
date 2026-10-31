@@ -88,10 +88,15 @@ checks in order:
    with no network, read-only binds, and CPU, memory, process, file-size, and
    wall-time limits. The scanner requires full user and PID namespaces and
    refuses the degraded bubblewrap rung or any host without isolation. Declared
-   `requires` are installed as wheels in a disposable per-submission environment
-   before the network-disabled probe. Resolution failures are named findings;
-   source builds and direct URL requirements are refused. The API image does not
-   carry pack-specific dependencies, and the environment is removed after probing.
+   Python requirements use Dinkster's `requires_for("cpu")`: base `requires` plus
+   `[pack.extra-requires].cpu`, with normal platform markers. This CPU-only
+   schema probe does not validate other accelerator environments. Wheels are
+   installed into a disposable per-submission directory before probing, without
+   processing dependency `.pth` startup files. The trusted interpreter and doctor
+   load before dependency paths are exposed, and the jail applies limits before
+   importing dependencies. Resolution failures are named findings; source builds
+   and direct URL requirements are refused. The API image does not carry
+   pack-specific dependencies, and the directory is removed after probing.
 5. `fast_security`: scans for confirmed secrets and known-bad file hashes and
    inventories native, executable, bytecode-only, and obfuscated content.
 

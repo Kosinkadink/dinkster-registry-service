@@ -26,7 +26,16 @@ def check_dependency_environment() -> None:
         wheel = package / "probe_dependency-1.0-py3-none-any.whl"
         marker = root / "outside-jail"
         files = {
-            "probe_dependency.py": "VALUE = 83\n",
+            "probe_dependency.py": (
+                "import resource\n"
+                "assert 0 < resource.getrlimit(resource.RLIMIT_CPU)[0] <= 300\n"
+                "assert 0 < resource.getrlimit(resource.RLIMIT_FSIZE)[0] <= 64 * 1024 * 1024\n"
+                "VALUE = 83\n"
+            ),
+            "dinkster_workers/__init__.py": "raise RuntimeError('counterfeit harness imported')\n",
+            "dinkster_workers/_doctor_probe.py": (
+                "raise RuntimeError('counterfeit probe imported')\n"
+            ),
             "probe_dependency-1.0.dist-info/METADATA": (
                 "Metadata-Version: 2.1\nName: probe-dependency\nVersion: 1.0\n"
             ),
@@ -68,7 +77,7 @@ def check_dependency_environment() -> None:
             nodes = pack / "nodes.py"
             nodes.write_text(
                 "from probe_dependency import VALUE\nimport builtins, socket\n"
-                "assert builtins.DEPENDENCY_STARTUP == 'jailed'\n"
+                "assert not hasattr(builtins, 'DEPENDENCY_STARTUP')\n"
                 "try:\n"
                 f" socket.create_connection(('127.0.0.1', {server.server_port}), timeout=1)\n"
                 "except OSError:\n pass\n"

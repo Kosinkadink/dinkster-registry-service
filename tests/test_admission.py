@@ -172,6 +172,9 @@ def probe_package_index(tmp_path: Path) -> Iterator[str]:
     wheel = package / "probe_dependency-1.0-py3-none-any.whl"
     files = {
         "probe_dependency.py": "VALUE = 83\n",
+        "dependency-startup.pth": "import sys; sys.stderr.write('UNTRUSTED_STARTUP')\n",
+        "dinkster_workers/__init__.py": "raise RuntimeError('counterfeit harness imported')\n",
+        "dinkster_workers/_doctor_probe.py": "raise RuntimeError('counterfeit probe imported')\n",
         "probe_dependency-1.0.dist-info/METADATA": (
             "Metadata-Version: 2.1\nName: probe-dependency\nVersion: 1.0\n"
         ),
@@ -201,20 +204,28 @@ def probe_package_index(tmp_path: Path) -> Iterator[str]:
         thread.join()
 
 
+@pytest.mark.parametrize("extra", (False, True))
 @pytest.mark.parametrize("version", ("1.0", "9.9"))
 def test_probe_installs_declared_dependencies_and_cleans_environment(
-    tmp_path: Path, probe_package_index: str, version: str
+    tmp_path: Path, probe_package_index: str, version: str, extra: bool
 ) -> None:
     source = _fixture_source(tmp_path)
     manifest = source / "dinkster-pack.toml"
-    manifest.write_text(
-        manifest.read_text().replace(
-            "[pack]\n", f'[pack]\nrequires = ["probe-dependency=={version}"]\n'
+    if extra:
+        manifest.write_text(
+            manifest.read_text()
+            + f'\n[pack.extra-requires]\ncpu = ["probe-dependency=={version}"]\n'
+            + 'cuda = ["probe-dependency==99.0"]\n'
         )
-    )
+    else:
+        manifest.write_text(
+            manifest.read_text().replace(
+                "[pack]\n", f'[pack]\nrequires = ["probe-dependency=={version}"]\n'
+            )
+        )
     nodes = source / "nodes.py"
     nodes.write_text(
-        "import sys\nprint('PROBE_INTERPRETER=' + sys.executable)\n"
+        "import probe_dependency\nprint('DEPENDENCY_FILE=' + probe_dependency.__file__)\n"
         "from probe_dependency import VALUE\n"
         + nodes.read_text().replace("version=2,", "version=VALUE,")
     )
@@ -233,9 +244,10 @@ def test_probe_installs_declared_dependencies_and_cleans_environment(
         assert result.operator_details is not None
         payload = json.loads(result.operator_details["stdoutTail"])
         output = payload["doctorReport"]["import_stdout"]
-        interpreter = Path(output.split("PROBE_INTERPRETER=", 1)[1].splitlines()[0])
-        assert interpreter != Path(sys.executable)
-        assert not interpreter.parent.parent.exists()
+        dependency_file = Path(output.split("DEPENDENCY_FILE=", 1)[1].splitlines()[0])
+        assert dependency_file.is_relative_to(source)
+        assert not dependency_file.parent.exists()
+        assert result.operator_details["stderrTail"] == ""
     assert "probe_dependency" not in sys.modules
 
 

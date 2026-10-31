@@ -584,7 +584,7 @@ def run_executable_probe(
     configured = settings or ServerSettings()
     try:
         manifest = load_manifest(root / MANIFEST_NAME)
-        requirements = [Requirement(value) for value in manifest.requires]
+        requirements = [Requirement(value) for value in manifest.requires_for("cpu")]
     except (ManifestError, InvalidRequirement):
         return StageResult(
             (_block("probe.dependencies-invalid", "Pack requirements are invalid."),)
@@ -598,76 +598,64 @@ def run_executable_probe(
             )
         )
     if not requirements:
-        return _run_executable_probe(root, configured, require_isolation, sys.executable)
+        return _run_executable_probe(root, configured, require_isolation)
     installer = shutil.which("uv")
     if installer is None:
         return StageResult(
             (_block("probe.dependencies-unavailable", "The dependency installer is unavailable."),)
         )
-    with tempfile.TemporaryDirectory(prefix="dinkster-registry-probe-") as directory:
-        environment = Path(directory) / "environment"
-        interpreter = environment / "bin" / "python"
+    # The existing probe mount exposes dependencies read-only, without mounting
+    # another host directory or changing the submitted archive bytes.
+    with tempfile.TemporaryDirectory(prefix=".registry-probe-", dir=root) as directory:
+        dependencies = Path(directory)
         common = [installer, "--no-config", "--no-cache", "--no-python-downloads", "--no-progress"]
-        commands = [
-            [*common, "venv", "--no-project", "--python", sys.executable, str(environment)],
-            [
-                *common,
-                "pip",
-                "install",
-                "--python",
-                str(interpreter),
-                "--only-binary",
-                ":all:",
-                "--keyring-provider",
-                "disabled",
-                "--index-url",
-                configured.probe_package_index_url,
-                "--no-sources",
-                *[str(requirement) for requirement in requirements],
-            ],
+        command = [
+            *common,
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            "--target",
+            str(dependencies),
+            "--only-binary",
+            ":all:",
+            "--keyring-provider",
+            "disabled",
+            "--index-url",
+            configured.probe_package_index_url,
+            "--no-sources",
+            *[str(requirement) for requirement in requirements],
         ]
-        deadline = time.monotonic() + configured.probe_dependency_timeout_seconds
-        for command in commands:
-            remaining = max(1, int(deadline - time.monotonic()))
-            try:
-                completed = _run_probe_process(
-                    command,
-                    timeout_seconds=remaining,
-                    output_limit_bytes=configured.probe_output_limit_bytes,
-                )
-            except OSError:
-                return StageResult(
-                    (_block("probe.dependencies-unavailable", "Dependency provisioning failed."),)
-                )
-            if completed.returncode or completed.timed_out or completed.output_limit:
-                return StageResult(
-                    (
-                        _block(
-                            "probe.dependencies-unresolved",
-                            "Declared dependencies could not be provisioned as wheels "
-                            "within the limits.",
-                        ),
+        try:
+            completed = _run_probe_process(
+                command,
+                timeout_seconds=configured.probe_dependency_timeout_seconds,
+                output_limit_bytes=configured.probe_output_limit_bytes,
+            )
+        except OSError:
+            return StageResult(
+                (_block("probe.dependencies-unavailable", "Dependency provisioning failed."),)
+            )
+        if completed.returncode or completed.timed_out or completed.output_limit:
+            return StageResult(
+                (
+                    _block(
+                        "probe.dependencies-unresolved",
+                        "Declared dependencies could not be provisioned as wheels "
+                        "within the limits.",
                     ),
-                )
-        # Only the jailed interpreter starts after wheel installation: .pth files
-        # from dependencies must never execute in the scanner's host environment.
-        site_packages = (
-            environment
-            / "lib"
-            / f"python{sys.version_info.major}.{sys.version_info.minor}"
-            / "site-packages"
-        )
-        site_packages.joinpath("registry-probe-host.pth").write_text(
-            "\n".join(path for path in sys.path if path and Path(path).is_absolute()) + "\n"
-        )
-        return _run_executable_probe(root, configured, require_isolation, str(interpreter))
+                ),
+            )
+        # Never run site.addsitedir: dependency .pth files must not run before
+        # the trusted harness or gain the ability to replace it at startup.
+        return _run_executable_probe(root, configured, require_isolation, dependencies)
 
 
 def _run_executable_probe(
     root: Path,
     configured: ServerSettings,
     require_isolation: bool,
-    interpreter: str,
+    dependencies: Path | None = None,
 ) -> StageResult:
     manifest_path = root / MANIFEST_NAME
     jail = None
@@ -689,7 +677,24 @@ def _run_executable_probe(
     probe_module = (
         "dinkster_registry_service.probe" if jail is None else "dinkster_workers._doctor_probe"
     )
-    command = [interpreter, "-m", probe_module, str(manifest_path)]
+    command = [sys.executable, "-m", probe_module, str(manifest_path)]
+    environment = _probe_environment()
+    if dependencies is not None:
+        # Dinkster's trusted bootstrap imports the harness, then installs these
+        # paths and limits before invoking it. Trusted imports stay first.
+        paths = [path for path in sys.path if path and Path(path).is_absolute()]
+        environment["PYTHONPATH"] = os.pathsep.join([*paths, str(dependencies)])
+        if jail is None:
+            command = [
+                sys.executable,
+                "-c",
+                "import runpy, sys; "
+                f"sys.path.extend([{str(dependencies)!r}]); "
+                "sys.argv = sys.argv[1:]; "
+                f"runpy.run_module({probe_module!r}, run_name='__main__')",
+                probe_module,
+                str(manifest_path),
+            ]
     try:
         if jail is None:
             completed = _run_probe_process(
@@ -699,7 +704,7 @@ def _run_executable_probe(
             )
         else:
             with tempfile.TemporaryFile() as environment_file:
-                environment_file.write(json.dumps(_probe_environment()).encode("utf-8"))
+                environment_file.write(json.dumps(environment).encode("utf-8"))
                 environment_file.flush()
                 environment_file.seek(0)
                 env_fd = environment_file.fileno()
