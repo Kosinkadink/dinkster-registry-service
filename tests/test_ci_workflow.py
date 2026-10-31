@@ -30,3 +30,7 @@ def test_postgres_uses_dynamic_loopback_ports_without_bridge_networks() -> None:
     assert "5432:5432" not in source
     assert "docker network create" not in source
     assert "--network dinkster-registry-test" not in source
+    assert source.count('export DINKSTER_PUBLIC_BASE_URL="http://127.0.0.1:$http_port"') == 3
+    assert source.count('s.bind(("127.0.0.1", 0))') == 3
+    assert "--port 8000" not in source
+    assert "http://127.0.0.1:8000" not in source
