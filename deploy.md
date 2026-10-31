@@ -130,9 +130,11 @@ Require a Fly CNAME, valid TLS, health200, exactly two started Machines in sjc,
 512 MB shared CPUs and no volumes. Publish through the normal authenticated
 API and wait for scanner acceptance; verify the same pack/version/BLAKE3 in
 both static indexes and conditional304 on both, without exposing the token.
-Run `conformance/run.py` against the public hostname with its documented
-fixture catalog; do not claim the fixture-specific runner passes against a
-different catalog. Public conformance and the deliberate failed-health deploy
+Run `uv run python conformance/run.py https://registry.dinkster.org --release-lock
+/path/to/official-packs.lock` with the exact accepted release lock. This checks
+the published catalog without seeding fixture packs into production. Keep the
+unchanged default fixture checks for disposable CI stacks.
+Public conformance and the deliberate failed-health deploy
 are mandatory remaining acceptance evidence, not implied by a health200.
 
 For the rollback exercise, first confirm a healthy exact-image deployment.
