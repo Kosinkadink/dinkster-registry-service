@@ -21,14 +21,14 @@ jobs:
     runs-on: ${{ fromJSON(vars.CI_RUNNERS).linux }}
     timeout-minutes: 30
     environment: production
-    env:
-      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
       - name: Validate production prerequisites
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: |
           test "$(hostname | tr '[:upper:]' '[:lower:]')" = kosin-x570-aorus-ultra
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
@@ -40,6 +40,8 @@ jobs:
         with:
           version: 0.5.1
       - name: Build the exact pushed commit and push its image
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: |
           flyctl auth docker
           image="registry.fly.io/dinkster-registry:${GITHUB_SHA}"
@@ -50,13 +52,15 @@ jobs:
           digest=$(docker image inspect "$image" --format '{{index .RepoDigests 0}}')
           printf 'FLY_IMAGE=%s\n' "$digest" >> "$GITHUB_ENV"
       - name: Migrate with short-lived administrator credentials
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: python3 scripts/migrate_image.py --image "$FLY_IMAGE"
       - name: Deploy both replicas with health checks and rollback
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: >-
           python3 scripts/deploy_image.py --app dinkster-registry --region sjc
           --image "$FLY_IMAGE"
-      - name: Verify public readiness
-        run: curl --fail --silent --show-error https://registry.dinkster.org/healthz
       - name: Record deployment evidence
         if: always()
         run: |

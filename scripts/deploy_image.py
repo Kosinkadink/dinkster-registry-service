@@ -9,6 +9,39 @@ import tempfile
 from pathlib import Path
 
 
+def public_ready() -> bool:
+    try:
+        result = subprocess.run(
+            [
+                "curl",
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--retry",
+                "10",
+                "--retry-all-errors",
+                "--retry-delay",
+                "2",
+                "--max-time",
+                "10",
+                "--retry-max-time",
+                "120",
+                "--output",
+                os.devnull,
+                "--write-out",
+                "%{http_code}",
+                "https://registry.dinkster.org/healthz",
+            ],
+            check=False,
+            timeout=150,
+            text=True,
+            capture_output=True,
+        )
+        return result.returncode == 0 and result.stdout == "200"
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--app", required=True)
@@ -91,8 +124,8 @@ def main() -> int:
             ],
             check=False,
         )
-        if result.returncode == 0:
-            print("Deployment passed Fly health checks", flush=True)
+        if result.returncode == 0 and public_ready():
+            print("Deployment passed Fly and public health checks", flush=True)
             return 0
 
         if previous_image is None:
@@ -132,10 +165,13 @@ def main() -> int:
             ],
             check=False,
         )
-        if rollback.returncode != 0:
+        if rollback.returncode != 0 or not public_ready():
             print("ROLLBACK FAILED: operator intervention is required", flush=True)
         else:
-            print("Rollback passed Fly health checks; deployment remains failed", flush=True)
+            print(
+                "Rollback passed Fly and public health checks; deployment remains failed",
+                flush=True,
+            )
         return 1
 
 

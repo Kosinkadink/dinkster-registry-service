@@ -45,17 +45,42 @@ else:
     sys.exit(99)
 """
 
+CURL = """#!/usr/bin/env python3
+import json, os, pathlib, sys
+state_path = pathlib.Path(os.environ["FLY_TEST_STATE"])
+state = json.loads(state_path.read_text())
+state.setdefault("public_checks", []).append(state["image"])
+state_path.write_text(json.dumps(state))
+failure = state["failed_public"] if state["image"].endswith("b" * 64) else ""
+print("302" if failure == "redirect" else "200", end="")
+sys.exit(int(failure == "network"))
+"""
+
 
 @pytest.mark.parametrize(
-    "failed_health,failed_rollback", [(False, False), (True, False), (True, True)]
+    "failed_health,failed_rollback,failed_public",
+    [
+        (False, False, ""),
+        (True, False, ""),
+        (True, True, ""),
+        (False, False, "network"),
+        (False, False, "redirect"),
+    ],
 )
 @pytest.mark.parametrize("bootstrap", (False, True))
 def test_deployment_keeps_the_new_release_or_restores_the_last_healthy_config(
-    tmp_path: Path, failed_health: bool, failed_rollback: bool, bootstrap: bool
+    tmp_path: Path,
+    failed_health: bool,
+    failed_rollback: bool,
+    failed_public: str,
+    bootstrap: bool,
 ) -> None:
     fly = tmp_path / "flyctl"
     fly.write_text(FLY)
     fly.chmod(0o700)
+    curl = tmp_path / "curl"
+    curl.write_text(CURL)
+    curl.chmod(0o700)
     state = tmp_path / "state.json"
     state.write_text(
         json.dumps(
@@ -63,6 +88,7 @@ def test_deployment_keeps_the_new_release_or_restores_the_last_healthy_config(
                 "image": OLD_IMAGE,
                 "config": "healthy-config",
                 "fail_rollback": failed_rollback,
+                "failed_public": failed_public,
                 "bootstrap": bootstrap,
                 "empty": bootstrap,
             }
@@ -93,21 +119,24 @@ def test_deployment_keeps_the_new_release_or_restores_the_last_healthy_config(
         check=False,
     )
     final = json.loads(state.read_text())
-    assert result.returncode == int(failed_health)
+    failed = failed_health or bool(failed_public)
+    assert result.returncode == int(failed)
+    if failed_public:
+        assert final["public_checks"] == ([NEW_IMAGE] if bootstrap else [NEW_IMAGE, OLD_IMAGE])
     if bootstrap:
-        assert final["empty"] == failed_health
-        if failed_health:
+        assert final["empty"] == failed
+        if failed:
             assert "First deployment failed" in result.stdout
         else:
             assert final["image"] == NEW_IMAGE
             assert final["config"] == "new-healthy-config"
         return
-    assert final["image"] == (OLD_IMAGE if failed_health else NEW_IMAGE)
-    assert final["config"] == ("healthy-config" if failed_health else "new-healthy-config")
+    assert final["image"] == (OLD_IMAGE if failed else NEW_IMAGE)
+    assert final["config"] == ("healthy-config" if failed else "new-healthy-config")
     if failed_rollback:
         assert "ROLLBACK FAILED" in result.stdout
-    elif failed_health:
-        assert "Rollback passed Fly health checks" in result.stdout
+    elif failed:
+        assert "Rollback passed Fly and public health checks" in result.stdout
 
 
 def test_deploy_refuses_a_mutable_image_before_contacting_fly() -> None:

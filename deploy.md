@@ -83,7 +83,10 @@ not reverse migrations or delete published data.
 private remote configuration, then runs `flyctl deploy --image <digest>` with
 rolling health checks and half the replicas unavailable at most. `--ha=true`
 requests the two service Machines on first deployment; `--no-public-ips`
-reuses the existing public allocations. Later failure restores the previous
+reuses the existing public allocations. Before discarding rollback state, the
+helper checks public HTTPS readiness with bounded retries, including DNS and
+TLS verification. A failed public check follows the same rollback path as a
+failed Fly health check. Later failure restores the previous
 image and configuration, keeps the deploy exit code nonzero, and reports
 rollback failure prominently. On a first deployment there is no prior image;
 failure removes only newly created Launch-managed Machines carrying the exact
@@ -136,7 +139,7 @@ For the rollback exercise, first confirm a healthy exact-image deployment.
 Use a temporary copy of `fly.toml` with only the health path changed to a
 nonexistent endpoint, and pass that copy to `scripts/deploy_image.py --config`
 with the same immutable image. Require a nonzero deployment result followed by
-`Rollback passed Fly health checks; deployment remains failed`, then confirm
+`Rollback passed Fly and public health checks; deployment remains failed`, then confirm
 public health and the restored image/configuration. Preserve the run link on
 issue586 and remove the temporary config. Never weaken or disable the health
 check to make this exercise pass, and never dispatch a workflow for the drill.
