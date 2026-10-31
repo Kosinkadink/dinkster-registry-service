@@ -122,6 +122,8 @@ def test_complete_s3_settings_select_s3_store(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_database_and_public_base_url_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DINKSTER_DATABASE_URL", raising=False)
+    monkeypatch.delenv("DINKSTER_PUBLIC_BASE_URL", raising=False)
     monkeypatch.setenv("DATABASE_URL", "sqlite+pysqlite:///:memory:")
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://registry.example.test/")
 
