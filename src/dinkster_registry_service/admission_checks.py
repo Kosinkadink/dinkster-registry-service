@@ -321,7 +321,11 @@ def run_manifest_admission(
         grants = session.execute(select(NamespaceGrantRecord, PackRecord).join(PackRecord)).all()
         for claim in (manifest.name, *manifest.namespaces):
             for grant, granted_pack in grants:
-                if granted_pack.name != pack_name and claims_conflict(claim, grant.claim):
+                if (
+                    granted_pack.name != pack_name
+                    and not (publisher is not None and grant.publisher_id == publisher)
+                    and claims_conflict(claim, grant.claim)
+                ):
                     raise ValueError(
                         f"namespace claim {claim!r} conflicts with pack {granted_pack.name!r}"
                     )
@@ -338,7 +342,9 @@ def run_manifest_admission(
                 raise ValueError("a pack cannot depend on itself")
             versions = releases_by_pack.get(dependency.pack, [])
             required = SpecifierSet(dependency.version)
-            if not any(Version(value.version) in required for value in versions):
+            if not any(
+                required.contains(Version(value.version), prereleases=True) for value in versions
+            ):
                 raise ValueError(
                     f"dependency {dependency.pack!r} has no active public version satisfying "
                     f"{dependency.version!r}"

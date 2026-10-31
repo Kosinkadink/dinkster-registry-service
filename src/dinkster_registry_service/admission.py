@@ -614,9 +614,8 @@ class AdmissionService:
                                 owner_id=pack.owner_id,
                             )
                         )
-                    elif grant.pack_id != pack.id or (
-                        candidate.publisher_id is not None
-                        and grant.publisher_id != candidate.publisher_id
+                    elif grant.publisher_id != candidate.publisher_id or (
+                        candidate.publisher_id is None and grant.pack_id != pack.id
                     ):
                         raise PromotionConflict(f"namespace claim {claim_name!r} is unavailable")
 

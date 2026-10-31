@@ -591,6 +591,42 @@ def test_official_claims_require_registry_publisher_and_keep_exact_ids(
             }
 
 
+@pytest.mark.parametrize("publisher", ("example-org", "other-org", None))
+@pytest.mark.parametrize("claim", ("shared", "shared.child"))
+def test_namespace_overlap_is_exclusive_to_a_publisher(
+    database: Database, tmp_path: Path, publisher: str | None, claim: str
+) -> None:
+    principals = PrincipalRepository(database)
+    principals.register_user("operator")
+    for name in ("example-org", "other-org"):
+        principals.register_publisher(name, "operator", datetime.now(UTC).isoformat())
+    service = _service(database, tmp_path)
+    for name, owner, namespace in (
+        ("first-pack", "example-org", "shared"),
+        ("second-pack", publisher, claim),
+    ):
+        source = _fixture_source(tmp_path, name)
+        manifest = source / "dinkster-pack.toml"
+        manifest.write_text(
+            manifest.read_text().replace(
+                f'namespaces = ["{name}"]', f'namespaces = ["{name}", "{namespace}"]'
+            )
+        )
+        candidate = service.submit(
+            build_registry_fixture_archive(source),
+            pack_name=name,
+            version="1.0",
+            publisher=owner,
+        )
+        assert service.run_once()
+        status = service.status(candidate)
+        if name == "first-pack" or publisher == "example-org":
+            assert status.status == "accepted", status
+        else:
+            assert status.status == "rejected"
+            assert any(finding.code == "manifest.invalid" for finding in status.findings)
+
+
 def test_node_outside_declared_namespace_rejects(database: Database, tmp_path: Path) -> None:
     source = _fixture_source(tmp_path)
     manifest = source / "dinkster-pack.toml"
@@ -641,6 +677,29 @@ def test_active_dependency_is_validated_and_recorded(database: Database, tmp_pat
         )
         assert dependency is not None
         assert (dependency.pack_name, dependency.version_range) == ("example-pack", "<2,>=1")
+
+
+@pytest.mark.parametrize("version", ("1.3.dev42", "2.1.dev42"))
+def test_active_development_dependency_must_satisfy_version_bounds(
+    database: Database, tmp_path: Path, version: str
+) -> None:
+    service = _service(database, tmp_path)
+    dependency = service.submit(_archive(tmp_path), pack_name="example-pack", version=version)
+    assert service.run_once()
+    assert service.status(dependency).status == "accepted"
+    source = _fixture_source(tmp_path, "dependent-pack")
+    manifest = source / "dinkster-pack.toml"
+    manifest.write_text(manifest.read_text() + '\n[pack.dependencies]\nexample-pack = ">=1,<2"\n')
+    candidate = service.submit(
+        build_registry_fixture_archive(source), pack_name="dependent-pack", version="1.0"
+    )
+    assert service.run_once()
+    status = service.status(candidate)
+    if version == "1.3.dev42":
+        assert status.status == "accepted", status
+    else:
+        assert status.status == "rejected"
+        assert any(finding.code == "manifest.invalid" for finding in status.findings)
 
 
 def test_missing_dependency_rejects(database: Database, tmp_path: Path) -> None:

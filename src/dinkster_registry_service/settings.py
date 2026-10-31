@@ -45,7 +45,7 @@ class ServerSettings:
     probe_timeout_seconds: int = 30
     probe_dependency_timeout_seconds: int = 300
     probe_package_index_url: str = "https://pypi.org/simple"
-    probe_output_limit_bytes: int = 256 * 1024
+    probe_output_limit_bytes: int = 2 * 1024 * 1024
     probe_operator_tail_bytes: int = 8 * 1024
     scanner_max_attempts: int = 3
 

@@ -163,6 +163,11 @@ strings, not invented compatibility or license claims. Dinkster's host/API
 contracts remain mandatory. Reserved namespaces require the registry-local
 `dinkster` publisher, not merely a publisher string in the submitted manifest.
 Exact node-ID claims retain their spelling using Dinkster's shared grammar.
+Namespace grants are publisher-exclusive: packs from the same registered
+publisher may share exact or overlapping claims. Anonymous operator submissions
+remain pack-exclusive, and another publisher cannot take an overlapping claim.
+Dependency admission considers active development and pre-release versions
+within the declared bounds; it does not select a client installation version.
 
 The development Compose scanner runs as root in a privileged container so
 bubblewrap can create full user, PID, mount, and network namespaces on Docker
@@ -179,10 +184,12 @@ builder delivers them through a private file descriptor. Do not put secrets in
 these variables.
 
 All evidence uses policy `registry-scan/1` and is append-only. By default,
-probe stdout and stderr are each capped at 256 KiB; exceeding either cap blocks
-the candidate. Bounded output tails are stored only in operator details and
-never copied into public finding messages. A `block` finding rejects an upload;
-a blocking active-release re-scan quarantines that release. A `review` finding
+probe stdout and stderr are each capped at 2 MiB; exceeding either cap blocks
+the candidate. The complete schema catalog is part of stdout; the official
+Comfy pack's 592-schema report occupies 888,063 bytes. Bounded output tails are
+stored only in operator details and never copied into public finding messages.
+A `block` finding rejects an upload; a blocking active-release re-scan
+quarantines that release. A `review` finding
 leaves an upload visible only to operators and does not change active bytes
 during re-scan. A `signal` finding is non-blocking and is included in accepted
 trust evidence. By default, a candidate can be claimed at most three times
@@ -379,7 +386,7 @@ startup. Invalid values stop the process with an error naming the variable.
 | --- | ---: | ---: |
 | `DINKSTER_PROBE_TIMEOUT_SECONDS` | 30 | 1-600 seconds |
 | `DINKSTER_PROBE_DEPENDENCY_TIMEOUT_SECONDS` | 300 | 1-1800 seconds |
-| `DINKSTER_PROBE_OUTPUT_LIMIT_BYTES` | 262144 | 4096-4194304 bytes per stream |
+| `DINKSTER_PROBE_OUTPUT_LIMIT_BYTES` | 2097152 | 4096-4194304 bytes per stream |
 | `DINKSTER_PROBE_OPERATOR_TAIL_BYTES` | 8192 | 512 bytes through the configured output limit |
 | `DINKSTER_SCANNER_MAX_ATTEMPTS` | 3 | 1-10 claims |
 

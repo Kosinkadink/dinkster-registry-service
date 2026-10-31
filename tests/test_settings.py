@@ -46,7 +46,7 @@ def test_probe_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) -
         ("DINKSTER_PROBE_OUTPUT_LIMIT_BYTES", "4095"),
         ("DINKSTER_PROBE_OUTPUT_LIMIT_BYTES", "4194305"),
         ("DINKSTER_PROBE_OPERATOR_TAIL_BYTES", "511"),
-        ("DINKSTER_PROBE_OPERATOR_TAIL_BYTES", "262145"),
+        ("DINKSTER_PROBE_OPERATOR_TAIL_BYTES", "2097153"),
         ("DINKSTER_SCANNER_MAX_ATTEMPTS", "0"),
         ("DINKSTER_SCANNER_MAX_ATTEMPTS", "11"),
         ("DINKSTER_PROBE_TIMEOUT_SECONDS", "not-an-integer"),
