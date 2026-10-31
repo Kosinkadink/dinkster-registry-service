@@ -166,10 +166,21 @@ def test_configured_probe_timeout_is_honored(tmp_path: Path) -> None:
 
 
 @pytest.fixture
-def probe_package_index(tmp_path: Path) -> Iterator[str]:
+def probe_package_index(tmp_path: Path) -> Iterator[tuple[str, list[str]]]:
     package = tmp_path / "index" / "probe-dependency"
     package.mkdir(parents=True)
-    wheel = package / "probe_dependency-1.0-py3-none-any.whl"
+    requests: list[str] = []
+
+    class Handler(SimpleHTTPRequestHandler):
+        def do_GET(self) -> None:
+            requests.append(self.path)
+            super().do_GET()
+
+        def do_HEAD(self) -> None:
+            requests.append(self.path)
+            super().do_HEAD()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, directory=str(package.parent)))
     files = {
         "probe_dependency.py": "VALUE = 83\n",
         "dependency-startup.pth": "import sys; sys.stderr.write('UNTRUSTED_STARTUP')\n",
@@ -183,21 +194,31 @@ def probe_package_index(tmp_path: Path) -> Iterator[str]:
             "Tag: py3-none-any\n"
         ),
     }
-    with zipfile.ZipFile(wheel, "w") as archive:
-        for name, data in files.items():
-            archive.writestr(name, data)
-        archive.writestr(
-            "probe_dependency-1.0.dist-info/RECORD",
-            "".join(f"{name},,\n" for name in files) + "probe_dependency-1.0.dist-info/RECORD,,\n",
-        )
-    package.joinpath("index.html").write_text(f'<a href="{wheel.name}">{wheel.name}</a>')
-    server = ThreadingHTTPServer(
-        ("127.0.0.1", 0), partial(SimpleHTTPRequestHandler, directory=str(package.parent))
-    )
+    links = []
+    for version in ("1.0", "2.0"):
+        wheel = package / f"probe_dependency-{version}-py3-none-any.whl"
+        entries = {
+            name.replace("1.0", version): data.replace(
+                "\nVersion: 1.0\n", f"\nVersion: {version}\n"
+            )
+            for name, data in files.items()
+        }
+        if version == "2.0":
+            entries[f"probe_dependency-{version}.dist-info/METADATA"] += (
+                f"Requires-Dist: forbidden @ http://127.0.0.1:{server.server_port}"
+                "/forbidden-1.0-py3-none-any.whl\n"
+            )
+        with zipfile.ZipFile(wheel, "w") as archive:
+            for name, data in entries.items():
+                archive.writestr(name, data)
+            record = f"probe_dependency-{version}.dist-info/RECORD"
+            archive.writestr(record, "".join(f"{name},,\n" for name in entries) + f"{record},,\n")
+        links.append(f'<a href="{wheel.name}">{wheel.name}</a>')
+    package.joinpath("index.html").write_text("\n".join(links))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield f"http://127.0.0.1:{server.server_port}"
+        yield f"http://127.0.0.1:{server.server_port}", requests
     finally:
         server.shutdown()
         server.server_close()
@@ -205,10 +226,11 @@ def probe_package_index(tmp_path: Path) -> Iterator[str]:
 
 
 @pytest.mark.parametrize("extra", (False, True))
-@pytest.mark.parametrize("version", ("1.0", "9.9"))
+@pytest.mark.parametrize("version", ("1.0", "2.0", "9.9"))
 def test_probe_installs_declared_dependencies_and_cleans_environment(
-    tmp_path: Path, probe_package_index: str, version: str, extra: bool
+    tmp_path: Path, probe_package_index: tuple[str, list[str]], version: str, extra: bool
 ) -> None:
+    index_url, requests = probe_package_index
     source = _fixture_source(tmp_path)
     manifest = source / "dinkster-pack.toml"
     if extra:
@@ -231,10 +253,10 @@ def test_probe_installs_declared_dependencies_and_cleans_environment(
     )
     result = run_executable_probe(
         source,
-        settings=ServerSettings(probe_package_index_url=probe_package_index),
+        settings=ServerSettings(probe_package_index_url=index_url),
         require_isolation=False,
     )
-    if version == "9.9":
+    if version != "1.0":
         assert result.blocked
         assert result.findings[0].code == "probe.dependencies-unresolved"
     else:
@@ -249,6 +271,7 @@ def test_probe_installs_declared_dependencies_and_cleans_environment(
         assert not dependency_file.parent.exists()
         assert result.operator_details["stderrTail"] == ""
     assert "probe_dependency" not in sys.modules
+    assert not any(path.startswith("/forbidden-") for path in requests)
 
 
 def test_probe_rejects_direct_dependency_urls(tmp_path: Path) -> None:
