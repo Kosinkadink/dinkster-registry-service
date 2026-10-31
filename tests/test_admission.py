@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import pytest
@@ -24,6 +25,7 @@ from sqlalchemy import func, select
 import dinkster_registry_service.admission as admission_module
 from dinkster_registry_service.admission import AdmissionService, quarantine_object_key
 from dinkster_registry_service.admission_checks import (
+    StageResult,
     extracted_archive,
     run_doctor_static,
     run_executable_probe,
@@ -715,6 +717,48 @@ def test_configured_candidate_claim_limit_is_honored(database: Database, tmp_pat
         1,
     )
     assert any(finding.code == "scanner.attempt-limit" for finding in status.findings)
+
+
+def test_running_probe_renews_lease(
+    database: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(database, tmp_path, lease_seconds=1)
+    candidate_id = service.submit(_archive(tmp_path), pack_name="example-pack", version="1.2.3")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def held_probe(root: Path, **kwargs: Any) -> StageResult:
+        entered.set()
+        assert release.wait(10)
+        return run_executable_probe(root, **kwargs)
+
+    monkeypatch.setattr(admission_module, "run_executable_probe", held_probe)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(service.run_once)
+        try:
+            assert entered.wait(10)
+            with database.session() as session:
+                candidate = session.get(ReleaseCandidateRecord, candidate_id)
+                assert candidate is not None
+                initial_expiry = candidate.lease_expires_at
+                assert initial_expiry is not None
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with database.session() as session:
+                    candidate = session.get(ReleaseCandidateRecord, candidate_id)
+                    assert candidate is not None
+                    assert candidate.lease_expires_at is not None
+                    if candidate.lease_expires_at >= initial_expiry + timedelta(seconds=1):
+                        break
+                time.sleep(0.02)
+            else:
+                pytest.fail("running probe did not renew its lease")
+            assert not _service(database, tmp_path, worker_id="contender").run_once()
+        finally:
+            release.set()
+        assert future.result(timeout=10)
+    status = service.status(candidate_id)
+    assert (status.status, status.attempts) == ("accepted", 1)
 
 
 def test_expired_lease_is_taken_over_after_scanner_sigkill(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -951,18 +952,20 @@ class AdmissionService:
                 return
             review |= doctor.review
             if claim.kind == "upload":
-                with self.database.session() as session, session.begin():
-                    candidate = self._leased_candidate(session, claim)
-                    candidate.lease_expires_at = datetime.now(UTC) + timedelta(
-                        seconds=self.lease_seconds
-                        + self.settings.probe_dependency_timeout_seconds
-                        + self.settings.probe_timeout_seconds
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        run_executable_probe,
+                        root,
+                        settings=self.settings,
+                        require_isolation=self.require_isolation,
                     )
-                probe = run_executable_probe(
-                    root,
-                    settings=self.settings,
-                    require_isolation=self.require_isolation,
-                )
+                    while not wait((future,), timeout=self.lease_seconds / 3).done:
+                        with self.database.session() as session, session.begin():
+                            candidate = self._leased_candidate(session, claim)
+                            candidate.lease_expires_at = datetime.now(UTC) + timedelta(
+                                seconds=self.lease_seconds
+                            )
+                    probe = future.result()
                 if not self._record_stage(claim, "executable_probe", probe):
                     return
                 review |= probe.review
