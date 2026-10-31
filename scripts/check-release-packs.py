@@ -1,0 +1,107 @@
+"""Admit the exact official ZIPs from a pinned Dinkster release."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tomllib
+import urllib.request
+import zipfile
+from pathlib import Path
+
+from dinkster_registry_service.digests import artifact_digest
+from dinkster_registry_service.identifiers import require_canonical_pack_name
+from dinkster_registry_service.versioning import require_public_version
+
+RELEASE_TAG = "main-fcd73e73234f92f7784164dc2609da1c6e03a4d2"
+RELEASE_URL = f"https://github.com/Kosinkadink/Dinkster/releases/download/{RELEASE_TAG}"
+
+
+def cli(*arguments: str) -> str:
+    return subprocess.check_output(
+        [sys.executable, "-m", "dinkster_registry_service.cli", *arguments], text=True
+    ).strip()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("directory", type=Path)
+    parser.add_argument("--download-only", action="store_true")
+    args = parser.parse_args()
+    directory = args.directory
+    if args.download_only:
+        directory.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(f"{RELEASE_URL}/official-packs.lock", timeout=60) as response:
+            (directory / "official-packs.lock").write_bytes(response.read())
+    lock = json.loads((directory / "official-packs.lock").read_bytes())
+    assert lock["format"] == "dinkster.lock/1"
+    packs = lock["packs"]
+    assert len(packs) == 14
+    assert len({pack["pack"] for pack in packs}) == 14
+    pending = {}
+    for pack in packs:
+        name = require_canonical_pack_name(pack["pack"])
+        version = require_public_version(pack["version"])
+        assert pack["publisher"] == "dinkster"
+        assert pack["source"] == f"git:Kosinkadink/Dinkster@{RELEASE_TAG.removeprefix('main-')}"
+        archive = directory / f"{name}-{version}.zip"
+        if args.download_only:
+            with urllib.request.urlopen(f"{RELEASE_URL}/{archive.name}", timeout=60) as response:
+                archive.write_bytes(response.read())
+        assert artifact_digest(archive.read_bytes()) == pack["artifactDigest"], name
+        with zipfile.ZipFile(archive) as source:
+            manifest = tomllib.loads(source.read("dinkster-pack.toml").decode())
+        dependencies = set(manifest["pack"].get("dependencies", {}))
+        pending[name] = (pack, archive, dependencies)
+        print(f"verified {name} {version} {pack['artifactDigest']}", flush=True)
+    if args.download_only:
+        return
+    assert os.environ.get("DINKSTER_DATABASE_URL"), "a disposable migrated database is required"
+    cli("admin", "add-user", "release-check")
+    cli("admin", "add-publisher", "dinkster", "--owner", "release-check")
+    accepted: set[str] = set()
+    while pending:
+        available = sorted(name for name, (_, _, deps) in pending.items() if deps <= accepted)
+        assert available, f"unresolved release dependencies: {sorted(pending)}"
+        for name in available:
+            pack, archive, _ = pending.pop(name)
+            candidate = cli(
+                "submit",
+                str(archive),
+                "--pack",
+                name,
+                "--version",
+                pack["version"],
+                "--publisher",
+                "dinkster",
+                "--submitted-by",
+                "release-check",
+            )
+            for _ in range(4):
+                cli("scanner", "--once")
+                status = json.loads(cli("status", candidate))
+                if status["status"] in {"accepted", "rejected", "review"}:
+                    break
+            assert status["status"] == "accepted", {
+                "pack": name,
+                "status": status["status"],
+                "reason": status["reason"],
+                "blockingCodes": sorted(
+                    {
+                        finding["code"]
+                        for finding in status["findings"]
+                        if finding["effect"] == "block"
+                    }
+                ),
+            }
+            assert status["digest"] == pack["artifactDigest"], status
+            accepted.add(name)
+            print(f"accepted {name} {pack['version']} {status['digest']}", flush=True)
+    assert len(accepted) == 14
+
+
+if __name__ == "__main__":
+    main()
