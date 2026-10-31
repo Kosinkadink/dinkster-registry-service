@@ -432,7 +432,7 @@ def test_official_claims_require_registry_publisher_and_keep_exact_ids(
     manifest.write_text(
         manifest.read_text().replace(
             'namespaces = ["official-pack"]',
-            'publisher = "dinkster"\nnamespaces = ["std", "ExampleResize", "ExampleSave"]',
+            'namespaces = ["std", "ExampleResize", "ExampleSave"]',
         )
     )
     nodes = source / "nodes.py"

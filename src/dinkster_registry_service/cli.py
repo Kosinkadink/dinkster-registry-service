@@ -16,7 +16,7 @@ from dinkster_registry import RegistryError
 from .admission import AdmissionService
 from .app import create_app
 from .database import Database
-from .object_store import MAX_ARTIFACT_SIZE, LocalFilesystemObjectStore
+from .object_store import MAX_ARTIFACT_SIZE
 from .principals import PrincipalRepository
 from .seed import seed_fixtures
 from .settings import ServerSettings
@@ -111,7 +111,7 @@ def main() -> None:
     if args.command == "seed":
         database = Database(settings.database_url)
         try:
-            result = seed_fixtures(database, LocalFilesystemObjectStore(settings.object_store_root))
+            result = seed_fixtures(database, settings.create_object_store())
         finally:
             database.dispose()
         print(
@@ -168,7 +168,7 @@ def main() -> None:
     database = Database(settings.database_url)
     service = AdmissionService(
         database,
-        LocalFilesystemObjectStore(settings.object_store_root),
+        settings.create_object_store(),
         settings=settings,
         worker_id=getattr(args, "worker_id", "registry-operator"),
         lease_seconds=getattr(args, "lease_seconds", 60),

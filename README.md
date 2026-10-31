@@ -23,6 +23,9 @@ repository's one temporary X570 runner:
 ```
 
 The runner has no `gpu` label, and the workflows do not run GPU validation.
+CI PostgreSQL uses host networking with an ephemeral loopback-only port; image
+probes use no network. This avoids bridge/veth churn on the shared host. The
+persistent runner keeps its uv cache locally without uploading the shared cache.
 
 ## Self-host with SQLite
 
@@ -296,6 +299,14 @@ accepts `DINKSTER_SEED_FIXTURES=0` to keep the catalog empty. PostgreSQL and SQL
 URLs are accepted. Production deployments must provide a shared unpredictable
 cursor secret and a public base URL that clients can reach.
 
+`DATABASE_URL` and `PUBLIC_BASE_URL` are aliases; the corresponding `DINKSTER_*`
+variables take precedence. Setting all five `S3_ENDPOINT_URL`, `S3_BUCKET`,
+`S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, and `S3_REGION` selects S3-compatible
+artifact storage for the API and CLI, including quarantine and scanner
+promotion. R2 uses region `auto`. Partial configuration is rejected in every
+mode. `DINKSTER_ENV=production` requires all five settings and never falls back
+to local artifact storage. Local files remain a development/self-hosting choice.
+
 Probe and scanner limits use integer environment variables validated at
 startup. Invalid values stop the process with an error naming the variable.
 
@@ -310,7 +321,8 @@ startup. Invalid values stop the process with an error naming the variable.
 
 The package targets Python 3.12 and commits `uv.lock`. The hosted service's
 tests require a disposable PostgreSQL database; the separate SQLite tests
-use temporary databases.
+use temporary databases. S3 contract tests start a native moto HTTP server on
+loopback, or use `TEST_S3_ENDPOINT_URL` when provided; they are not skipped in CI.
 
 ```sh
 env -u GITHUB_TOKEN uv sync --frozen

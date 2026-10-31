@@ -1,5 +1,6 @@
 [pack]
 name = "example-pack"
+publisher = "dinkster"
 namespaces = ["example"]
 platforms = ["darwin", "linux"]
 dinkster = ">=0.9,<1"

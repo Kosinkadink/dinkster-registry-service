@@ -17,9 +17,16 @@ def test_every_ci_job_uses_the_cpu_runner_contract_and_timeout() -> None:
     assert "gpu" not in source.lower()
 
 
-def test_postgres_services_use_assigned_host_ports() -> None:
+def test_postgres_uses_dynamic_loopback_ports_without_bridge_networks() -> None:
     source = WORKFLOW.read_text()
+    postgres = (WORKFLOW.parents[2] / "scripts" / "with-test-postgres.sh").read_text()
 
-    assert source.count("          - 5432\n") == 2
+    assert "\n    services:" not in source
+    assert source.count("bash scripts/with-test-postgres.sh ") == 3
+    assert "--network host" in postgres
+    assert 's.bind(("127.0.0.1", 0))' in postgres
+    assert "-c listen_addresses=127.0.0.1" in postgres
+    assert '-c port="$port"' in postgres
     assert "5432:5432" not in source
-    assert source.count("${{ job.services.postgres.ports[5432] }}") == 2
+    assert "docker network create" not in source
+    assert "--network dinkster-registry-test" not in source

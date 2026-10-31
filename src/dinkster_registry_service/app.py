@@ -29,7 +29,7 @@ from .database import Database, ReleaseCandidateRecord
 from .digests import DigestError, require_blake3_digest
 from .identifiers import IdentifierError, require_canonical_pack_name
 from .ids import uuid7
-from .object_store import MAX_ARTIFACT_SIZE, LocalFilesystemObjectStore, ObjectStoreError
+from .object_store import MAX_ARTIFACT_SIZE, ObjectStoreError
 from .principals import PrincipalRepository
 from .repository import CatalogDataError, CatalogRepository
 from .settings import ServerSettings
@@ -282,7 +282,7 @@ def _candidate_payload(status: CandidateStatus) -> dict[str, object]:
 def create_app(settings: ServerSettings | None = None) -> FastAPI:
     configured = settings or ServerSettings.from_environment()
     database = Database(configured.database_url)
-    object_store = LocalFilesystemObjectStore(configured.object_store_root)
+    object_store = configured.create_object_store()
     repository = CatalogRepository(database, CursorCodec(configured.cursor_secret))
     principals = PrincipalRepository(database)
     admission = AdmissionService(database, object_store, settings=configured)

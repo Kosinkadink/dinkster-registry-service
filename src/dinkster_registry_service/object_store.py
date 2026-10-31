@@ -4,9 +4,11 @@ import os
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
-from typing import BinaryIO, Protocol
+from typing import Any, BinaryIO, Protocol, cast
 
+import boto3  # type: ignore[import-untyped]
 from blake3 import blake3
+from botocore.exceptions import BotoCoreError, ClientError  # type: ignore[import-untyped]
 
 MAX_ARTIFACT_SIZE = 64 * 1024 * 1024
 READ_CHUNK_SIZE = 64 * 1024
@@ -20,6 +22,7 @@ class StoredObject:
     def __init__(self, source: BinaryIO, size: int) -> None:
         self.source = source
         self.size = size
+        self.closed = False
 
     def __iter__(self) -> Iterator[bytes]:
         remaining = self.size
@@ -37,6 +40,7 @@ class StoredObject:
 
     def close(self) -> None:
         self.source.close()
+        self.closed = True
 
 
 class ObjectStore(Protocol):
@@ -129,3 +133,130 @@ class LocalFilesystemObjectStore:
 
     def remove(self, key: str) -> None:
         self._path(key).unlink(missing_ok=True)
+
+
+class S3ObjectStore:
+    def __init__(
+        self,
+        *,
+        endpoint_url: str,
+        bucket: str,
+        access_key_id: str,
+        secret_access_key: str,
+        region: str,
+    ) -> None:
+        self.bucket = bucket
+        self._client: Any = boto3.client(
+            "s3",
+            endpoint_url=endpoint_url,
+            aws_access_key_id=access_key_id,
+            aws_secret_access_key=secret_access_key,
+            region_name=region,
+        )
+
+    def put(self, key: str, data: bytes) -> None:
+        if not 1 <= len(data) <= MAX_ARTIFACT_SIZE:
+            raise ObjectStoreError(f"object size must be between 1 and {MAX_ARTIFACT_SIZE} bytes")
+        try:
+            self._client.put_object(Bucket=self.bucket, Key=key, Body=data, IfNoneMatch="*")
+        except ClientError as error:
+            if not self._is_precondition_failure(error):
+                self._raise_storage_error(error)
+        except BotoCoreError as error:
+            self._raise_storage_error(error)
+        else:
+            return
+        if not self._matches(key, data):
+            raise ObjectStoreError(f"object {key!r} already exists with different bytes")
+
+    def read(self, key: str, *, max_size: int = MAX_ARTIFACT_SIZE) -> bytes:
+        if max_size < 1:
+            raise ObjectStoreError("object read limit must be positive")
+        body = self._get_object(key)["Body"]
+        try:
+            data = cast(bytes, body.read(max_size + 1))
+        finally:
+            body.close()
+        if len(data) > max_size:
+            raise ObjectStoreError(f"object exceeds the {max_size}-byte read limit")
+        return data
+
+    def open(self, key: str, *, expected_size: int, expected_digest: str) -> StoredObject:
+        if not 1 <= expected_size <= MAX_ARTIFACT_SIZE:
+            raise ObjectStoreError("artifact metadata exceeds the supported size range")
+        stored = self._get_object(key)
+        body = stored["Body"]
+        try:
+            digest = blake3()
+            remaining = expected_size
+            while remaining:
+                chunk = body.read(min(READ_CHUNK_SIZE, remaining))
+                if not chunk:
+                    raise ObjectStoreError("object is shorter than its declared size")
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if body.read(1):
+                raise ObjectStoreError("object exceeds its declared size or the artifact size cap")
+            if "blake3:" + digest.hexdigest() != expected_digest:
+                raise ObjectStoreError("object digest differs from immutable artifact metadata")
+        finally:
+            body.close()
+        return StoredObject(self._get_object(key, etag=stored["ETag"])["Body"], expected_size)
+
+    def exists(self, key: str) -> bool:
+        try:
+            self._client.head_object(Bucket=self.bucket, Key=key)
+        except ClientError as error:
+            if self._is_missing(error):
+                return False
+            self._raise_storage_error(error)
+        except BotoCoreError as error:
+            self._raise_storage_error(error)
+        return True
+
+    def remove(self, key: str) -> None:
+        try:
+            self._client.delete_object(Bucket=self.bucket, Key=key)
+        except (BotoCoreError, ClientError) as error:
+            self._raise_storage_error(error)
+
+    def _matches(self, key: str, expected: bytes) -> bool:
+        body = self._get_object(key)["Body"]
+        try:
+            offset = 0
+            while chunk := body.read(READ_CHUNK_SIZE):
+                if chunk != expected[offset : offset + len(chunk)]:
+                    return False
+                offset += len(chunk)
+                if offset > len(expected):
+                    return False
+            return offset == len(expected)
+        finally:
+            body.close()
+
+    def _get_object(self, key: str, *, etag: str | None = None) -> Any:
+        try:
+            conditions = {} if etag is None else {"IfMatch": etag}
+            response = self._client.get_object(Bucket=self.bucket, Key=key, **conditions)
+        except ClientError as error:
+            if self._is_missing(error):
+                raise FileNotFoundError(key) from None
+            self._raise_storage_error(error)
+        except BotoCoreError as error:
+            self._raise_storage_error(error)
+        return response
+
+    @staticmethod
+    def _is_missing(error: ClientError) -> bool:
+        code = str(error.response.get("Error", {}).get("Code", ""))
+        return code in {"404", "NoSuchKey", "NoSuchObject", "NotFound"}
+
+    @staticmethod
+    def _is_precondition_failure(error: ClientError) -> bool:
+        code = str(error.response.get("Error", {}).get("Code", ""))
+        return code in {"412", "PreconditionFailed", "ConditionalRequestConflict"}
+
+    @staticmethod
+    def _raise_storage_error(error: BotoCoreError | ClientError) -> None:
+        del error
+        raise ObjectStoreError("S3 object storage operation failed") from None
