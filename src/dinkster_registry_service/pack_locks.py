@@ -78,8 +78,41 @@ def parse_pack_locks(data: bytes, *, pack: str, digest: str) -> tuple[PublishedP
                     raise PackLocksError(f"{variant}: expected an exact sha256 base identity")
                 if binding["artifactDigest"] != digest:
                     raise PackLocksError(f"{variant}: lock artifact digest differs from archive")
+                record = binding["lock"]
+                if not isinstance(record, dict) or any(
+                    not isinstance(record.get(field), str)
+                    for field in ("format", "pack", "variant", "requiresPython")
+                ):
+                    raise PackLocksError(f"{variant}: dependency lock requires string identities")
+                for field in ("requirements", "indexes"):
+                    values = record.get(field)
+                    if not isinstance(values, list) or any(
+                        not isinstance(value, str) for value in values
+                    ):
+                        raise PackLocksError(f"{variant}: {field} must be an array of strings")
+                packages = record.get("packages")
+                if not isinstance(packages, list):
+                    raise PackLocksError(f"{variant}: packages must be an array")
+                for package in packages:
+                    if not isinstance(package, dict) or any(
+                        not isinstance(package.get(field), str) for field in ("name", "version")
+                    ):
+                        raise PackLocksError(f"{variant}: package identity must be strings")
+                    wheels = package.get("wheels")
+                    if not isinstance(wheels, list) or not wheels:
+                        raise PackLocksError(f"{variant}: package wheels must be a nonempty array")
+                    for wheel in wheels:
+                        if (
+                            not isinstance(wheel, dict)
+                            or type(wheel.get("size")) is not int
+                            or any(
+                                not isinstance(wheel.get(field), str)
+                                for field in ("filename", "sha256", "url")
+                            )
+                        ):
+                            raise PackLocksError(f"{variant}: invalid wheel field types")
                 payload = json.dumps(
-                    binding["lock"], sort_keys=True, separators=(",", ":"), allow_nan=False
+                    record, sort_keys=True, separators=(",", ":"), allow_nan=False
                 ).encode("ascii")
                 if len(payload) > MAX_LOCK_SIZE:
                     raise PackLocksError(
@@ -90,12 +123,17 @@ def parse_pack_locks(data: bytes, *, pack: str, digest: str) -> tuple[PublishedP
                 if lock.pack != pack or lock.variant != variant:
                     raise PackLocksError(f"{variant}: dependency lock pack or variant differs")
                 for package in lock.packages:
-                    if not package.wheels:
-                        raise PackLocksError(f"{variant}: {package.name} has no hashed wheels")
                     for wheel in package.wheels:
-                        if wheel.size < 1 or urlparse(wheel.url).scheme not in {"https", "http"}:
+                        origin = urlparse(wheel.url)
+                        if (
+                            wheel.size < 1
+                            or origin.scheme not in {"https", "http"}
+                            or not origin.hostname
+                            or origin.username is not None
+                            or origin.password is not None
+                        ):
                             raise PackLocksError(
-                                f"{variant}: published wheels require HTTP origins"
+                                f"{variant}: published wheels require credential-free HTTP origins"
                             )
                 result.append(PublishedPackLock(variant, base, payload))
         return tuple(result)

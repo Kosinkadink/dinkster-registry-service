@@ -22,6 +22,7 @@ from sqlalchemy import (
     Uuid,
     create_engine,
     event,
+    inspect,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
@@ -441,6 +442,15 @@ class Database:
         self.engine = create_database_engine(database_url)
         if self.engine.dialect.name == "sqlite":
             Base.metadata.create_all(self.engine)
+            with self.engine.begin() as connection:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                for table in ("release_candidates", "releases"):
+                    columns = {column["name"] for column in inspect(connection).get_columns(table)}
+                    if "install_locks" not in columns:
+                        connection.exec_driver_sql(
+                            f"ALTER TABLE {table} ADD COLUMN install_locks JSON NOT NULL "
+                            "DEFAULT '{}'"
+                        )
         self._sessions = sessionmaker(self.engine, expire_on_commit=False)
 
     @property

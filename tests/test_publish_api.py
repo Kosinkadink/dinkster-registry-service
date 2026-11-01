@@ -106,7 +106,21 @@ def _locks(archive: bytes) -> dict[str, object]:
 def test_published_locks_bind_archive_base_and_visibility(tmp_path: Path) -> None:
     client, app, token = _client(tmp_path)
     archive = _archive(tmp_path, "locked-pack")
-    locks = _locks(archive)
+    locks = json.loads(json.dumps(_locks(archive)))
+    locks["linux-cpu"]["lock"]["packages"] = [
+        {
+            "name": "fixture",
+            "version": "1.0",
+            "wheels": [
+                {
+                    "filename": "fixture-1.0-py3-none-any.whl",
+                    "size": 7,
+                    "sha256": "a" * 64,
+                    "url": "https://example.test/fixture-1.0-py3-none-any.whl",
+                }
+            ],
+        }
+    ]
     endpoint = "/v1/publish/locked-pack/versions/1.2.3"
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -135,7 +149,14 @@ def test_published_locks_bind_archive_base_and_visibility(tmp_path: Path) -> Non
     assert set(detail["installLocks"]) == {"linux-cpu", "win-cpu"}
     download = client.get(lock_url, params=query)
     assert download.status_code == 200
-    assert download.json()["variant"] == "linux-cpu"
+    assert download.json() == locks["linux-cpu"]["lock"]
+    windows = client.get(
+        lock_url.replace("linux-cpu", "win-cpu"),
+        params={"baseId": "sha256:" + "2" * 64},
+    )
+    assert windows.status_code == 200
+    assert windows.json() == locks["win-cpu"]["lock"]
+    assert windows.content != download.content
     facts = detail["installLocks"]["linux-cpu"]
     assert facts["artifactDigest"] == artifact_digest(archive)
     assert facts["digest"] == artifact_digest(download.content)
@@ -157,15 +178,51 @@ def test_published_locks_bind_archive_base_and_visibility(tmp_path: Path) -> Non
 
         release = session.scalar(select(ReleaseRecord))
         assert release is not None
+        release.state = "yanked"
+    assert client.get(lock_url, params=query).content == download.content
+    with app.state.database.session() as session, session.begin():
+        release = session.scalar(select(ReleaseRecord))
+        assert release is not None
         release.state = "quarantined"
     assert client.get(lock_url, params=query).status_code == 404
+    with app.state.database.session() as session, session.begin():
+        release = session.scalar(select(ReleaseRecord))
+        assert release is not None
+        release.state = "active"
+    digest = facts["digest"].removeprefix("blake3:")
+    stored = tmp_path / "objects" / "pack-locks" / "blake3" / digest[:2] / f"{digest}.json"
+    stored.write_bytes(b"damaged retained lock")
+    assert client.get(lock_url, params=query).status_code == 500
 
 
-@pytest.mark.parametrize("mutation", ["base", "archive", "pack", "variant", "empty", "duplicate"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "base",
+        "archive",
+        "pack",
+        "variant",
+        "empty",
+        "duplicate",
+        "requirements-object",
+        "indexes-string",
+        "packages-object",
+        "python-null",
+        "package-name-number",
+        "wheel-size-boolean",
+        "wheel-url-no-host",
+        "wheel-url-credentials",
+        "wheel-file-origin",
+        "wheel-hash",
+        "too-many-variants",
+        "oversized-lock",
+    ],
+)
 def test_invalid_published_locks_refuse_before_submission(tmp_path: Path, mutation: str) -> None:
     client, app, token = _client(tmp_path)
     archive = _archive(tmp_path, "locked-pack")
     locks = json.loads(json.dumps(_locks(archive)))
+    lock = locks["linux-cpu"]["lock"]
     if mutation == "base":
         locks["linux-cpu"]["baseId"] = "linux-cpu"
     elif mutation == "archive":
@@ -176,6 +233,43 @@ def test_invalid_published_locks_refuse_before_submission(tmp_path: Path, mutati
         locks["linux-cpu"]["lock"]["variant"] = "win-cpu"
     elif mutation == "empty":
         locks = {}
+    elif mutation == "requirements-object":
+        lock["requirements"] = {}
+    elif mutation == "indexes-string":
+        lock["indexes"] = ""
+    elif mutation == "packages-object":
+        lock["packages"] = {}
+    elif mutation == "python-null":
+        lock["requiresPython"] = None
+    elif mutation == "too-many-variants":
+        binding = locks["linux-cpu"]
+        locks = {}
+        for number in range(33):
+            variant = f"variant-{number}"
+            locks[variant] = json.loads(json.dumps(binding))
+            locks[variant]["lock"]["variant"] = variant
+    elif mutation == "oversized-lock":
+        lock["indexes"] = ["https://example.test/" + "a" * (1024 * 1024)]
+    elif mutation.startswith("package-") or mutation.startswith("wheel-"):
+        url = {
+            "wheel-url-no-host": "https:///fixture.whl",
+            "wheel-url-credentials": "https://user:secret@example.test/fixture.whl",
+            "wheel-file-origin": "file:///tmp/fixture.whl",
+        }.get(mutation, "https://example.test/fixture.whl")
+        lock["packages"] = [
+            {
+                "name": 1 if mutation == "package-name-number" else "fixture",
+                "version": "1.0",
+                "wheels": [
+                    {
+                        "filename": "fixture-1.0-py3-none-any.whl",
+                        "size": True if mutation == "wheel-size-boolean" else 7,
+                        "sha256": "not-a-hash" if mutation == "wheel-hash" else "a" * 64,
+                        "url": url,
+                    }
+                ],
+            }
+        ]
     payload = json.dumps(locks)
     if mutation == "duplicate":
         payload = payload.replace('"requiresPython":', '"pack":"other-pack","requiresPython":')

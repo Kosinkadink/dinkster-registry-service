@@ -86,8 +86,9 @@ persistent runner keeps its uv cache locally without uploading the shared cache.
 ## Self-host with SQLite
 
 One data directory can hold both SQLite metadata and artifact objects. The
-service creates the SQLite schema on first open. Use the same command and wire
-contract as a PostgreSQL deployment:
+service creates the SQLite schema on first open and adds missing installation
+lock columns to existing catalogs without changing their releases. PostgreSQL
+uses the Alembic migration. Use the same command and wire contract on both:
 
 ```sh
 uv sync --frozen
@@ -285,11 +286,12 @@ Empty package lists are suitable only when the pack has no dependency closure.
 The ordinary archive-only request remains unchanged. A lock-bearing request
 requires a nonempty map of at most 32 variants, at most 8 MiB of lock input,
 and at most 1 MiB per lock. Duplicate JSON keys, mismatched archive/pack/variant
-identities, malformed base identities, unhashed wheel records and local-file
-wheel origins refuse before candidate storage. Base identities are publisher
-bindings, not a registry assertion that a base is approved or installed. The
-publisher must provide the complete supported set; the service never resolves
-a missing lock at installation time.
+identities, malformed base identities, incorrect JSON field types, unhashed
+wheel records, local-file wheel origins and URLs with credentials or no host
+refuse before candidate storage. Base identities are publisher bindings, not a
+registry assertion that a base is approved or installed. The publisher must
+provide the complete supported set; the service never resolves a missing lock
+at installation time.
 
 Locks are serialized as canonical JSON and stored through ObjectStore, with
 immutable size/BLAKE3 metadata on the candidate and release. Identical retries
