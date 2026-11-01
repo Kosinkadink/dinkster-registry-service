@@ -30,7 +30,6 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: |
-          test "$(hostname | tr '[:upper:]' '[:lower:]')" = kosin-x570-aorus-ultra
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test -n "$FLY_API_TOKEN"
           docker_config="$RUNNER_TEMP/fly-docker-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
