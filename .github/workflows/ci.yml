@@ -104,8 +104,11 @@ jobs:
         run: DOCKER_BUILDKIT=1 docker build --network host --tag dinkster-registry:test .
       - name: Inspect container contents
         run: |
-          image_size_bytes=$(docker image inspect --format '{{.Size}}' dinkster-registry:test)
-          test "$image_size_bytes" -le 200000000
+          set -o pipefail
+          # Docker inspect reports different size units across image stores.
+          compressed_image_bytes=$(docker image save dinkster-registry:test | gzip -c | wc -c)
+          echo "compressed_image_bytes=$compressed_image_bytes"
+          test "$compressed_image_bytes" -le 200000000
           container_id=$(docker create --network none dinkster-registry:test)
           archive=$(mktemp)
           trap 'docker rm "$container_id" >/dev/null; rm -f "$archive"' EXIT
@@ -119,7 +122,6 @@ jobs:
             echo "Dinkster test or golden content found" >&2
             exit 1
           fi
-          echo "image_size_bytes=$image_size_bytes"
           echo "forbidden_paths=none"
       - name: Run command help smoke test
         run: docker run --rm --network none dinkster-registry:test dinkster-registry --help

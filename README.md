@@ -84,6 +84,8 @@ The workflows do not require a self-hosted runner or run GPU validation.
 CI PostgreSQL uses host networking with an ephemeral loopback-only port; image
 probes use no network. Each hosted job has its own Docker daemon and temporary
 workspace; dependency setup does not require a persistent local cache.
+Container validation bounds the gzip-compressed saved image to 200 MB and
+inspects the exported filesystem for forbidden caches, Git data and test data.
 
 ## Self-host with SQLite
 
