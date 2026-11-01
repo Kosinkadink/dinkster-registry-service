@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import io
+import json
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import zipfile
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import pytest
@@ -19,6 +25,7 @@ from sqlalchemy import func, select
 import dinkster_registry_service.admission as admission_module
 from dinkster_registry_service.admission import AdmissionService, quarantine_object_key
 from dinkster_registry_service.admission_checks import (
+    StageResult,
     extracted_archive,
     run_doctor_static,
     run_executable_probe,
@@ -30,6 +37,7 @@ from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
 from dinkster_registry_service.database import (
     Database,
+    NamespaceGrantRecord,
     OutboxRecord,
     PackRecord,
     ReleaseCandidateRecord,
@@ -39,26 +47,26 @@ from dinkster_registry_service.database import (
 )
 from dinkster_registry_service.digests import artifact_digest
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore, ObjectStoreError
+from dinkster_registry_service.principals import PrincipalRepository
 from dinkster_registry_service.seed import FIXTURE_ROOT, seed_fixtures
 from dinkster_registry_service.settings import ServerSettings
 
 
-def _fixture_source(tmp_path: Path, name: str = "example-pack", version: str = "1.2.3") -> Path:
+def _fixture_source(tmp_path: Path, name: str = "example-pack") -> Path:
     source = tmp_path / name
     shutil.copytree(FIXTURE_ROOT / "example-pack", source)
     manifest_path = source / "dinkster-pack.toml"
     manifest = manifest_path.read_text()
     manifest = manifest.replace('name = "example-pack"', f'name = "{name}"')
     manifest = manifest.replace('namespaces = ["example"]', f'namespaces = ["{name}"]')
-    manifest = manifest.replace('version = "1.2.3"', f'version = "{version}"')
     manifest_path.write_text(manifest)
     nodes_path = source / "nodes.py"
     nodes_path.write_text(nodes_path.read_text().replace("example.", f"{name}."))
     return source
 
 
-def _archive(tmp_path: Path, name: str = "example-pack", version: str = "1.2.3") -> bytes:
-    return build_registry_fixture_archive(_fixture_source(tmp_path, name, version))
+def _archive(tmp_path: Path, name: str = "example-pack") -> bytes:
+    return build_registry_fixture_archive(_fixture_source(tmp_path, name))
 
 
 def _service(
@@ -121,6 +129,50 @@ def test_mandatory_stage_functions_accept_the_registry_fixture(
     assert not security.blocked
 
 
+@pytest.mark.parametrize(
+    ("declared", "entry"),
+    ((False, "empty"), (True, "empty"), (True, "broken"), (True, "invalid-schema")),
+)
+def test_catalog_declaration_accepts_only_a_valid_empty_catalog(
+    database: Database, database_url: str, tmp_path: Path, declared: bool, entry: str
+) -> None:
+    source = _fixture_source(tmp_path)
+    manifest = source / "dinkster-pack.toml"
+    if declared:
+        manifest.write_text(
+            manifest.read_text().replace(
+                "[pack]\n", '[pack]\nnode-source = "remote-gateway-catalog"\n'
+            )
+        )
+    nodes = source / "nodes.py"
+    if entry == "empty":
+        nodes.write_text("PACK_NODES = []\n")
+    elif entry == "broken":
+        nodes.write_text('raise RuntimeError("broken entry")\n')
+    else:
+        nodes.write_text(
+            nodes.read_text().replace('node_type="example-pack.resize"', 'node_type=""')
+        )
+    service = _service(database, tmp_path)
+    candidate_id = service.submit(
+        build_registry_fixture_archive(source), pack_name="example-pack", version="1.2.3"
+    )
+    assert service.run_once()
+    status = service.status(candidate_id)
+    accepted = declared and entry == "empty"
+    assert status.status == ("accepted" if accepted else "rejected")
+    with _client(database_url, tmp_path / "objects") as client:
+        response = client.get("/v1/packs/example-pack/versions/1.2.3")
+        assert response.status_code == (200 if accepted else 404)
+        if accepted:
+            assert response.json()["manifest"]["nodeSource"] == "remote-gateway-catalog"
+            assert response.json()["nodes"] == []
+        else:
+            assert any(finding.effect == "block" for finding in status.findings)
+            if not declared:
+                assert any(finding.code == "probe.no-schemas" for finding in status.findings)
+
+
 def test_isolated_probe_refuses_to_degrade_on_macos(tmp_path: Path) -> None:
     if sys.platform == "linux":
         pytest.skip("the container smoke test covers Linux isolation")
@@ -155,6 +207,128 @@ def test_configured_probe_timeout_is_honored(tmp_path: Path) -> None:
     assert result.blocked
     assert result.findings[0].code == "probe.timeout"
     assert result.findings[0].message == "Executable probe exceeded 1s."
+
+
+@pytest.fixture
+def probe_package_index(tmp_path: Path) -> Iterator[tuple[str, list[str]]]:
+    package = tmp_path / "index" / "probe-dependency"
+    package.mkdir(parents=True)
+    requests: list[str] = []
+
+    class Handler(SimpleHTTPRequestHandler):
+        def do_GET(self) -> None:
+            requests.append(self.path)
+            super().do_GET()
+
+        def do_HEAD(self) -> None:
+            requests.append(self.path)
+            super().do_HEAD()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, directory=str(package.parent)))
+    files = {
+        "probe_dependency.py": "VALUE = 83\n",
+        "dependency-startup.pth": "import sys; sys.stderr.write('UNTRUSTED_STARTUP')\n",
+        "dinkster_workers/__init__.py": "raise RuntimeError('counterfeit harness imported')\n",
+        "dinkster_workers/_doctor_probe.py": "raise RuntimeError('counterfeit probe imported')\n",
+        "probe_dependency-1.0.dist-info/METADATA": (
+            "Metadata-Version: 2.1\nName: probe-dependency\nVersion: 1.0\n"
+        ),
+        "probe_dependency-1.0.dist-info/WHEEL": (
+            "Wheel-Version: 1.0\nGenerator: registry-test\nRoot-Is-Purelib: true\n"
+            "Tag: py3-none-any\n"
+        ),
+    }
+    links = []
+    for version in ("1.0", "2.0"):
+        wheel = package / f"probe_dependency-{version}-py3-none-any.whl"
+        entries = {
+            name.replace("1.0", version): data.replace(
+                "\nVersion: 1.0\n", f"\nVersion: {version}\n"
+            )
+            for name, data in files.items()
+        }
+        if version == "2.0":
+            entries[f"probe_dependency-{version}.dist-info/METADATA"] += (
+                f"Requires-Dist: forbidden @ http://127.0.0.1:{server.server_port}"
+                "/forbidden-1.0-py3-none-any.whl\n"
+            )
+        with zipfile.ZipFile(wheel, "w") as archive:
+            for name, data in entries.items():
+                archive.writestr(name, data)
+            record = f"probe_dependency-{version}.dist-info/RECORD"
+            archive.writestr(record, "".join(f"{name},,\n" for name in entries) + f"{record},,\n")
+        links.append(f'<a href="{wheel.name}">{wheel.name}</a>')
+    package.joinpath("index.html").write_text("\n".join(links))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.parametrize("extra", (False, True))
+@pytest.mark.parametrize("version", ("1.0", "2.0", "9.9"))
+def test_probe_installs_declared_dependencies_and_cleans_environment(
+    tmp_path: Path, probe_package_index: tuple[str, list[str]], version: str, extra: bool
+) -> None:
+    index_url, requests = probe_package_index
+    source = _fixture_source(tmp_path)
+    manifest = source / "dinkster-pack.toml"
+    if extra:
+        manifest.write_text(
+            manifest.read_text()
+            + f'\n[pack.extra-requires]\ncpu = ["probe-dependency=={version}"]\n'
+            + 'cuda = ["probe-dependency==99.0"]\n'
+        )
+    else:
+        manifest.write_text(
+            manifest.read_text().replace(
+                "[pack]\n", f'[pack]\nrequires = ["probe-dependency=={version}"]\n'
+            )
+        )
+    nodes = source / "nodes.py"
+    nodes.write_text(
+        "import probe_dependency\nprint('DEPENDENCY_FILE=' + probe_dependency.__file__)\n"
+        "from probe_dependency import VALUE\n"
+        + nodes.read_text().replace("version=2,", "version=VALUE,")
+    )
+    result = run_executable_probe(
+        source,
+        settings=ServerSettings(probe_package_index_url=index_url),
+        require_isolation=False,
+    )
+    if version != "1.0":
+        assert result.blocked
+        assert result.findings[0].code == "probe.dependencies-unresolved"
+    else:
+        assert not result.blocked, result
+        assert result.data is not None
+        assert result.data["schemas"][0]["schemaVersion"] == 83
+        assert result.operator_details is not None
+        payload = json.loads(result.operator_details["stdoutTail"])
+        output = payload["doctorReport"]["import_stdout"]
+        dependency_file = Path(output.split("DEPENDENCY_FILE=", 1)[1].splitlines()[0])
+        assert dependency_file.is_relative_to(source)
+        assert not dependency_file.parent.exists()
+        assert result.operator_details["stderrTail"] == ""
+    assert "probe_dependency" not in sys.modules
+    assert not any(path.startswith("/forbidden-") for path in requests)
+
+
+def test_probe_rejects_direct_dependency_urls(tmp_path: Path) -> None:
+    source = _fixture_source(tmp_path)
+    manifest = source / "dinkster-pack.toml"
+    manifest.write_text(
+        manifest.read_text().replace(
+            "[pack]\n", '[pack]\nrequires = ["example @ file:///outside-probe.whl"]\n'
+        )
+    )
+    result = run_executable_probe(source, require_isolation=False)
+    assert result.blocked
+    assert result.findings[0].code == "probe.dependencies-invalid"
 
 
 def test_probe_output_limit_blocks_without_buffering_unbounded_output(tmp_path: Path) -> None:
@@ -396,26 +570,169 @@ def test_path_traversal_entry_rejects(database: Database, tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize(
-    ("submitted_name", "submitted_version"),
-    (("other-pack", "1.2.3"), ("example-pack", "1.2.4")),
+    ("submitted_name", "submitted_version", "accepted"),
+    (("other-pack", "1.2.3", False), ("example-pack", "1.2.4", True)),
 )
-def test_manifest_name_or_version_mismatch_rejects(
+def test_manifest_name_matches_and_submission_owns_version(
     database: Database,
     tmp_path: Path,
     submitted_name: str,
     submitted_version: str,
+    accepted: bool,
 ) -> None:
     service = _service(database, tmp_path)
     archive = _archive(tmp_path)
     candidate_id = service.submit(archive, pack_name=submitted_name, version=submitted_version)
-    _assert_rejected(service, candidate_id, "manifest.invalid")
+    if accepted:
+        assert service.run_once()
+        assert service.status(candidate_id).status == "accepted"
+        with database.session() as session:
+            release = session.scalar(select(ReleaseRecord))
+            assert release is not None and release.version == submitted_version
+    else:
+        _assert_rejected(service, candidate_id, "manifest.invalid")
+
+
+@pytest.mark.parametrize("publisher", (None, "dinkster"))
+def test_official_claims_require_registry_publisher_and_keep_exact_ids(
+    database: Database, tmp_path: Path, publisher: str | None
+) -> None:
+    principals = PrincipalRepository(database)
+    principals.register_user("operator")
+    principals.register_publisher("dinkster", "operator", datetime.now(UTC).isoformat())
+    source = _fixture_source(tmp_path, "official-pack")
+    manifest = source / "dinkster-pack.toml"
+    manifest.write_text(
+        manifest.read_text().replace(
+            'namespaces = ["official-pack"]',
+            'namespaces = ["std", "ExampleResize", "ExampleSave"]',
+        )
+    )
+    nodes = source / "nodes.py"
+    nodes.write_text(
+        nodes.read_text()
+        .replace("official-pack.resize", "ExampleResize")
+        .replace("official-pack.save", "ExampleSave")
+    )
+    service = _service(database, tmp_path)
+    candidate_id = service.submit(
+        build_registry_fixture_archive(source),
+        pack_name="official-pack",
+        version="2.0",
+        publisher=publisher,
+    )
+    if publisher is None:
+        _assert_rejected(service, candidate_id, "manifest.invalid")
+    else:
+        assert service.run_once()
+        assert service.status(candidate_id).status == "accepted"
+        with database.session() as session:
+            assert set(session.scalars(select(NamespaceGrantRecord.claim))) == {
+                "official-pack",
+                "std",
+                "ExampleResize",
+                "ExampleSave",
+            }
+
+
+@pytest.mark.parametrize("publisher", ("example-org", "other-org", None))
+@pytest.mark.parametrize("claim", ("shared", "shared.child"))
+def test_namespace_overlap_is_exclusive_to_a_publisher(
+    database: Database, tmp_path: Path, publisher: str | None, claim: str
+) -> None:
+    principals = PrincipalRepository(database)
+    principals.register_user("operator")
+    for name in ("example-org", "other-org"):
+        principals.register_publisher(name, "operator", datetime.now(UTC).isoformat())
+    service = _service(database, tmp_path)
+    for name, owner, namespace in (
+        ("first-pack", "example-org", "shared"),
+        ("second-pack", publisher, claim),
+    ):
+        source = _fixture_source(tmp_path, name)
+        manifest = source / "dinkster-pack.toml"
+        manifest.write_text(
+            manifest.read_text().replace(
+                f'namespaces = ["{name}"]', f'namespaces = ["{name}", "{namespace}"]'
+            )
+        )
+        candidate = service.submit(
+            build_registry_fixture_archive(source),
+            pack_name=name,
+            version="1.0",
+            publisher=owner,
+        )
+        assert service.run_once()
+        status = service.status(candidate)
+        if name == "first-pack" or publisher == "example-org":
+            assert status.status == "accepted", status
+        else:
+            assert status.status == "rejected"
+            assert any(finding.code == "manifest.invalid" for finding in status.findings)
+
+
+@pytest.mark.parametrize("publisher", ("example-org", "other-org", None))
+@pytest.mark.parametrize(
+    ("first_claim", "second_claim"),
+    (("shared", "shared"), ("shared", "shared.child"), ("shared.child", "shared")),
+)
+def test_promotion_rechecks_namespace_grants_after_both_candidates_scan(
+    database: Database,
+    tmp_path: Path,
+    publisher: str | None,
+    first_claim: str,
+    second_claim: str,
+) -> None:
+    principals = PrincipalRepository(database)
+    principals.register_user("operator")
+    for name in ("example-org", "other-org"):
+        principals.register_publisher(name, "operator", datetime.now(UTC).isoformat())
+    service = _service(database, tmp_path)
+    candidates = []
+    for name, owner, namespace in (
+        ("first-pack", "example-org", first_claim),
+        ("second-pack", publisher, second_claim),
+    ):
+        source = _fixture_source(tmp_path, name)
+        manifest = source / "dinkster-pack.toml"
+        manifest.write_text(
+            manifest.read_text().replace(
+                f'namespaces = ["{name}"]', f'namespaces = ["{name}", "{namespace}"]'
+            )
+        )
+        (source / "extension.so").write_bytes(b"synthetic native inventory fixture")
+        candidate = service.submit(
+            build_registry_fixture_archive(source),
+            pack_name=name,
+            version="1.0",
+            publisher=owner,
+        )
+        assert service.run_once()
+        assert service.status(candidate).status == "review"
+        candidates.append(candidate)
+
+    first = service.resolve_review(
+        candidates[0], accepted=True, actor="operator", reason="reviewed"
+    )
+    assert first.status == "accepted"
+    second = service.resolve_review(
+        candidates[1], accepted=True, actor="operator", reason="reviewed"
+    )
+    if publisher == "example-org":
+        assert second.status == "accepted", second
+    else:
+        assert second.status == "rejected", second
+        assert any(finding.code == "manifest.version-conflict" for finding in second.findings)
+    assert service.status(candidates[0]).status == "accepted"
 
 
 def test_node_outside_declared_namespace_rejects(database: Database, tmp_path: Path) -> None:
     source = _fixture_source(tmp_path)
     manifest = source / "dinkster-pack.toml"
     manifest.write_text(
-        manifest.read_text().replace('namespaces = ["example-pack"]', 'namespaces = ["other"]')
+        manifest.read_text().replace(
+            'namespaces = ["example-pack"]', 'namespaces = ["example-pack.other"]'
+        )
     )
     service = _service(database, tmp_path)
     candidate_id = service.submit(
@@ -428,7 +745,7 @@ def test_duplicate_semantic_version_rejects(database: Database, tmp_path: Path) 
     store = LocalFilesystemObjectStore(tmp_path / "objects")
     seed_fixtures(database, store)
     service = AdmissionService(database, store, require_isolation=False)
-    archive = _archive(tmp_path, version="1.2.3.0")
+    archive = _archive(tmp_path)
     candidate_id = service.submit(archive, pack_name="example-pack", version="1.2.3.0")
     _assert_rejected(service, candidate_id, "manifest.invalid")
     with database.session() as session:
@@ -459,6 +776,29 @@ def test_active_dependency_is_validated_and_recorded(database: Database, tmp_pat
         )
         assert dependency is not None
         assert (dependency.pack_name, dependency.version_range) == ("example-pack", "<2,>=1")
+
+
+@pytest.mark.parametrize("version", ("1.3.dev42", "2.1.dev42"))
+def test_active_development_dependency_must_satisfy_version_bounds(
+    database: Database, tmp_path: Path, version: str
+) -> None:
+    service = _service(database, tmp_path)
+    dependency = service.submit(_archive(tmp_path), pack_name="example-pack", version=version)
+    assert service.run_once()
+    assert service.status(dependency).status == "accepted"
+    source = _fixture_source(tmp_path, "dependent-pack")
+    manifest = source / "dinkster-pack.toml"
+    manifest.write_text(manifest.read_text() + '\n[pack.dependencies]\nexample-pack = ">=1,<2"\n')
+    candidate = service.submit(
+        build_registry_fixture_archive(source), pack_name="dependent-pack", version="1.0"
+    )
+    assert service.run_once()
+    status = service.status(candidate)
+    if version == "1.3.dev42":
+        assert status.status == "accepted", status
+    else:
+        assert status.status == "rejected"
+        assert any(finding.code == "manifest.invalid" for finding in status.findings)
 
 
 def test_missing_dependency_rejects(database: Database, tmp_path: Path) -> None:
@@ -572,6 +912,48 @@ def test_configured_candidate_claim_limit_is_honored(database: Database, tmp_pat
     assert any(finding.code == "scanner.attempt-limit" for finding in status.findings)
 
 
+def test_running_probe_renews_lease(
+    database: Database, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _service(database, tmp_path, lease_seconds=1)
+    candidate_id = service.submit(_archive(tmp_path), pack_name="example-pack", version="1.2.3")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def held_probe(root: Path, **kwargs: Any) -> StageResult:
+        entered.set()
+        assert release.wait(10)
+        return run_executable_probe(root, **kwargs)
+
+    monkeypatch.setattr(admission_module, "run_executable_probe", held_probe)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(service.run_once)
+        try:
+            assert entered.wait(10)
+            with database.session() as session:
+                candidate = session.get(ReleaseCandidateRecord, candidate_id)
+                assert candidate is not None
+                initial_expiry = candidate.lease_expires_at
+                assert initial_expiry is not None
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with database.session() as session:
+                    candidate = session.get(ReleaseCandidateRecord, candidate_id)
+                    assert candidate is not None
+                    assert candidate.lease_expires_at is not None
+                    if candidate.lease_expires_at >= initial_expiry + timedelta(seconds=1):
+                        break
+                time.sleep(0.02)
+            else:
+                pytest.fail("running probe did not renew its lease")
+            assert not _service(database, tmp_path, worker_id="contender").run_once()
+        finally:
+            release.set()
+        assert future.result(timeout=10)
+    status = service.status(candidate_id)
+    assert (status.status, status.attempts) == ("accepted", 1)
+
+
 def test_expired_lease_is_taken_over_after_scanner_sigkill(
     database: Database, database_url: str, tmp_path: Path
 ) -> None:
@@ -648,7 +1030,14 @@ service.run_once()
             )
         )
         assert attempts == {1, 2}
-        assert session.scalar(select(func.count()).select_from(OutboxRecord)) == 1
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(OutboxRecord)
+                .where(OutboxRecord.topic == "artifact.promote")
+            )
+            == 1
+        )
         candidate = session.get(ReleaseCandidateRecord, candidate_id)
         assert candidate is not None and candidate.release_id is not None
 
@@ -692,7 +1081,14 @@ def test_two_workers_promote_ten_candidates_without_duplicates(
 
     with database.session() as session:
         assert session.scalar(select(func.count()).select_from(ReleaseRecord)) == 10
-        assert session.scalar(select(func.count()).select_from(OutboxRecord)) == 10
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(OutboxRecord)
+                .where(OutboxRecord.topic == "artifact.promote")
+            )
+            == 10
+        )
         assert (
             session.scalar(
                 select(func.count(func.distinct(ReleaseRecord.pack_id))).select_from(ReleaseRecord)
@@ -775,10 +1171,25 @@ def _assert_reviewed_rescan_decision(
         assert release is not None
         assert release.state == ("active" if accepted else "quarantined")
         assert release.state_reason == (None if accepted else "rescan reviewed")
-        assert session.scalar(select(func.count()).select_from(OutboxRecord)) == 1
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(OutboxRecord)
+                .where(OutboxRecord.topic == "artifact.promote")
+            )
+            == 1
+        )
     with _client(database_url, tmp_path / "objects") as client:
         response = client.get("/v1/packs/reviewed-rescan-pack")
         assert response.status_code == (200 if accepted else 404)
+        if not accepted:
+            assert service.run_once()
+        for key in ("packs/index.json", "translations/index.json"):
+            index = client.get(f"/{key}")
+            assert index.status_code == 200
+            assert [item["name"] for item in index.json()["items"]] == (
+                ["reviewed-rescan-pack"] if accepted else []
+            )
 
 
 @pytest.mark.parametrize("accepted", (True, False), ids=("accept", "reject"))

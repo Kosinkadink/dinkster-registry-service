@@ -1,0 +1,133 @@
+name: Deploy immutable image
+
+on:
+  workflow_call:
+    secrets:
+      FLY_API_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fly-production-dinkster-registry
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      vars.FLY_DEPLOY_ENABLED == 'true'
+    runs-on: ${{ fromJSON(vars.CI_RUNNERS).linux }}
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate production prerequisites
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          test "$(hostname | tr '[:upper:]' '[:lower:]')" = kosin-x570-aorus-ultra
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -n "$FLY_API_TOKEN"
+          docker_config="$RUNNER_TEMP/fly-docker-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -m 700 "$docker_config"
+          printf 'DOCKER_CONFIG=%s\n' "$docker_config" >> "$GITHUB_ENV"
+      - uses: superfly/flyctl-actions/setup-flyctl@98172f70657cb3e15db199af139be99bd3e61200
+        with:
+          version: 0.5.1
+      - name: Verify required Fly secret names without reading values
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          result = subprocess.run(
+              ["flyctl", "secrets", "list", "--app", "dinkster-registry", "--json"],
+              text=True, capture_output=True, timeout=30, check=False,
+          )
+          if result.returncode:
+              raise SystemExit("Fly secret names inventory failed; no deployment attempted")
+          secrets = {entry["name"]: entry.get("status", "Unknown") for entry in json.loads(result.stdout)}
+          required = (
+              "DINKSTER_DATABASE_URL", "DINKSTER_CURSOR_SECRET", "S3_ENDPOINT_URL",
+              "S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_REGION",
+          )
+          for name in required:
+              status = secrets.get(name, "Missing")
+              if status not in {"Deployed", "Staged", "Partial", "Unknown", "Missing"}:
+                  status = "Unknown"
+              print(f"{name}: {status}")
+          missing = [name for name in required if name not in secrets]
+          if missing:
+              raise SystemExit("Missing required Fly secrets: " + ", ".join(missing))
+          PY
+      - name: Build the exact pushed commit and push its image
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          flyctl auth docker
+          image="registry.fly.io/dinkster-registry:${GITHUB_SHA}"
+          DOCKER_BUILDKIT=1 docker build --network host \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "$image" .
+          docker push "$image"
+          digest=$(docker image inspect "$image" --format '{{index .RepoDigests 0}}')
+          printf 'FLY_IMAGE=%s\n' "$digest" >> "$GITHUB_ENV"
+      - name: Migrate with short-lived administrator credentials
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: python3 scripts/migrate_image.py --image "$FLY_IMAGE"
+      - name: Deploy both replicas with health checks and rollback
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: >-
+          python3 scripts/deploy_image.py --app dinkster-registry --region sjc
+          --image "$FLY_IMAGE"
+      - name: Verify automatic rollback after a deliberate failed health check
+        if: vars.FLY_VERIFY_ROLLBACK == 'true'
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          scratch=$(mktemp -d)
+          trap 'rm -rf -- "$scratch"' EXIT
+          python3 - "$scratch/failed-health.toml" <<'PY'
+          import sys
+          from pathlib import Path
+          source = Path("fly.toml").read_text()
+          health = 'path = "/healthz"'
+          if source.count(health) != 1:
+              raise SystemExit("Expected exactly one registry health check")
+          Path(sys.argv[1]).write_text(source.replace(health, 'path = "/__registry-broken-health-check__"'))
+          PY
+          status=0
+          python3 scripts/deploy_image.py --app dinkster-registry --region sjc \
+            --image "$FLY_IMAGE" --config "$scratch/failed-health.toml" \
+            >"$scratch/deploy.log" 2>&1 || status=$?
+          cat "$scratch/deploy.log"
+          if test "$status" -eq 0; then
+            echo "ERROR: the deliberate failed-health deployment unexpectedly succeeded" >&2
+            python3 scripts/deploy_image.py --app dinkster-registry --region sjc \
+              --image "$FLY_IMAGE" --config fly.toml
+            exit 1
+          fi
+          grep -Fx 'Rollback passed Fly and public health checks; deployment remains failed' \
+            "$scratch/deploy.log"
+          printf 'Deliberate failed-health deployment restored the healthy immutable release.\n' \
+            >> "$GITHUB_STEP_SUMMARY"
+      - name: Record deployment evidence
+        if: always()
+        run: |
+          printf 'Commit: %s\nImage: %s\nRun: %s/%s/actions/runs/%s\n' \
+            "$GITHUB_SHA" "${FLY_IMAGE:-not-built}" "$GITHUB_SERVER_URL" \
+            "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove registry credentials
+        if: always()
+        run: |
+          if test -n "${DOCKER_CONFIG:-}"; then
+            rm -rf -- "$DOCKER_CONFIG"
+          fi

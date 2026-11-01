@@ -29,7 +29,7 @@ from .database import Database, ReleaseCandidateRecord
 from .digests import DigestError, require_blake3_digest
 from .identifiers import IdentifierError, require_canonical_pack_name
 from .ids import uuid7
-from .object_store import MAX_ARTIFACT_SIZE, LocalFilesystemObjectStore, ObjectStoreError
+from .object_store import MAX_ARTIFACT_SIZE, ObjectStoreError
 from .principals import PrincipalRepository
 from .repository import CatalogDataError, CatalogRepository
 from .settings import ServerSettings
@@ -282,7 +282,7 @@ def _candidate_payload(status: CandidateStatus) -> dict[str, object]:
 def create_app(settings: ServerSettings | None = None) -> FastAPI:
     configured = settings or ServerSettings.from_environment()
     database = Database(configured.database_url)
-    object_store = LocalFilesystemObjectStore(configured.object_store_root)
+    object_store = configured.create_object_store()
     repository = CatalogRepository(database, CursorCodec(configured.cursor_secret))
     principals = PrincipalRepository(database)
     admission = AdmissionService(database, object_store, settings=configured)
@@ -357,6 +357,12 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             ),
         )
 
+    @app.get("/healthz")
+    def readiness() -> Response:
+        with database.engine.connect() as connection:
+            connection.exec_driver_sql("SELECT 1")
+        return Response(status_code=200, headers={"Cache-Control": NO_STORE})
+
     @app.get("/v1/health")
     def health(request: Request) -> Response:
         _query(request, EmptyQuery)
@@ -366,6 +372,20 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             cache_control=PUBLIC_CACHE,
             etag_context={"endpoint": "health"},
         )
+
+    @app.get("/packs/index.json")
+    @app.get("/translations/index.json")
+    def static_index(request: Request) -> Response:
+        _query(request, EmptyQuery)
+        try:
+            body = object_store.read(request.url.path.lstrip("/"))
+        except FileNotFoundError:
+            raise _not_found("The static index has not been published.") from None
+        etag = f'"{blake3(body).hexdigest()}"'
+        headers = {"ETag": etag, "Cache-Control": PUBLIC_CACHE}
+        if _etag_matches(request.headers.get("if-none-match", ""), etag):
+            return Response(status_code=304, headers=headers)
+        return Response(body, media_type="application/json", headers=headers)
 
     @app.post("/v1/publish/{canonical_name}/versions/{canonical_version}")
     async def publish(request: Request, canonical_name: str, canonical_version: str) -> Response:

@@ -4,6 +4,9 @@
 .pytest_cache
 .ruff_cache
 .venv
+.amp
+.env
+.env.*
 __pycache__
 .data
 dist

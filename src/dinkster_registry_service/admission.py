@@ -3,12 +3,13 @@ from __future__ import annotations
 import io
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
-from dinkster_schema import canonical_name
+from dinkster_schema import canonical_claim, canonical_name, claims_conflict
 from packaging.version import Version
 from sqlalchemy import and_, or_, select, text
 from sqlalchemy.orm import Session
@@ -44,6 +45,7 @@ from .database import (
 from .digests import artifact_digest, artifact_object_key
 from .identifiers import require_canonical_pack_name
 from .ids import uuid7
+from .indexes import StaticIndexes, queue_index_rebuild
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStore, ObjectStoreError
 from .seed import MEDIA_TYPE
 from .settings import ServerSettings
@@ -153,6 +155,7 @@ class AdmissionService:
         self.database = database
         self.object_store = object_store
         self.settings = settings or ServerSettings()
+        self.indexes = StaticIndexes(database, object_store, self.settings.public_base_url)
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
         self.require_isolation = require_isolation
@@ -496,6 +499,7 @@ class AdmissionService:
         release.state = "quarantined"
         release.state_reason = reason
         release.state_changed_at = now
+        queue_index_rebuild(session)
         pack = session.get(PackRecord, release.pack_id)
         if pack is None or pack.latest_version != release.version:
             return
@@ -594,8 +598,21 @@ class AdmissionService:
                     session.flush()
                 claims = {
                     canonical_name(candidate.pack_name),
-                    *(canonical_name(value) for value in cast("list[str]", manifest["namespaces"])),
+                    *(
+                        canonical_claim(value)
+                        for value in cast("list[str]", manifest["namespaces"])
+                    ),
                 }
+                grants = list(session.scalars(select(NamespaceGrantRecord)))
+                for claim_name in sorted(claims):
+                    for held_grant in grants:
+                        if claims_conflict(claim_name, held_grant.claim) and (
+                            held_grant.publisher_id != candidate.publisher_id
+                            or (candidate.publisher_id is None and held_grant.pack_id != pack.id)
+                        ):
+                            raise PromotionConflict(
+                                f"namespace claim {claim_name!r} is unavailable"
+                            )
                 for claim_name in sorted(claims):
                     grant = session.get(NamespaceGrantRecord, claim_name)
                     if grant is None:
@@ -607,11 +624,6 @@ class AdmissionService:
                                 owner_id=pack.owner_id,
                             )
                         )
-                    elif grant.pack_id != pack.id or (
-                        candidate.publisher_id is not None
-                        and grant.publisher_id != candidate.publisher_id
-                    ):
-                        raise PromotionConflict(f"namespace claim {claim_name!r} is unavailable")
 
                 final_key = artifact_object_key(candidate.declared_digest)
                 with zipfile.ZipFile(io.BytesIO(data)) as archive:
@@ -836,6 +848,7 @@ class AdmissionService:
                 outbox.state = "delivered"
                 outbox.delivered_at = now
                 outbox.attempts += 1
+                queue_index_rebuild(session)
                 session.add(
                     AuditEventRecord(
                         id=uuid7(),
@@ -848,6 +861,7 @@ class AdmissionService:
                 )
         if failure is not None:
             return True
+        self.indexes.deliver_one()
         self.object_store.remove(source_key)
         return True
 
@@ -932,7 +946,14 @@ class AdmissionService:
         with extracted_archive(data) as root:
             if claim.kind == "upload":
                 with self.database.session() as session:
-                    manifest = run_manifest_admission(root, claim.pack_name, claim.version, session)
+                    candidate = self._leased_candidate(session, claim)
+                    manifest = run_manifest_admission(
+                        root,
+                        claim.pack_name,
+                        claim.version,
+                        session,
+                        publisher=candidate.publisher_id,
+                    )
                 if not self._record_stage(claim, "manifest", manifest):
                     return
                 review |= manifest.review
@@ -941,11 +962,20 @@ class AdmissionService:
                 return
             review |= doctor.review
             if claim.kind == "upload":
-                probe = run_executable_probe(
-                    root,
-                    settings=self.settings,
-                    require_isolation=self.require_isolation,
-                )
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        run_executable_probe,
+                        root,
+                        settings=self.settings,
+                        require_isolation=self.require_isolation,
+                    )
+                    while not wait((future,), timeout=self.lease_seconds / 3).done:
+                        with self.database.session() as session, session.begin():
+                            candidate = self._leased_candidate(session, claim)
+                            candidate.lease_expires_at = datetime.now(UTC) + timedelta(
+                                seconds=self.lease_seconds
+                            )
+                    probe = future.result()
                 if not self._record_stage(claim, "executable_probe", probe):
                     return
                 review |= probe.review
@@ -987,6 +1017,8 @@ class AdmissionService:
             )
 
     def run_once(self) -> bool:
+        if self.indexes.deliver_one():
+            return True
         if self.deliver_one_promotion():
             return True
         claim = self.claim()

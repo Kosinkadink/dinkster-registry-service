@@ -1,0 +1,283 @@
+"""Exercise the deploy command against a local Fly CLI simulator, never Fly resources."""
+
+import json
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+import pytest
+
+DEPLOY = Path(__file__).parents[1] / "scripts" / "deploy_image.py"
+OLD_IMAGE = "registry.fly.io/dinkster-registry@sha256:" + "a" * 64
+NEW_IMAGE = "registry.fly.io/dinkster-registry@sha256:" + "b" * 64
+
+FLY = """#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+state_path = pathlib.Path(os.environ["FLY_TEST_STATE"])
+state = json.loads(state_path.read_text())
+if args[:2] == ["machine", "list"]:
+    if state.get("empty", False):
+        print("[]")
+        sys.exit(0)
+    managed = {"image": state["image"], "metadata": {"fly_platform_version": "v2"}}
+    unmanaged = {"image": "old-backup-image", "metadata": {}}
+    machines = [{"id": "owned", "config": managed}]
+    if not state.get("bootstrap", False):
+        machines.append({"id": "unmanaged", "config": unmanaged})
+    print(json.dumps(machines))
+elif args[:2] == ["secrets", "list"]:
+    print(json.dumps(state["secrets"]))
+    sys.exit(state.get("inventory_exit", 0))
+elif args[:2] == ["config", "save"]:
+    pathlib.Path(args[args.index("--config") + 1]).write_text(state["config"])
+elif args[:2] == ["machine", "destroy"]:
+    if args[2] != "owned":
+        sys.exit(99)
+    state["empty"] = True
+    state_path.write_text(json.dumps(state))
+elif args[0] == "deploy":
+    config = pathlib.Path(args[args.index("--config") + 1]).read_text()
+    image = args[args.index("--image") + 1]
+    state.update(image=image, config=config, empty=False)
+    state_path.write_text(json.dumps(state))
+    if ("broken-health" in config and not state.get("ignore_failed_health", False)) or (
+        "--skip-release-command" in args and state["fail_rollback"]
+    ):
+        sys.exit(1)
+else:
+    sys.exit(99)
+"""
+
+CURL = """#!/usr/bin/env python3
+import json, os, pathlib, sys
+state_path = pathlib.Path(os.environ["FLY_TEST_STATE"])
+state = json.loads(state_path.read_text())
+state.setdefault("public_checks", []).append(state["image"])
+state_path.write_text(json.dumps(state))
+failure = state["failed_public"] if state["image"].endswith("b" * 64) else ""
+print("302" if failure == "redirect" else "200", end="")
+sys.exit(int(failure == "network"))
+"""
+
+
+@pytest.mark.parametrize(
+    "failed_health,failed_rollback,failed_public",
+    [
+        (False, False, ""),
+        (True, False, ""),
+        (True, True, ""),
+        (False, False, "network"),
+        (False, False, "redirect"),
+    ],
+)
+@pytest.mark.parametrize("bootstrap", (False, True))
+def test_deployment_keeps_the_new_release_or_restores_the_last_healthy_config(
+    tmp_path: Path,
+    failed_health: bool,
+    failed_rollback: bool,
+    failed_public: str,
+    bootstrap: bool,
+) -> None:
+    fly = tmp_path / "flyctl"
+    fly.write_text(FLY)
+    fly.chmod(0o700)
+    curl = tmp_path / "curl"
+    curl.write_text(CURL)
+    curl.chmod(0o700)
+    state = tmp_path / "state.json"
+    state.write_text(
+        json.dumps(
+            {
+                "image": OLD_IMAGE,
+                "config": "healthy-config",
+                "fail_rollback": failed_rollback,
+                "failed_public": failed_public,
+                "bootstrap": bootstrap,
+                "empty": bootstrap,
+            }
+        )
+    )
+    config = tmp_path / "new.toml"
+    config.write_text("broken-health" if failed_health else "new-healthy-config")
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(DEPLOY),
+            "--app",
+            "dinkster-registry",
+            "--region",
+            "sjc",
+            "--image",
+            NEW_IMAGE,
+            "--config",
+            str(config),
+        ],
+        env={
+            **os.environ,
+            "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+            "FLY_TEST_STATE": str(state),
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    final = json.loads(state.read_text())
+    failed = failed_health or bool(failed_public)
+    assert result.returncode == int(failed)
+    if failed_public:
+        assert final["public_checks"] == ([NEW_IMAGE] if bootstrap else [NEW_IMAGE, OLD_IMAGE])
+    if bootstrap:
+        assert final["empty"] == failed
+        if failed:
+            assert "First deployment failed" in result.stdout
+        else:
+            assert final["image"] == NEW_IMAGE
+            assert final["config"] == "new-healthy-config"
+        return
+    assert final["image"] == (OLD_IMAGE if failed else NEW_IMAGE)
+    assert final["config"] == ("healthy-config" if failed else "new-healthy-config")
+    if failed_rollback:
+        assert "ROLLBACK FAILED" in result.stdout
+    elif failed:
+        assert "Rollback passed Fly and public health checks" in result.stdout
+
+
+def test_deploy_refuses_a_mutable_image_before_contacting_fly() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(DEPLOY),
+            "--app",
+            "dinkster-registry",
+            "--region",
+            "sjc",
+            "--image",
+            "registry.fly.io/dinkster-registry:main",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "immutable Fly registry digest" in result.stderr
+
+
+@pytest.mark.parametrize("failure", ("", "rollback", "unexpected-success"))
+def test_workflow_rollback_drill_requires_failed_health_and_successful_restoration(
+    tmp_path: Path, failure: str
+) -> None:
+    root = DEPLOY.parents[1]
+    workflow = (root / ".github/workflows/deploy.yml").read_text()
+    step = workflow.split(
+        "      - name: Verify automatic rollback after a deliberate failed health check\n", 1
+    )[1].split("      - name: Record deployment evidence\n", 1)[0]
+    script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+    for name, source in (("flyctl", FLY), ("curl", CURL)):
+        executable = tmp_path / name
+        executable.write_text(source)
+        executable.chmod(0o700)
+    config = (root / "fly.toml").read_text()
+    state = tmp_path / "state.json"
+    state.write_text(
+        json.dumps(
+            {
+                "image": NEW_IMAGE,
+                "config": config,
+                "fail_rollback": failure == "rollback",
+                "ignore_failed_health": failure == "unexpected-success",
+                "failed_public": "",
+            }
+        )
+    )
+    summary = tmp_path / "summary"
+    result = subprocess.run(
+        ["bash", "-eo", "pipefail", "-c", script],
+        cwd=root,
+        env={
+            **os.environ,
+            "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+            "FLY_TEST_STATE": str(state),
+            "FLY_IMAGE": NEW_IMAGE,
+            "GITHUB_STEP_SUMMARY": str(summary),
+        },
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert (result.returncode == 0) == (not failure), result.stdout + result.stderr
+    final = json.loads(state.read_text())
+    assert final["image"] == NEW_IMAGE
+    assert final["config"] == config
+    if failure:
+        assert not summary.exists()
+        if failure == "rollback":
+            assert "ROLLBACK FAILED" in result.stdout
+        else:
+            assert "unexpectedly succeeded" in result.stderr
+    else:
+        assert summary.read_text() == (
+            "Deliberate failed-health deployment restored the healthy immutable release.\n"
+        )
+
+
+@pytest.mark.parametrize("missing", ("", "DINKSTER_CURSOR_SECRET", "S3_SECRET_ACCESS_KEY", "api"))
+def test_workflow_secret_inventory_requires_names_and_never_prints_raw_metadata(
+    tmp_path: Path, missing: str
+) -> None:
+    root = DEPLOY.parents[1]
+    workflow = (root / ".github/workflows/deploy.yml").read_text()
+    step = workflow.split(
+        "      - name: Verify required Fly secret names without reading values\n", 1
+    )[1].split("      - name: Build the exact pushed commit and push its image\n", 1)[0]
+    script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+    names = (
+        "DINKSTER_DATABASE_URL",
+        "DINKSTER_CURSOR_SECRET",
+        "S3_ENDPOINT_URL",
+        "S3_BUCKET",
+        "S3_ACCESS_KEY_ID",
+        "S3_SECRET_ACCESS_KEY",
+        "S3_REGION",
+    )
+    entries = [
+        {"name": name, "digest": "unprinted-fixture-digest", "status": "Staged"}
+        for name in names
+        if name != missing
+    ]
+    entries[0].pop("status")
+    entries[-1]["status"] = "unprinted-fixture-status"
+    state = tmp_path / "state.json"
+    before = json.dumps({"secrets": entries, "inventory_exit": int(missing == "api")})
+    state.write_text(before)
+    fly = tmp_path / "flyctl"
+    fly.write_text(FLY)
+    fly.chmod(0o700)
+    result = subprocess.run(
+        ["bash", "-eo", "pipefail", "-c", script],
+        cwd=root,
+        env={
+            **os.environ,
+            "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+            "FLY_TEST_STATE": str(state),
+        },
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert (result.returncode == 0) == (not missing), result.stdout + result.stderr
+    assert state.read_text() == before
+    assert "unprinted-fixture" not in result.stdout + result.stderr
+    if missing == "api":
+        assert "Fly secret names inventory failed" in result.stderr
+    else:
+        assert "DINKSTER_DATABASE_URL: Unknown" in result.stdout
+        assert "S3_REGION: Unknown" in result.stdout
+        if missing:
+            assert f"Missing required Fly secrets: {missing}" in result.stderr
+        else:
+            assert "DINKSTER_CURSOR_SECRET: Staged" in result.stdout

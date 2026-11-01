@@ -3,13 +3,20 @@ from __future__ import annotations
 import argparse
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 
 from blake3 import blake3
 
-from dinkster_registry_service.wire import DownloadTicket, NodeProvidersResponse, PackPage
+from dinkster_registry_service.wire import (
+    DownloadTicket,
+    NodeProvidersResponse,
+    PackPage,
+    ReleaseDetail,
+)
 
 
 @dataclass(frozen=True)
@@ -92,11 +99,106 @@ def run(base_url: str) -> None:
     print(f"PASS fixture artifact: {actual_digest} ({len(artifact.body)} bytes)")
 
 
+def check_conditional(origin: str, path: str, result: HttpResult) -> None:
+    etag = result.headers.get("etag")
+    if not etag:
+        raise ConformanceFailure(f"{path} has no ETag")
+    conditional = _request(origin + path, headers={"If-None-Match": etag})
+    if conditional.status != 304 or conditional.body:
+        raise ConformanceFailure(f"{path} did not return an empty HTTP 304")
+    for header in ("etag", "cache-control"):
+        if conditional.headers.get(header) != result.headers.get(header):
+            raise ConformanceFailure(f"{path} changed {header} on HTTP 304")
+
+
+def run_release(base_url: str, lock: dict[str, Any]) -> None:
+    origin = base_url.rstrip("/")
+    if lock.get("format") != "dinkster.lock/1" or not lock.get("packs"):
+        raise ConformanceFailure("expected a nonempty dinkster.lock/1 release lock")
+    expected = {(pack["pack"], pack["version"], pack["artifactDigest"]) for pack in lock["packs"]}
+    if len(expected) != len(lock["packs"]):
+        raise ConformanceFailure("release lock contains duplicate entries")
+
+    names: set[str] = set()
+    cursors: set[str] = set()
+    path = "/v1/packs?limit=100"
+    while True:
+        browse = _request(origin + path)
+        page = PackPage.model_validate(_json(browse))
+        names.update(pack.name for pack in page.items)
+        check_conditional(origin, path, browse)
+        if page.next_cursor is None:
+            break
+        if page.next_cursor in cursors:
+            raise ConformanceFailure("browse repeated a pagination cursor")
+        cursors.add(page.next_cursor)
+        path = "/v1/packs?" + urllib.parse.urlencode({"limit": 100, "cursor": page.next_cursor})
+    if missing := {name for name, _, _ in expected} - names:
+        raise ConformanceFailure(f"release packs missing from browse: {sorted(missing)}")
+    print(f"PASS release browse and conditional GET: {len(expected)} locked packs")
+
+    for path in ("/packs/index.json", "/translations/index.json"):
+        response = _request(origin + path)
+        index = _json(response)
+        entries = {(item["name"], item["version"], item["digest"]) for item in index["items"]}
+        if index.get("schemaVersion") != 1 or not expected <= entries:
+            raise ConformanceFailure(f"{path} does not contain every locked release and digest")
+        check_conditional(origin, path, response)
+        print(f"PASS release static index and conditional GET: {path}")
+
+    for name, version, digest in sorted(expected):
+        path = f"/v1/packs/{urllib.parse.quote(name, safe='')}/versions/"
+        path += urllib.parse.quote(version, safe="")
+        detail = ReleaseDetail.model_validate(_json(_request(origin + path)))
+        if (detail.pack_name, detail.version, detail.artifact.digest, detail.state) != (
+            name,
+            version,
+            digest,
+            "active",
+        ):
+            raise ConformanceFailure(f"release detail differs from lock: {name} {version}")
+        for node in detail.nodes:
+            provider_path = "/v1/nodes/" + urllib.parse.quote(node.node_type, safe="")
+            providers = NodeProvidersResponse.model_validate(
+                _json(_request(origin + provider_path + "/providers?includePrerelease=true"))
+            )
+            if not any(
+                (provider.pack_name, provider.version, provider.artifact_digest)
+                == (name, version, digest)
+                for provider in providers.providers
+            ):
+                raise ConformanceFailure(
+                    f"node provider differs from lock: {name} {node.node_type}"
+                )
+        ticket = DownloadTicket.model_validate(
+            _json(_request(origin + path + "/download-tickets", method="POST"))
+        )
+        if (ticket.pack_name, ticket.version, ticket.artifact_digest, ticket.artifact_size) != (
+            name,
+            version,
+            digest,
+            detail.artifact.size,
+        ):
+            raise ConformanceFailure(f"download ticket differs from locked release: {name}")
+        artifact = _request(ticket.url, headers=ticket.required_headers)
+        if (
+            artifact.status != 200
+            or "blake3:" + blake3(artifact.body).hexdigest() != digest
+            or len(artifact.body) != ticket.artifact_size
+        ):
+            raise ConformanceFailure(f"downloaded bytes differ from locked release: {name}")
+        print(f"PASS locked release, providers and artifact: {name} {version} {digest}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="registry-conformance")
     parser.add_argument("base_url")
+    parser.add_argument("--release-lock", type=Path)
     args = parser.parse_args()
-    run(cast("str", args.base_url))
+    if args.release_lock is None:
+        run(cast("str", args.base_url))
+    else:
+        run_release(args.base_url, json.loads(args.release_lock.read_bytes()))
 
 
 if __name__ == "__main__":

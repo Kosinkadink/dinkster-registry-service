@@ -11,16 +11,8 @@ requires-python = ">=3.12"
 dependencies = [
   "alembic>=1.16,<2",
   "blake3>=1.0,<2",
-  "dinkster-api @ git+https://github.com/Kosinkadink/Dinkster.git@976174e850e6e04ba32d95c163836842be405938#subdirectory=packages/dinkster-api",
-  "dinkster-assets @ git+https://github.com/Kosinkadink/Dinkster.git@976174e850e6e04ba32d95c163836842be405938#subdirectory=packages/dinkster-assets",
-  "dinkster-caches @ git+https://github.com/Kosinkadink/Dinkster.git@976174e850e6e04ba32d95c163836842be405938#subdirectory=packages/dinkster-caches",
-  "dinkster-inference @ git+https://github.com/Kosinkadink/Dinkster.git@976174e850e6e04ba32d95c163836842be405938#subdirectory=packages/dinkster-inference",
-  "dinkster-memory @ git+https://github.com/Kosinkadink/Dinkster.git@976174e850e6e04ba32d95c163836842be405938#subdirectory=packages/dinkster-memory",
-  "dinkster-protocol @ git+https://github.com/Kosinkadink/Dinkster.git@976174e850e6e04ba32d95c163836842be405938#subdirectory=packages/dinkster-protocol",
-  "dinkster-registry @ git+https://github.com/Kosinkadink/Dinkster.git@976174e850e6e04ba32d95c163836842be405938#subdirectory=packages/dinkster-registry",
-  "dinkster-schema @ git+https://github.com/Kosinkadink/Dinkster.git@976174e850e6e04ba32d95c163836842be405938#subdirectory=packages/dinkster-schema",
-  "dinkster-values @ git+https://github.com/Kosinkadink/Dinkster.git@976174e850e6e04ba32d95c163836842be405938#subdirectory=packages/dinkster-values",
-  "dinkster-workers @ git+https://github.com/Kosinkadink/Dinkster.git@976174e850e6e04ba32d95c163836842be405938#subdirectory=packages/dinkster-workers",
+  "boto3>=1.40,<2",
+  "dinkster-api @ git+https://github.com/Kosinkadink/Dinkster.git@b2a0acf12a55b60e3f0c9fbe0249becefe7d57b8#subdirectory=packages/dinkster-api",
   "fastapi>=0.116,<1",
   "packaging>=25,<26",
   "psycopg[binary]>=3.2,<4",
@@ -35,6 +27,7 @@ dinkster-registry = "dinkster_registry_service.cli:main"
 [dependency-groups]
 dev = [
   "httpx2>=2.12,<3",
+  "moto[s3,server]>=5,<6",
   "mypy>=1.17,<2",
   "pytest>=8.4,<9",
   "ruff>=0.12,<1",

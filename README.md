@@ -13,8 +13,64 @@ to immutable artifact storage. Bearer-authenticated HTTP routes accept publisher
 submissions and operator review decisions. Pending, rejected, and
 operator-review candidates are never visible through public catalog routes.
 
+## Static public indexes
+
+Every accepted publish queues a durable rebuild of `packs/index.json` and
+`translations/index.json` in the configured object store and immediately
+attempts delivery. Both contain deterministic JSON with `schemaVersion: 1` and
+an `items` array of active public releases, ordered by pack name and version
+text. Each entry includes `name`, `version`, BLAKE3 `digest`, byte `size`, and
+the artifact download `url`. Translation entries also contain `catalogs`, an
+array of locale, SHA-256 digest, and path within the same ZIP. An empty array
+means the release carries no locale catalog. Quarantine queues a rebuild to
+remove the release from both lists.
+
+The service serves the stored bytes at `/packs/index.json` and
+`/translations/index.json`, with content-derived ETags and `If-None-Match`
+support (304). The object-store indexes have a 60-second public cache lifetime.
+Artifact bytes remain immutable; only these two index keys can be replaced.
+Production stores all three in R2 through the S3 API, not on local disk.
+
+Index delivery is eventually consistent with SQL acceptance. A storage outage
+does not undo an accepted artifact: the scanner retries the durable event after
+five seconds. Each object replacement is atomic, but the pair is not a single
+transaction; a failure between writes can temporarily expose different
+snapshots. A retry rebuilds both from current catalog state. PostgreSQL advisory
+transaction locks serialize snapshot reads and writes across replicas; SQLite
+uses an immediate transaction. A slower writer cannot overwrite a newer
+snapshot after another writer completes. Before any publish or rebuild, index
+requests return 404 rather than synthesizing a different database view.
+
+Operators can rebuild both indexes from current catalog state with the same
+database and object-store environment settings used by the service:
+
+```sh
+uv run dinkster-registry rebuild-indexes
+```
+
+Seeding development fixtures does not simulate publish acceptance. Run the
+rebuild command after `seed` to expose fixtures through the static indexes.
+
+## Production deployment
+
+Two replicas share PostgreSQL metadata, fenced scanner leases and durable
+outbox events, plus R2 quarantine/artifacts/indexes. This makes local artifact
+volumes unnecessary; the image declares none. The Fly configuration keeps two
+512 MB shared-cpu-1x Machines in sjc, each with supervised nonroot API/scanner
+processes and full probe-isolation preflight. See [deploy.md](deploy.md) for
+secret prerequisites, migration/runtime credential separation, first deploy,
+health-checked rollback and the required live evidence.
+
+The [immutable-image deploy workflow](.github/workflows/deploy.yml) runs on X570
+after main's CI gates and only when production is enabled. The successful
+landed-commit deployment run and deliberate failed-health rollback receipt are
+not yet available; [issue586](https://github.com/Kosinkadink/comfy-vibe-station/issues/586)
+tracks them. Neither the workflow file nor local simulations claim live
+acceptance. Do not enable a health-only deployment while admission is blocked.
+
 Pull requests and main pushes run checks, HTTP conformance, and container
-validation in GitHub Actions. Each job has a 10-minute bound. The required
+validation in GitHub Actions. Each validation job has a 10-minute bound;
+the enabled main-only deployment has a separate 30-minute bound. The required
 `CI_RUNNERS` repository variable routes all three CPU-only jobs to the
 repository's one temporary X570 runner:
 
@@ -23,6 +79,9 @@ repository's one temporary X570 runner:
 ```
 
 The runner has no `gpu` label, and the workflows do not run GPU validation.
+CI PostgreSQL uses host networking with an ephemeral loopback-only port; image
+probes use no network. This avoids bridge/veth churn on the shared host. The
+persistent runner keeps its uv cache locally without uploading the shared cache.
 
 ## Self-host with SQLite
 
@@ -46,14 +105,14 @@ resolution all use the shared schema and FastAPI routes on both backends.
 
 ## Run the fixture catalog
 
-Requirements are Docker with Compose, Python 3.12, uv, Git, GitHub CLI, and
-authenticated read access to the private Dinkster repository. The second command
+Requirements are Docker with Compose, Python 3.12, uv, and Git. The pinned
+Dinkster source is public and needs no repository token. The second command
 starts PostgreSQL 16, migrates and seeds the database, starts the service on
 port 18041, and starts one isolated scanner worker.
 
 ```sh
-env -u GITHUB_TOKEN uv sync --frozen
-DOCKER_BUILDKIT=1 DINKSTER_REPO_TOKEN="$(env -u GITHUB_TOKEN gh auth token)" docker-compose up --build --wait
+env -u GH_TOKEN -u GITHUB_TOKEN uv sync --frozen
+DOCKER_BUILDKIT=1 docker-compose up --build --wait
 uv run python conformance/run.py http://127.0.0.1:18041
 docker-compose down --volumes --remove-orphans --rmi local
 ```
@@ -70,9 +129,10 @@ are rootless, uncompressed ZIP files with sorted paths, ZIP epoch timestamps,
 
 ## Release admission
 
-Submission, status, and re-scan commands connect directly to PostgreSQL and the
-object store. There is no public HTTP mutation route and no unauthenticated
-publishing path. The scanner runs these mandatory checks in order:
+Submission, status, and re-scan commands connect directly to the database and
+object store. HTTP publishing and review routes require bearer authentication;
+there is no unauthenticated publishing path. The scanner runs these mandatory
+checks in order:
 
 1. `ingest_integrity`: verifies size, BLAKE3, ZIP structure and CRCs, safe
    paths, regular files, limits, stored compression, and deterministic bytes.
@@ -83,9 +143,31 @@ publishing path. The scanner runs these mandatory checks in order:
 4. `executable_probe`: imports the pack in a fresh process under bubblewrap
    with no network, read-only binds, and CPU, memory, process, file-size, and
    wall-time limits. The scanner requires full user and PID namespaces and
-   refuses the degraded bubblewrap rung or any host without isolation.
+   refuses the degraded bubblewrap rung or any host without isolation. Declared
+   Python requirements use Dinkster's `requires_for("cpu")`: base `requires` plus
+   `[pack.extra-requires].cpu`, with normal platform markers. This CPU-only
+   schema probe does not validate other accelerator environments. Wheels are
+   installed into a disposable per-submission directory before probing, without
+   processing dependency `.pth` startup files. The trusted interpreter and doctor
+   load before dependency paths are exposed, and the jail applies limits before
+   importing dependencies. Resolution failures are named findings; source builds
+   and direct URL requirements are refused. The API image does not carry
+   pack-specific dependencies, and the directory is removed after probing.
 5. `fast_security`: scans for confirmed secrets and known-bad file hashes and
    inventories native, executable, bytecode-only, and obfuscated content.
+
+The submission URL or CLI version is the release version; `[pack.release]` is
+not required or read. Optional `dinkster`, `license`, and `repository` metadata
+comes from `[pack]`. Missing version ranges and licenses are reported as empty
+strings, not invented compatibility or license claims. Dinkster's host/API
+contracts remain mandatory. Reserved namespaces require the registry-local
+`dinkster` publisher, not merely a publisher string in the submitted manifest.
+Exact node-ID claims retain their spelling using Dinkster's shared grammar.
+Namespace grants are publisher-exclusive: packs from the same registered
+publisher may share exact or overlapping claims. Anonymous operator submissions
+remain pack-exclusive, and another publisher cannot take an overlapping claim.
+Dependency admission considers active development and pre-release versions
+within the declared bounds; it does not select a client installation version.
 
 The development Compose scanner runs as root in a privileged container so
 bubblewrap can create full user, PID, mount, and network namespaces on Docker
@@ -102,10 +184,12 @@ builder delivers them through a private file descriptor. Do not put secrets in
 these variables.
 
 All evidence uses policy `registry-scan/1` and is append-only. By default,
-probe stdout and stderr are each capped at 256 KiB; exceeding either cap blocks
-the candidate. Bounded output tails are stored only in operator details and
-never copied into public finding messages. A `block` finding rejects an upload;
-a blocking active-release re-scan quarantines that release. A `review` finding
+probe stdout and stderr are each capped at 2 MiB; exceeding either cap blocks
+the candidate. The complete schema catalog is part of stdout; the official
+Comfy pack's 592-schema report occupies 888,063 bytes. Bounded output tails are
+stored only in operator details and never copied into public finding messages.
+A `block` finding rejects an upload; a blocking active-release re-scan
+quarantines that release. A `review` finding
 leaves an upload visible only to operators and does not change active bytes
 during re-scan. A `signal` finding is non-blocking and is included in accepted
 trust evidence. By default, a candidate can be claimed at most three times
@@ -123,7 +207,7 @@ registry, build the registry's deterministic test fixture inside the container,
 and submit it:
 
 ```sh
-DOCKER_BUILDKIT=1 DINKSTER_REPO_TOKEN="$(env -u GITHUB_TOKEN gh auth token)" DINKSTER_SEED_FIXTURES=0 docker-compose up --build --wait
+DOCKER_BUILDKIT=1 DINKSTER_SEED_FIXTURES=0 docker-compose up --build --wait
 docker-compose exec -T registry python -c 'from pathlib import Path; from dinkster_registry_service.artifacts import build_registry_fixture_archive; from dinkster_registry_service.seed import FIXTURE_ROOT; Path("/tmp/example-pack.zip").write_bytes(build_registry_fixture_archive(FIXTURE_ROOT / "example-pack"))'
 candidate_id="$(docker-compose exec -T registry dinkster-registry submit /tmp/example-pack.zip --pack example-pack --version 1.2.3)"
 docker-compose exec -T registry dinkster-registry status "$candidate_id"
@@ -283,9 +367,17 @@ uv run dinkster-registry scanner
 
 Configuration uses `DINKSTER_DATABASE_URL`, `DINKSTER_OBJECT_STORE_ROOT`,
 `DINKSTER_PUBLIC_BASE_URL`, and `DINKSTER_CURSOR_SECRET`. Development startup also
-accepts `DINKSTER_SEED_FIXTURES=0` to keep the catalog empty. Only PostgreSQL URLs
-are accepted. Production deployments must provide a shared unpredictable
+accepts `DINKSTER_SEED_FIXTURES=0` to keep the catalog empty. PostgreSQL and SQLite
+URLs are accepted. Production deployments must provide a shared unpredictable
 cursor secret and a public base URL that clients can reach.
+
+`DATABASE_URL` and `PUBLIC_BASE_URL` are aliases; the corresponding `DINKSTER_*`
+variables take precedence. Setting all five `S3_ENDPOINT_URL`, `S3_BUCKET`,
+`S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, and `S3_REGION` selects S3-compatible
+artifact storage for the API and CLI, including quarantine and scanner
+promotion. R2 uses region `auto`. Partial configuration is rejected in every
+mode. `DINKSTER_ENV=production` requires all five settings and never falls back
+to local artifact storage. Local files remain a development/self-hosting choice.
 
 Probe and scanner limits use integer environment variables validated at
 startup. Invalid values stop the process with an error naming the variable.
@@ -293,15 +385,27 @@ startup. Invalid values stop the process with an error naming the variable.
 | Variable | Default | Valid range |
 | --- | ---: | ---: |
 | `DINKSTER_PROBE_TIMEOUT_SECONDS` | 30 | 1-600 seconds |
-| `DINKSTER_PROBE_OUTPUT_LIMIT_BYTES` | 262144 | 4096-4194304 bytes per stream |
+| `DINKSTER_PROBE_DEPENDENCY_TIMEOUT_SECONDS` | 300 | 1-1800 seconds |
+| `DINKSTER_PROBE_OUTPUT_LIMIT_BYTES` | 2097152 | 4096-4194304 bytes per stream |
 | `DINKSTER_PROBE_OPERATOR_TAIL_BYTES` | 8192 | 512 bytes through the configured output limit |
 | `DINKSTER_SCANNER_MAX_ATTEMPTS` | 3 | 1-10 claims |
+
+`DINKSTER_PROBE_PACKAGE_INDEX_URL` selects the operator-controlled package index
+(default `https://pypi.org/simple`). Installer subprocesses do not inherit host
+credentials or configuration. The scanner image includes uv; host-process
+scanners must also have uv on PATH.
+
+Packs declaring `[pack] node-source = "remote-gateway-catalog"` may publish an
+empty offline node catalog. The validated declaration is retained as
+`manifest.nodeSource`; undeclared empty packs and entry/schema errors still
+reject, and the declaration does not bypass network, ownership or security checks.
 
 ## Development
 
 The package targets Python 3.12 and commits `uv.lock`. The hosted service's
 tests require a disposable PostgreSQL database; the separate SQLite tests
-use temporary databases.
+use temporary databases. S3 contract tests start a native moto HTTP server on
+loopback, or use `TEST_S3_ENDPOINT_URL` when provided; they are not skipped in CI.
 
 ```sh
 env -u GITHUB_TOKEN uv sync --frozen
@@ -314,6 +418,5 @@ uv build --all-packages
 ```
 
 CI runs these checks against PostgreSQL 16, starts the HTTP conformance runner,
-builds the container with the private dependency credential as a BuildKit
-secret, inspects image contents, runs the isolated probe under bubblewrap, and
-runs conformance against the image.
+builds the container without dependency credentials, inspects image contents,
+runs the isolated probe under bubblewrap, and runs conformance against the image.

@@ -9,33 +9,14 @@ jobs:
   checks:
     runs-on: ${{ fromJSON(vars.CI_RUNNERS).linux }}
     timeout-minutes: 10
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_DB: dinkster_test
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d dinkster_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.0.1
         with:
-          enable-cache: true
+          enable-cache: false
           python-version: "3.12"
-      - name: Sync private Dinkster dependency
-        env:
-          DINKSTER_REPO_TOKEN: ${{ secrets.DINKSTER_REPO_TOKEN }}
-        run: |
-          GIT_CONFIG_COUNT=1 \
-          GIT_CONFIG_KEY_0="url.https://x-access-token:${DINKSTER_REPO_TOKEN}@github.com/.insteadOf" \
-          GIT_CONFIG_VALUE_0="https://github.com/" \
-          env -u GITHUB_TOKEN uv sync --frozen
+      - name: Sync public Dinkster dependency without credentials
+        run: env -u GH_TOKEN -u GITHUB_TOKEN uv sync --frozen
       - name: Verify no global Git URL rewrites
         run: |
           test -z "$(git config --global --get-regexp '^url\.' || true)"
@@ -44,9 +25,7 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy src tests
-      - run: uv run pytest -q
-        env:
-          TEST_POSTGRES_URL: postgresql+psycopg://postgres:postgres@localhost:${{ job.services.postgres.ports[5432] }}/dinkster_test
+      - run: bash scripts/with-test-postgres.sh uv run pytest -q
       - run: uv build
 
   conformance:
@@ -54,73 +33,60 @@ jobs:
     timeout-minutes: 10
     env:
       DINKSTER_OBJECT_STORE_ROOT: .data/conformance-objects
-      DINKSTER_PUBLIC_BASE_URL: http://127.0.0.1:8000
       DINKSTER_CURSOR_SECRET: conformance-cursor-secret-at-least-32-bytes
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_DB: dinkster_conformance
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d dinkster_conformance"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.0.1
         with:
-          enable-cache: true
+          enable-cache: false
           python-version: "3.12"
-          save-cache: false
-      - name: Sync private Dinkster dependency
-        env:
-          DINKSTER_REPO_TOKEN: ${{ secrets.DINKSTER_REPO_TOKEN }}
-        run: |
-          GIT_CONFIG_COUNT=1 \
-          GIT_CONFIG_KEY_0="url.https://x-access-token:${DINKSTER_REPO_TOKEN}@github.com/.insteadOf" \
-          GIT_CONFIG_VALUE_0="https://github.com/" \
-          env -u GITHUB_TOKEN uv sync --frozen
+      - name: Sync public Dinkster dependency without credentials
+        run: env -u GH_TOKEN -u GITHUB_TOKEN uv sync --frozen
       - name: Verify no global Git URL rewrites
         run: |
           test -z "$(git config --global --get-regexp '^url\.' || true)"
           echo "global_url_rewrites=none"
       - name: Run HTTP conformance suite
-        env:
-          DINKSTER_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:${{ job.services.postgres.ports[5432] }}/dinkster_conformance
         run: |
+          bash scripts/with-test-postgres.sh bash -e <<'SH'
+          http_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+          export DINKSTER_PUBLIC_BASE_URL="http://127.0.0.1:$http_port"
           uv run alembic upgrade head
           uv run dinkster-registry seed
-          uv run dinkster-registry serve --host 127.0.0.1 --port 8000 &
+          .venv/bin/dinkster-registry serve --host 127.0.0.1 --port "$http_port" &
           server_pid=$!
-          trap 'kill "$server_pid"' EXIT
+          trap 'kill "$server_pid" 2>/dev/null; wait "$server_pid" 2>/dev/null || true' EXIT
           for attempt in $(seq 1 30); do
-            if curl --fail --silent http://127.0.0.1:8000/v1/health >/dev/null; then
+            kill -0 "$server_pid"
+            if curl --fail --silent "$DINKSTER_PUBLIC_BASE_URL/v1/health" >/dev/null; then
               break
             fi
             sleep 1
           done
-          uv run python conformance/run.py http://127.0.0.1:8000
+          kill -0 "$server_pid"
+          uv run python conformance/run.py "$DINKSTER_PUBLIC_BASE_URL"
+          SH
       - name: Run SQLite HTTP conformance suite
         env:
           DINKSTER_DATABASE_URL: sqlite:///.data/conformance.db
           DINKSTER_OBJECT_STORE_ROOT: .data/sqlite-conformance-objects
         run: |
+          http_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+          export DINKSTER_PUBLIC_BASE_URL="http://127.0.0.1:$http_port"
           rm -f .data/conformance.db
           uv run dinkster-registry seed
-          uv run dinkster-registry serve --host 127.0.0.1 --port 8000 &
+          .venv/bin/dinkster-registry serve --host 127.0.0.1 --port "$http_port" &
           server_pid=$!
-          trap 'kill "$server_pid"' EXIT
+          trap 'kill "$server_pid" 2>/dev/null; wait "$server_pid" 2>/dev/null || true' EXIT
           for attempt in $(seq 1 30); do
-            if curl --fail --silent http://127.0.0.1:8000/v1/health >/dev/null; then
+            kill -0 "$server_pid"
+            if curl --fail --silent "$DINKSTER_PUBLIC_BASE_URL/v1/health" >/dev/null; then
               break
             fi
             sleep 1
           done
-          uv run python conformance/run.py http://127.0.0.1:8000
+          kill -0 "$server_pid"
+          uv run python conformance/run.py "$DINKSTER_PUBLIC_BASE_URL"
 
   container:
     runs-on: ${{ fromJSON(vars.CI_RUNNERS).linux }}
@@ -128,14 +94,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Build container
-        env:
-          DINKSTER_REPO_TOKEN: ${{ secrets.DINKSTER_REPO_TOKEN }}
-        run: DOCKER_BUILDKIT=1 docker build --secret id=dinkster_repo_token,env=DINKSTER_REPO_TOKEN --tag dinkster-registry:test .
+        run: DOCKER_BUILDKIT=1 docker build --network host --tag dinkster-registry:test .
       - name: Inspect container contents
         run: |
           image_size_bytes=$(docker image inspect --format '{{.Size}}' dinkster-registry:test)
           test "$image_size_bytes" -le 200000000
-          container_id=$(docker create dinkster-registry:test)
+          container_id=$(docker create --network none dinkster-registry:test)
           archive=$(mktemp)
           trap 'docker rm "$container_id" >/dev/null; rm -f "$archive"' EXIT
           docker export --output "$archive" "$container_id"
@@ -151,35 +115,46 @@ jobs:
           echo "image_size_bytes=$image_size_bytes"
           echo "forbidden_paths=none"
       - name: Run command help smoke test
-        run: docker run --rm dinkster-registry:test dinkster-registry --help
+        run: docker run --rm --network none dinkster-registry:test dinkster-registry --help
       - name: Run isolated executable probe
-        run: docker run --rm --privileged --user root dinkster-registry:test python scripts/check-isolated-probe.py
+        run: docker run --rm --network none --privileged dinkster-registry:test python scripts/check-isolated-probe.py
       - name: Run container conformance suite
         run: |
-          docker network create dinkster-registry-test
-          docker run --detach --name dinkster-registry-postgres \
-            --network dinkster-registry-test \
-            --env POSTGRES_DB=dinkster_registry \
-            --env POSTGRES_PASSWORD=postgres \
-            postgres:16-alpine
-          trap 'docker rm --force dinkster-registry-test dinkster-registry-postgres >/dev/null 2>&1 || true; docker network rm dinkster-registry-test >/dev/null 2>&1 || true' EXIT
-          for attempt in $(seq 1 30); do
-            if docker exec dinkster-registry-postgres pg_isready -U postgres -d dinkster_registry; then
-              break
-            fi
-            sleep 1
-          done
-          docker run --detach --name dinkster-registry-test \
-            --network dinkster-registry-test \
-            --env DINKSTER_DATABASE_URL=postgresql+psycopg://postgres:postgres@dinkster-registry-postgres:5432/dinkster_registry \
-            --env DINKSTER_PUBLIC_BASE_URL=http://127.0.0.1:8000 \
+          bash scripts/with-test-postgres.sh bash -e <<'SH'
+          http_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+          export DINKSTER_PUBLIC_BASE_URL="http://127.0.0.1:$http_port"
+          name="registry-conformance-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+          trap 'docker rm --force "$name" >/dev/null' EXIT
+          docker run --detach --privileged --name "$name" \
+            --network host \
+            --env DINKSTER_DATABASE_URL \
+            --env DINKSTER_PUBLIC_BASE_URL \
+            --env HTTP_HOST=127.0.0.1 \
+            --env HTTP_PORT="$http_port" \
             --env DINKSTER_CURSOR_SECRET=container-conformance-secret-at-least-32-bytes \
             dinkster-registry:test \
-            /app/scripts/start-dev.sh
+            bash -ec 'alembic upgrade head; dinkster-registry seed; exec bash scripts/start-service.sh'
           for attempt in $(seq 1 30); do
-            if docker exec dinkster-registry-test python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/health', timeout=2)"; then
+            test "$(docker inspect --format '{{.State.Running}}' "$name")" = true
+            if docker exec "$name" python -c 'import os, urllib.request; urllib.request.urlopen(os.environ["DINKSTER_PUBLIC_BASE_URL"] + "/v1/health", timeout=2)'; then
               break
             fi
             sleep 1
           done
-          docker exec dinkster-registry-test python conformance/run.py http://127.0.0.1:8000
+          test "$(docker inspect --format '{{.State.Running}}' "$name")" = true
+          docker exec "$name" python conformance/run.py "$DINKSTER_PUBLIC_BASE_URL"
+          SH
+      - name: Admit every published official pack and verify release-lock digests
+        run: |
+          bash scripts/with-test-postgres.sh bash -e <<'SH'
+          docker run --rm --privileged --network host \
+            --env DINKSTER_DATABASE_URL \
+            dinkster-registry:test \
+            bash -ec 'alembic upgrade head; python scripts/check-release-packs.py /tmp/official-packs --download-only; python scripts/check-release-packs.py /tmp/official-packs'
+          SH
+
+  deploy:
+    needs: [checks, conformance, container]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.FLY_DEPLOY_ENABLED == 'true'
+    uses: ./.github/workflows/deploy.yml
+    secrets: inherit

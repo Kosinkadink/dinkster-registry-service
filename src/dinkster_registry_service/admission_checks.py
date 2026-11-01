@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -28,11 +29,13 @@ from dinkster_schema import (
     reserved_root,
     schema_from_wire,
     schema_signature,
+    validate_claim,
 )
 from dinkster_workers import doctor as dinkster_doctor
 from dinkster_workers.manifest import ManifestError, PackManifest, load_manifest
 from dinkster_workers.sandbox import SandboxError, detect_probe_jail
 from packaging.licenses import InvalidLicenseExpression, canonicalize_license_expression
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import Version
 from sqlalchemy import select
@@ -199,28 +202,21 @@ def extracted_archive(data: bytes) -> Iterator[Path]:
         yield root
 
 
-def _release_table(manifest_path: Path) -> dict[str, object]:
+def _pack_metadata(manifest_path: Path) -> dict[str, object]:
     with manifest_path.open("rb") as source:
         document = tomllib.load(source)
     pack = document.get("pack")
     if not isinstance(pack, dict):
         raise ValueError("manifest is missing [pack]")
-    release = cast("dict[str, object]", pack).get("release")
-    if not isinstance(release, dict):
-        raise ValueError("manifest is missing [pack.release]")
-    table = cast("dict[str, object]", release)
-    unknown = sorted(set(table) - {"version", "dinkster", "license", "repository"})
-    if unknown:
-        raise ValueError(f"[pack.release] has unknown fields: {', '.join(unknown)}")
-    return table
+    return cast("dict[str, object]", pack)
 
 
 def _manifest_payload(manifest: PackManifest, release: dict[str, object]) -> dict[str, Any]:
     contracts = manifest.contracts
     assert contracts is not None
     return {
-        "dinkster": release["dinkster"],
-        "license": release["license"],
+        "dinkster": release.get("dinkster", ""),
+        "license": release.get("license", ""),
         "contracts": {
             "host": contracts.host,
             "api": contracts.api,
@@ -233,12 +229,21 @@ def _manifest_payload(manifest: PackManifest, release: dict[str, object]) -> dic
             "writableMounts": manifest.sandbox.writable_mounts,
         },
         "pythonRequirements": list(manifest.requires),
+        "nodeSource": manifest.node_source,
         "dependencies": [
             {"packName": dependency.pack, "versionRange": dependency.version}
             for dependency in manifest.dependencies
         ],
         "repository": release.get("repository"),
         "namespaces": list(manifest.namespaces),
+        "localeCatalogs": [
+            {
+                "locale": catalog.locale,
+                "digest": catalog.digest,
+                "path": f"locales/{catalog.locale}.json",
+            }
+            for catalog in manifest.locale_catalogs
+        ],
         "templates": [
             {
                 "id": template.id,
@@ -266,45 +271,40 @@ def run_manifest_admission(
     session: Session,
     *,
     rescan: bool = False,
+    publisher: str | None = None,
 ) -> StageResult:
     try:
         manifest = load_manifest(root / MANIFEST_NAME)
-        release = _release_table(root / MANIFEST_NAME)
+        release = _pack_metadata(root / MANIFEST_NAME)
         require_canonical_pack_name(manifest.name)
         require_public_version(release_version)
-        declared_version = release.get("version")
-        if not isinstance(declared_version, str):
-            raise ValueError("[pack.release] version must be a string")
-        require_public_version(declared_version)
         if manifest.name != pack_name:
             raise ValueError(
                 f"manifest pack name {manifest.name!r} does not match submission {pack_name!r}"
             )
-        if declared_version != release_version:
-            raise ValueError(
-                f"manifest version {declared_version!r} does not match submission "
-                f"{release_version!r}"
-            )
-        dinkster_range = release.get("dinkster")
-        if not isinstance(dinkster_range, str) or not dinkster_range:
-            raise ValueError("[pack.release] dinkster must be a nonempty version range")
-        if not str(SpecifierSet(dinkster_range)):
-            raise ValueError("[pack.release] dinkster must constrain the engine version")
+        dinkster_range = release.get("dinkster", "")
+        if not isinstance(dinkster_range, str):
+            raise ValueError("[pack] dinkster must be a version range")
+        SpecifierSet(dinkster_range)
         license_expression = release.get("license")
-        if not isinstance(license_expression, str):
-            raise ValueError("[pack.release] license must be an SPDX expression")
-        normalized_license = canonicalize_license_expression(license_expression)
-        if "LicenseRef-" in normalized_license and not (root / "LICENSE").is_file():
-            raise ValueError("a LicenseRef license requires a root LICENSE file")
+        if license_expression is not None:
+            if not isinstance(license_expression, str):
+                raise ValueError("[pack] license must be an SPDX expression")
+            normalized_license = canonicalize_license_expression(license_expression)
+            if "LicenseRef-" in normalized_license and not (root / "LICENSE").is_file():
+                raise ValueError("a LicenseRef license requires a root LICENSE file")
         repository = release.get("repository")
         if repository is not None and (
             not isinstance(repository, str) or not repository.startswith("https://")
         ):
-            raise ValueError("[pack.release] repository must be an HTTPS URL")
+            raise ValueError("[pack] repository must be an HTTPS URL")
         if manifest.contracts is None:
             raise ValueError("manifest is missing [pack.contracts]")
         for claim in (manifest.name, *manifest.namespaces):
-            if reserved_root(claim) is not None:
+            problem = validate_claim(claim)
+            if problem is not None:
+                raise ValueError(f"invalid namespace claim {claim!r}: {problem}")
+            if reserved_root(claim) is not None and publisher != "dinkster":
                 raise ValueError(f"namespace claim is reserved: {claim!r}")
         pack = session.scalar(select(PackRecord).where(PackRecord.name == pack_name))
         if pack is not None and not rescan:
@@ -322,7 +322,11 @@ def run_manifest_admission(
         grants = session.execute(select(NamespaceGrantRecord, PackRecord).join(PackRecord)).all()
         for claim in (manifest.name, *manifest.namespaces):
             for grant, granted_pack in grants:
-                if granted_pack.name != pack_name and claims_conflict(claim, grant.claim):
+                if (
+                    granted_pack.name != pack_name
+                    and not (publisher is not None and grant.publisher_id == publisher)
+                    and claims_conflict(claim, grant.claim)
+                ):
                     raise ValueError(
                         f"namespace claim {claim!r} conflicts with pack {granted_pack.name!r}"
                     )
@@ -339,7 +343,9 @@ def run_manifest_admission(
                 raise ValueError("a pack cannot depend on itself")
             versions = releases_by_pack.get(dependency.pack, [])
             required = SpecifierSet(dependency.version)
-            if not any(Version(value.version) in required for value in versions):
+            if not any(
+                required.contains(Version(value.version), prereleases=True) for value in versions
+            ):
                 raise ValueError(
                     f"dependency {dependency.pack!r} has no active public version satisfying "
                     f"{dependency.version!r}"
@@ -411,7 +417,7 @@ def run_doctor_static(root: Path) -> StageResult:
         mapped,
         {
             "status": "failed" if errors else "warning" if warnings else "passed",
-            "doctorVersion": distribution_version("dinkster-workers"),
+            "doctorVersion": distribution_version("dinkster-api"),
             "reportVersion": dinkster_doctor.DOCTOR_REPORT_VERSION,
             "errorCount": errors,
             "warningCount": warnings,
@@ -591,6 +597,81 @@ def run_executable_probe(
     require_isolation: bool = True,
 ) -> StageResult:
     configured = settings or ServerSettings()
+    try:
+        manifest = load_manifest(root / MANIFEST_NAME)
+        requirements = [Requirement(value) for value in manifest.requires_for("cpu")]
+    except (ManifestError, InvalidRequirement):
+        return StageResult(
+            (_block("probe.dependencies-invalid", "Pack requirements are invalid."),)
+        )
+    if any(requirement.url is not None for requirement in requirements):
+        return StageResult(
+            (
+                _block(
+                    "probe.dependencies-invalid", "Probe dependencies must use the package index."
+                ),
+            )
+        )
+    if not requirements:
+        return _run_executable_probe(root, configured, require_isolation)
+    installer = shutil.which("uv")
+    if installer is None:
+        return StageResult(
+            (_block("probe.dependencies-unavailable", "The dependency installer is unavailable."),)
+        )
+    # The existing probe mount exposes dependencies read-only, without mounting
+    # another host directory or changing the submitted archive bytes.
+    with tempfile.TemporaryDirectory(prefix=".registry-probe-", dir=root) as directory:
+        dependencies = Path(directory)
+        common = [installer, "--no-config", "--no-cache", "--no-python-downloads", "--no-progress"]
+        command = [
+            *common,
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            "--target",
+            str(dependencies),
+            "--only-binary",
+            ":all:",
+            "--keyring-provider",
+            "disabled",
+            "--index-url",
+            configured.probe_package_index_url,
+            "--no-sources",
+            *[str(requirement) for requirement in requirements],
+        ]
+        try:
+            completed = _run_probe_process(
+                command,
+                timeout_seconds=configured.probe_dependency_timeout_seconds,
+                output_limit_bytes=configured.probe_output_limit_bytes,
+            )
+        except OSError:
+            return StageResult(
+                (_block("probe.dependencies-unavailable", "Dependency provisioning failed."),)
+            )
+        if completed.returncode or completed.timed_out or completed.output_limit:
+            return StageResult(
+                (
+                    _block(
+                        "probe.dependencies-unresolved",
+                        "Declared dependencies could not be provisioned as wheels "
+                        "within the limits.",
+                    ),
+                ),
+            )
+        # Never run site.addsitedir: dependency .pth files must not run before
+        # the trusted harness or gain the ability to replace it at startup.
+        return _run_executable_probe(root, configured, require_isolation, dependencies)
+
+
+def _run_executable_probe(
+    root: Path,
+    configured: ServerSettings,
+    require_isolation: bool,
+    dependencies: Path | None = None,
+) -> StageResult:
     manifest_path = root / MANIFEST_NAME
     jail = None
     if require_isolation:
@@ -612,6 +693,23 @@ def run_executable_probe(
         "dinkster_registry_service.probe" if jail is None else "dinkster_workers._doctor_probe"
     )
     command = [sys.executable, "-m", probe_module, str(manifest_path)]
+    environment = _probe_environment()
+    if dependencies is not None:
+        # Dinkster's trusted bootstrap imports the harness, then installs these
+        # paths and limits before invoking it. Trusted imports stay first.
+        paths = [path for path in sys.path if path and Path(path).is_absolute()]
+        environment["PYTHONPATH"] = os.pathsep.join([*paths, str(dependencies)])
+        if jail is None:
+            command = [
+                sys.executable,
+                "-c",
+                "import runpy, sys; "
+                f"sys.path.extend([{str(dependencies)!r}]); "
+                "sys.argv = sys.argv[1:]; "
+                f"runpy.run_module({probe_module!r}, run_name='__main__')",
+                probe_module,
+                str(manifest_path),
+            ]
     try:
         if jail is None:
             completed = _run_probe_process(
@@ -621,7 +719,7 @@ def run_executable_probe(
             )
         else:
             with tempfile.TemporaryFile() as environment_file:
-                environment_file.write(json.dumps(_probe_environment()).encode("utf-8"))
+                environment_file.write(json.dumps(environment).encode("utf-8"))
                 environment_file.flush()
                 environment_file.seek(0)
                 env_fd = environment_file.fileno()
@@ -736,7 +834,11 @@ def run_executable_probe(
     )
     if observed_gpu and not manifest.sandbox.gpu:
         findings.append(_review("probe.undeclared-gpu", "Import initialized an undeclared GPU."))
-    if not schemas and not any(finding.effect == "block" for finding in findings):
+    if (
+        not schemas
+        and manifest.node_source != "remote-gateway-catalog"
+        and not any(finding.effect == "block" for finding in findings)
+    ):
         findings.append(_block("probe.no-schemas", "Pack probe returned no node schemas."))
     return StageResult(tuple(findings), {"schemas": schemas}, operator_details)
 
