@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from dinkster_registry.archive_admission import ProbeSettings
+
 from .database import default_object_root
 
 if TYPE_CHECKING:
@@ -31,7 +33,7 @@ def _environment_value(primary: str, alias: str, default: str) -> str:
 
 
 @dataclass(frozen=True)
-class ServerSettings:
+class ServerSettings(ProbeSettings):
     database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5432/dinkster_registry"
     object_store_root: Path = default_object_root()
     public_base_url: str = "http://127.0.0.1:8000"
@@ -42,11 +44,6 @@ class ServerSettings:
     s3_secret_access_key: str | None = field(default=None, repr=False)
     s3_region: str | None = None
     cursor_secret: bytes = b"local-cursor-secret-change-in-production"
-    probe_timeout_seconds: int = 30
-    probe_dependency_timeout_seconds: int = 300
-    probe_package_index_url: str = "https://pypi.org/simple"
-    probe_output_limit_bytes: int = 2 * 1024 * 1024
-    probe_operator_tail_bytes: int = 8 * 1024
     scanner_max_attempts: int = 3
 
     def __post_init__(self) -> None:
