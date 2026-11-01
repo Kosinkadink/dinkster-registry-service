@@ -244,6 +244,7 @@ All catalog routes are under `/v1` and use camelCase JSON fields:
 | GET | `/v1/packs/{name}/versions` | List active releases, optionally including yanks. |
 | GET | `/v1/packs/{name}/versions/{version}` | Read immutable release facts and trust signals. |
 | GET | `/v1/packs/{name}/versions/{version}/schemas` | Read complete indexed node schemas. |
+| GET | `/v1/packs/{name}/versions/{version}/locks/{variant}?baseId={id}` | Read an immutable dependency lock bound to an exact base. |
 | GET | `/v1/nodes/{nodeType}/providers` | Find active compatible providers for a node type. |
 | POST | `/v1/packs/{name}/versions/{version}/download-tickets` | Get an immutable public artifact URL. |
 | GET | `/v1/artifacts/{digest}` | Download and verify an active or yanked public release archive. |
@@ -254,6 +255,55 @@ Browse accepts `q`, `ownerType`, `owner`, `nodeType`, `visibility`, `sort`,
 without authenticated private-pack support. Version lists accept
 `includeYanked`, `limit`, and `cursor`. Node-provider queries accept
 `dinksterVersion` and `includePrerelease`.
+
+### Publishing dependency locks
+
+The authenticated publish route also accepts `multipart/form-data` with one
+file part named `archive` and one text part named `locks`. The latter is a
+JSON map from every supported variant to its exact base identity, source
+archive BLAKE3 and existing `dinkster.pack-lock/1` document:
+
+```json
+{
+  "linux-cpu": {
+    "baseId": "sha256:<64 lowercase hex>",
+    "artifactDigest": "blake3:<archive hex>",
+    "lock": {
+      "format": "dinkster.pack-lock/1",
+      "pack": "example-pack",
+      "variant": "linux-cpu",
+      "requiresPython": ">=3.12",
+      "requirements": [],
+      "indexes": [],
+      "packages": []
+    }
+  }
+}
+```
+
+Empty package lists are suitable only when the pack has no dependency closure.
+The ordinary archive-only request remains unchanged. A lock-bearing request
+requires a nonempty map of at most 32 variants, at most 8 MiB of lock input,
+and at most 1 MiB per lock. Duplicate JSON keys, mismatched archive/pack/variant
+identities, malformed base identities, unhashed wheel records and local-file
+wheel origins refuse before candidate storage. Base identities are publisher
+bindings, not a registry assertion that a base is approved or installed. The
+publisher must provide the complete supported set; the service never resolves
+a missing lock at installation time.
+
+Locks are serialized as canonical JSON and stored through ObjectStore, with
+immutable size/BLAKE3 metadata on the candidate and release. Identical retries
+return the original candidate; a changed binding for that publication refuses.
+The release remains private until every lock and the archive are verified in
+immutable storage. A promotion outage retries through the existing outbox.
+
+Release detail exposes `installLocks`, keyed by variant, containing `baseId`,
+`artifactDigest`, lock `digest`, `size`, and a relative `url`. Resolve that URL
+against the registry origin and pass the exact `baseId` query parameter; a
+rolling variant label is insufficient and a different base returns 409. Lock
+downloads follow archive visibility (active or yanked, never quarantine), verify
+stored bytes, and use the digest ETag and immutable cache policy. Raw archive
+releases without attached locks expose an empty map.
 
 Every mutable public GET returns a strong opaque ETag and:
 

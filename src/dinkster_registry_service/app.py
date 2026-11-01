@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pydantic.alias_generators import to_camel
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.background import BackgroundTask
+from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response, StreamingResponse
 
@@ -30,6 +31,7 @@ from .digests import DigestError, require_blake3_digest
 from .identifiers import IdentifierError, require_canonical_pack_name
 from .ids import uuid7
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStoreError
+from .pack_locks import MAX_LOCKS_SIZE, PackLocksError, lock_object_key
 from .principals import PrincipalRepository
 from .repository import CatalogDataError, CatalogRepository
 from .settings import ServerSettings
@@ -51,6 +53,10 @@ class RequestModel(BaseModel):
 
 class EmptyQuery(RequestModel):
     pass
+
+
+class LockQuery(RequestModel):
+    base_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
 
 class BrowseQuery(RequestModel):
@@ -398,7 +404,42 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             principals.authorize_token(token, token.publisher, name)
         except RegistryError as exc:
             raise ProtocolError(403, "forbidden", str(exc)) from None
-        archive = await request.body()
+        locks = None
+        limit = MAX_ARTIFACT_SIZE
+        multipart = (
+            request.headers.get("content-type", "").split(";", 1)[0] == "multipart/form-data"
+        )
+        if multipart:
+            limit += MAX_LOCKS_SIZE + 16384
+        chunks = bytearray()
+        async for chunk in request.stream():
+            chunks.extend(chunk)
+            if len(chunks) > limit:
+                raise ProtocolError(
+                    413, "artifact_too_large", "Publication body exceeds size limit."
+                )
+        if multipart:
+
+            async def receive_body() -> dict[str, Any]:
+                return {"type": "http.request", "body": bytes(chunks), "more_body": False}
+
+            bounded = Request(request.scope, receive=receive_body)
+            async with bounded.form(
+                max_files=1, max_fields=1, max_part_size=MAX_LOCKS_SIZE
+            ) as form:
+                if [key for key, _ in form.multi_items()].count("archive") != 1 or (
+                    len(form.multi_items()) != 2 or "locks" not in form
+                ):
+                    raise ProtocolError(
+                        400, "invalid_request", "Expected one archive and one locks part."
+                    )
+                upload, raw_locks = form["archive"], form["locks"]
+                if not isinstance(upload, UploadFile) or not isinstance(raw_locks, str):
+                    raise ProtocolError(400, "invalid_request", "Invalid archive or locks part.")
+                archive = await upload.read()
+                locks = raw_locks.encode("utf-8")
+        else:
+            archive = bytes(chunks)
         if not 1 <= len(archive) <= MAX_ARTIFACT_SIZE:
             raise ProtocolError(
                 413,
@@ -412,6 +453,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
                 version=version,
                 submitted_by=token.minted_by,
                 publisher=token.publisher,
+                locks=locks,
             )
             principals.record(
                 token.minted_by,
@@ -420,6 +462,8 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
                 datetime.now(UTC).isoformat(),
                 f"{name} {version}",
             )
+        except PackLocksError as exc:
+            raise ProtocolError(400, "invalid_request", str(exc)) from None
         except (AdmissionError, RegistryError) as exc:
             raise ProtocolError(409, "publish_in_progress", str(exc)) from None
         return _json_response(
@@ -767,6 +811,36 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             cache_control=NO_STORE,
             conditional=False,
             include_etag=False,
+        )
+
+    @app.get("/v1/packs/{canonical_name}/versions/{canonical_version}/locks/{variant}")
+    def installation_lock(
+        request: Request, canonical_name: str, canonical_version: str, variant: str
+    ) -> Response:
+        query = _query(request, LockQuery)
+        release = repository.release_detail(_pack_name(canonical_name), _version(canonical_version))
+        lock = release.install_locks.get(variant) if release is not None else None
+        if lock is None:
+            raise _not_found("The requested installation lock was not found.")
+        if lock.base_id != query.base_id:
+            raise ProtocolError(409, "invalid_request", "Installation lock base identity differs.")
+        etag = f'"{lock.digest}"'
+        headers = {"Cache-Control": ARTIFACT_CACHE, "ETag": etag}
+        if _etag_matches(request.headers.get("if-none-match", ""), etag):
+            return Response(status_code=304, headers=headers)
+        try:
+            stored = object_store.open(
+                lock_object_key(lock.digest), expected_size=lock.size, expected_digest=lock.digest
+            )
+        except (FileNotFoundError, ObjectStoreError) as exc:
+            raise ProtocolError(
+                500, "internal", "Installation lock bytes are unavailable."
+            ) from exc
+        return StreamingResponse(
+            stored,
+            media_type="application/json",
+            headers=headers,
+            background=BackgroundTask(stored.close),
         )
 
     @app.get("/v1/artifacts/{digest}")

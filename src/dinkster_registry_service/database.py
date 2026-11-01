@@ -195,6 +195,7 @@ class ReleaseRecord(Base):
         String(71), ForeignKey("artifacts.digest", ondelete="RESTRICT")
     )
     manifest: Mapped[dict[str, Any]] = mapped_column(JSON_STORAGE)
+    install_locks: Mapped[dict[str, Any]] = mapped_column(JSON_STORAGE, default=dict)
     next_scan_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
@@ -318,6 +319,7 @@ class ReleaseCandidateRecord(Base):
     declared_digest: Mapped[str] = mapped_column(String(71))
     declared_size: Mapped[int] = mapped_column(BigInteger)
     object_key: Mapped[str] = mapped_column(Text)
+    install_locks: Mapped[dict[str, Any]] = mapped_column(JSON_STORAGE, default=dict)
     status: Mapped[str] = mapped_column(String(16))
     status_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

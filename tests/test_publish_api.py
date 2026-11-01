@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+import json
 import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from httpx2 import Response
 from sqlalchemy import select
 
 from dinkster_registry_service.admission import AdmissionService
 from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
-from dinkster_registry_service.database import NamespaceGrantRecord, PackRecord
-from dinkster_registry_service.object_store import LocalFilesystemObjectStore
+from dinkster_registry_service.database import NamespaceGrantRecord, OutboxRecord, PackRecord
+from dinkster_registry_service.digests import artifact_digest
+from dinkster_registry_service.object_store import LocalFilesystemObjectStore, ObjectStoreError
 from dinkster_registry_service.principals import PrincipalRepository
 from dinkster_registry_service.seed import FIXTURE_ROOT
 from dinkster_registry_service.settings import ServerSettings
@@ -78,6 +82,161 @@ def test_publish_api_authenticates_and_attributes_a_sqlite_submission(tmp_path: 
 
     principals = PrincipalRepository(app.state.database)
     assert principals.audit()[-1].action == "submit-release"
+
+
+def _locks(archive: bytes) -> dict[str, object]:
+    return {
+        variant: {
+            "baseId": "sha256:" + digit * 64,
+            "artifactDigest": artifact_digest(archive),
+            "lock": {
+                "format": "dinkster.pack-lock/1",
+                "pack": "locked-pack",
+                "variant": variant,
+                "requiresPython": ">=3.12",
+                "requirements": [],
+                "indexes": [],
+                "packages": [],
+            },
+        }
+        for variant, digit in (("linux-cpu", "1"), ("win-cpu", "2"))
+    }
+
+
+def test_published_locks_bind_archive_base_and_visibility(tmp_path: Path) -> None:
+    client, app, token = _client(tmp_path)
+    archive = _archive(tmp_path, "locked-pack")
+    locks = _locks(archive)
+    endpoint = "/v1/publish/locked-pack/versions/1.2.3"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    def publish(payload: dict[str, object]) -> Response:
+        return client.post(
+            endpoint,
+            headers=headers,
+            files={"archive": ("pack.zip", archive, "application/zip")},
+            data={"locks": json.dumps(payload)},
+        )
+
+    submitted = publish(locks)
+    assert submitted.status_code == 202, submitted.text
+    assert publish(locks).json()["candidateId"] == submitted.json()["candidateId"]
+    lock_url = "/v1/packs/locked-pack/versions/1.2.3/locks/linux-cpu"
+    query = {"baseId": "sha256:" + "1" * 64}
+    assert client.get(lock_url, params=query).status_code == 404
+    admission = AdmissionService(
+        app.state.database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        require_isolation=False,
+    )
+    assert admission.run_once()
+    assert admission.status(UUID(submitted.json()["candidateId"])).status == "accepted"
+    detail = client.get("/v1/packs/locked-pack/versions/1.2.3").json()
+    assert set(detail["installLocks"]) == {"linux-cpu", "win-cpu"}
+    download = client.get(lock_url, params=query)
+    assert download.status_code == 200
+    assert download.json()["variant"] == "linux-cpu"
+    facts = detail["installLocks"]["linux-cpu"]
+    assert facts["artifactDigest"] == artifact_digest(archive)
+    assert facts["digest"] == artifact_digest(download.content)
+    assert facts["size"] == len(download.content)
+    assert facts["baseId"] == query["baseId"]
+    assert client.get(lock_url, params={"baseId": "sha256:" + "2" * 64}).status_code == 409
+    assert (
+        client.get(
+            lock_url, params=query, headers={"If-None-Match": download.headers["etag"]}
+        ).status_code
+        == 304
+    )
+    assert publish(locks).json()["candidateId"] == submitted.json()["candidateId"]
+    changed = json.loads(json.dumps(locks))
+    changed["linux-cpu"]["baseId"] = "sha256:" + "3" * 64
+    assert publish(changed).status_code == 409
+    with app.state.database.session() as session, session.begin():
+        from dinkster_registry_service.database import ReleaseRecord
+
+        release = session.scalar(select(ReleaseRecord))
+        assert release is not None
+        release.state = "quarantined"
+    assert client.get(lock_url, params=query).status_code == 404
+
+
+@pytest.mark.parametrize("mutation", ["base", "archive", "pack", "variant", "empty", "duplicate"])
+def test_invalid_published_locks_refuse_before_submission(tmp_path: Path, mutation: str) -> None:
+    client, app, token = _client(tmp_path)
+    archive = _archive(tmp_path, "locked-pack")
+    locks = json.loads(json.dumps(_locks(archive)))
+    if mutation == "base":
+        locks["linux-cpu"]["baseId"] = "linux-cpu"
+    elif mutation == "archive":
+        locks["linux-cpu"]["artifactDigest"] = "blake3:" + "0" * 64
+    elif mutation == "pack":
+        locks["linux-cpu"]["lock"]["pack"] = "other-pack"
+    elif mutation == "variant":
+        locks["linux-cpu"]["lock"]["variant"] = "win-cpu"
+    elif mutation == "empty":
+        locks = {}
+    payload = json.dumps(locks)
+    if mutation == "duplicate":
+        payload = payload.replace('"requiresPython":', '"pack":"other-pack","requiresPython":')
+    response = client.post(
+        "/v1/publish/locked-pack/versions/1.2.3",
+        headers={"Authorization": f"Bearer {token}"},
+        files={"archive": ("pack.zip", archive, "application/zip")},
+        data={"locks": payload},
+    )
+    assert response.status_code == 400, response.text
+    assert not (tmp_path / "objects").exists()
+
+
+def test_installation_lock_storage_failure_keeps_release_private_until_retry(
+    tmp_path: Path,
+) -> None:
+    client, app, token = _client(tmp_path)
+    archive = _archive(tmp_path, "locked-pack")
+    submitted = client.post(
+        "/v1/publish/locked-pack/versions/1.2.3",
+        headers={"Authorization": f"Bearer {token}"},
+        files={"archive": ("pack.zip", archive, "application/zip")},
+        data={"locks": json.dumps(_locks(archive))},
+    )
+    assert submitted.status_code == 202
+
+    class UnavailableLockStorage(LocalFilesystemObjectStore):
+        unavailable = True
+
+        def put(self, key: str, data: bytes) -> None:
+            if key.startswith("pack-locks/") and self.unavailable:
+                raise ObjectStoreError("synthetic lock storage outage")
+            super().put(key, data)
+
+    store = UnavailableLockStorage(tmp_path / "objects")
+    admission = AdmissionService(app.state.database, store, require_isolation=False)
+    candidate = UUID(submitted.json()["candidateId"])
+    assert admission.run_once()
+    assert admission.status(candidate).status == "promoting"
+    endpoint = "/v1/packs/locked-pack/versions/1.2.3"
+    assert client.get(endpoint).status_code == 404
+    assert (
+        client.get(
+            endpoint + "/locks/linux-cpu", params={"baseId": "sha256:" + "1" * 64}
+        ).status_code
+        == 404
+    )
+    store.unavailable = False
+    with app.state.database.session() as session, session.begin():
+        event = session.scalar(select(OutboxRecord).where(OutboxRecord.topic == "artifact.promote"))
+        assert event is not None
+        event.available_at = datetime.now(UTC) - timedelta(seconds=1)
+    assert admission.run_once()
+    assert admission.status(candidate).status == "accepted"
+    detail = client.get(endpoint).json()
+    for variant, digit in (("linux-cpu", "1"), ("win-cpu", "2")):
+        response = client.get(
+            endpoint + f"/locks/{variant}", params={"baseId": "sha256:" + digit * 64}
+        )
+        assert response.status_code == 200
+        assert artifact_digest(response.content) == detail["installLocks"][variant]["digest"]
 
 
 def test_operator_resolves_review_and_publisher_owns_catalog_grants(tmp_path: Path) -> None:

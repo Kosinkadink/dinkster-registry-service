@@ -17,6 +17,7 @@ dependencies = [
   "packaging>=25,<26",
   "psycopg[binary]>=3.2,<4",
   "pydantic>=2.11,<3",
+  "python-multipart>=0.0.22,<1",
   "sqlalchemy>=2.0,<3",
   "uvicorn>=0.35,<1",
 ]

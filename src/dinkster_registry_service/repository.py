@@ -375,6 +375,13 @@ class CatalogRepository:
                         "mediaType": artifact.media_type,
                         "manifestDigest": artifact.manifest_digest,
                     },
+                    "installLocks": {
+                        variant: {
+                            **lock,
+                            "url": f"/v1/packs/{name}/versions/{version}/locks/{variant}",
+                        }
+                        for variant, lock in release.install_locks.items()
+                    },
                     "manifest": release.manifest,
                     "nodes": [
                         {
