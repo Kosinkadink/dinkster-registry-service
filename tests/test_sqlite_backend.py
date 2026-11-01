@@ -28,12 +28,16 @@ from dinkster_registry_service.settings import ServerSettings
 
 
 @contextmanager
-def _sqlite_client(tmp_path: Path) -> Iterator[TestClient]:
+def _sqlite_client(tmp_path: Path, *, legacy_schema: bool = False) -> Iterator[TestClient]:
     database_url = f"sqlite:///{tmp_path / 'registry.db'}"
     object_store = LocalFilesystemObjectStore(tmp_path / "objects")
     database = Database(database_url)
     try:
         seed_fixtures(database, object_store)
+        if legacy_schema:
+            with database.engine.begin() as connection:
+                for table in ("release_candidates", "releases"):
+                    connection.exec_driver_sql(f"ALTER TABLE {table} DROP COLUMN install_locks")
     finally:
         database.dispose()
     app = create_app(
@@ -48,8 +52,9 @@ def _sqlite_client(tmp_path: Path) -> Iterator[TestClient]:
         yield client
 
 
-def test_sqlite_serves_the_hosted_catalog_contract(tmp_path: Path) -> None:
-    with _sqlite_client(tmp_path) as client:
+@pytest.mark.parametrize("legacy_schema", (False, True))
+def test_sqlite_serves_the_hosted_catalog_contract(tmp_path: Path, legacy_schema: bool) -> None:
+    with _sqlite_client(tmp_path, legacy_schema=legacy_schema) as client:
         browse = client.get("/v1/packs")
         assert browse.status_code == 200
         assert [pack["name"] for pack in browse.json()["items"]] == [
@@ -88,6 +93,9 @@ def test_sqlite_serves_the_hosted_catalog_contract(tmp_path: Path) -> None:
             "sha256:" + hashlib.sha256(document.content).hexdigest()
             == templates.json()["templates"][0]["digest"]
         )
+        detail = client.get("/v1/packs/example-pack/versions/1.2.3")
+        assert detail.status_code == 200
+        assert detail.json()["installLocks"] == {}
 
 
 @pytest.mark.parametrize("fault", ("", "lock-digest", "translation-index", "artifact"))

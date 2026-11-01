@@ -76,6 +76,7 @@ def test_accepted_catalog_facts_cannot_be_rewritten_or_erased(
     immutable_operations = (
         update(ArtifactRecord).values(size=1),
         delete(ArtifactRecord),
+        update(ReleaseRecord).values(install_locks={"linux-cpu": {"digest": "rewritten"}}),
         update(ReleaseNodeRecord).values(role="schema-only"),
         delete(ReleaseNodeRecord),
         delete(ReleaseRecord),

@@ -22,6 +22,7 @@ from sqlalchemy import (
     Uuid,
     create_engine,
     event,
+    inspect,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
@@ -195,6 +196,7 @@ class ReleaseRecord(Base):
         String(71), ForeignKey("artifacts.digest", ondelete="RESTRICT")
     )
     manifest: Mapped[dict[str, Any]] = mapped_column(JSON_STORAGE)
+    install_locks: Mapped[dict[str, Any]] = mapped_column(JSON_STORAGE, default=dict)
     next_scan_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
@@ -318,6 +320,7 @@ class ReleaseCandidateRecord(Base):
     declared_digest: Mapped[str] = mapped_column(String(71))
     declared_size: Mapped[int] = mapped_column(BigInteger)
     object_key: Mapped[str] = mapped_column(Text)
+    install_locks: Mapped[dict[str, Any]] = mapped_column(JSON_STORAGE, default=dict)
     status: Mapped[str] = mapped_column(String(16))
     status_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -439,6 +442,15 @@ class Database:
         self.engine = create_database_engine(database_url)
         if self.engine.dialect.name == "sqlite":
             Base.metadata.create_all(self.engine)
+            with self.engine.begin() as connection:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                for table in ("release_candidates", "releases"):
+                    columns = {column["name"] for column in inspect(connection).get_columns(table)}
+                    if "install_locks" not in columns:
+                        connection.exec_driver_sql(
+                            f"ALTER TABLE {table} ADD COLUMN install_locks JSON NOT NULL "
+                            "DEFAULT '{}'"
+                        )
         self._sessions = sessionmaker(self.engine, expire_on_commit=False)
 
     @property

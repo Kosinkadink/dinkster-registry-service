@@ -203,6 +203,14 @@ class CloudEligibility(ResponseModel):
     policy_version: str
 
 
+class InstallationLock(ResponseModel):
+    base_id: str
+    artifact_digest: str
+    digest: str
+    size: int
+    url: str
+
+
 class ReleaseDetail(ResponseModel):
     pack_id: UUID7
     pack_name: str
@@ -221,6 +229,7 @@ class ReleaseDetail(ResponseModel):
     published_at: datetime
     published_by: Publisher
     artifact: ArtifactMetadata
+    install_locks: dict[str, InstallationLock] = Field(default_factory=dict)
     manifest: ReleaseManifest
     nodes: list[ReleaseNode]
     trust_signals: TrustSignals

@@ -47,6 +47,7 @@ from .identifiers import require_canonical_pack_name
 from .ids import uuid7
 from .indexes import StaticIndexes, queue_index_rebuild
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStore, ObjectStoreError
+from .pack_locks import lock_object_key, parse_pack_locks, quarantine_lock_key
 from .seed import MEDIA_TYPE
 from .settings import ServerSettings
 from .versioning import public_version_key, require_public_version
@@ -170,6 +171,7 @@ class AdmissionService:
         publisher: str | None = None,
         declared_digest: str | None = None,
         declared_size: int | None = None,
+        locks: bytes | None = None,
     ) -> UUID:
         require_canonical_pack_name(pack_name)
         require_public_version(version)
@@ -179,11 +181,61 @@ class AdmissionService:
         size = len(archive) if declared_size is None else declared_size
         if not 1 <= size <= MAX_ARTIFACT_SIZE:
             raise AdmissionError(f"declared size must be between 1 and {MAX_ARTIFACT_SIZE} bytes")
+        prepared = (
+            parse_pack_locks(locks, pack=pack_name, digest=digest) if locks is not None else ()
+        )
+        if prepared and (digest != artifact_digest(archive) or size != len(archive)):
+            raise AdmissionError("lock-bearing submission archive identity does not match bytes")
+        install_locks = {
+            lock.variant: {
+                "baseId": lock.base_id,
+                "artifactDigest": digest,
+                "digest": lock.digest,
+                "size": len(lock.data),
+            }
+            for lock in prepared
+        }
         candidate_id = uuid7()
         object_key = quarantine_object_key(candidate_id)
         self.object_store.put(object_key, archive)
         try:
+            for lock in prepared:
+                self.object_store.put(quarantine_lock_key(candidate_id, lock.variant), lock.data)
             with self.database.session() as session, session.begin():
+                if prepared:
+                    if self.database.is_postgresql:
+                        session.execute(
+                            text("SELECT pg_advisory_xact_lock(hashtext(:identity))"),
+                            {"identity": f"{pack_name}:{public_version_key(version)}"},
+                        )
+                    else:
+                        session.execute(text("BEGIN IMMEDIATE"))
+                    previous = session.scalar(
+                        select(ReleaseCandidateRecord)
+                        .where(
+                            ReleaseCandidateRecord.kind == "upload",
+                            ReleaseCandidateRecord.pack_name == pack_name,
+                            ReleaseCandidateRecord.version_key == public_version_key(version),
+                            ReleaseCandidateRecord.publisher_id == publisher,
+                        )
+                        .order_by(ReleaseCandidateRecord.submitted_at)
+                        .limit(1)
+                    )
+                    if previous is not None:
+                        if (
+                            previous.declared_digest != digest
+                            or previous.declared_size != size
+                            or previous.install_locks != install_locks
+                        ):
+                            raise AdmissionError(
+                                "release already has different archive or lock bindings"
+                            )
+                        self.object_store.remove(object_key)
+                        for lock in prepared:
+                            self.object_store.remove(
+                                quarantine_lock_key(candidate_id, lock.variant)
+                            )
+                        return previous.id
                 now = datetime.now(UTC)
                 session.add(
                     ReleaseCandidateRecord(
@@ -197,6 +249,7 @@ class AdmissionService:
                         declared_digest=digest,
                         declared_size=size,
                         object_key=object_key,
+                        install_locks=install_locks,
                         status="queued",
                         status_reason=None,
                         submitted_at=now,
@@ -224,6 +277,8 @@ class AdmissionService:
                 )
         except BaseException:
             self.object_store.remove(object_key)
+            for lock in prepared:
+                self.object_store.remove(quarantine_lock_key(candidate_id, lock.variant))
             raise
         return candidate_id
 
@@ -660,6 +715,7 @@ class AdmissionService:
                     published_by_principal_id=candidate.submitted_by,
                     artifact_digest=candidate.declared_digest,
                     manifest=manifest,
+                    install_locks=candidate.install_locks,
                     next_scan_at=now + RESCAN_INTERVAL,
                 )
                 session.add(release)
@@ -818,6 +874,18 @@ class AdmissionService:
                         expected_digest=candidate.declared_digest,
                     )
                     stored.close()
+                for variant, lock in release.install_locks.items():
+                    source = quarantine_lock_key(candidate_id, variant)
+                    destination = lock_object_key(lock["digest"])
+                    if self.object_store.exists(source):
+                        stored = self.object_store.open(
+                            source, expected_size=lock["size"], expected_digest=lock["digest"]
+                        )
+                        self.object_store.put(destination, b"".join(stored))
+                    stored = self.object_store.open(
+                        destination, expected_size=lock["size"], expected_digest=lock["digest"]
+                    )
+                    stored.close()
             except (AdmissionError, FileNotFoundError, ObjectStoreError) as exc:
                 failure = exc
                 outbox.attempts += 1
@@ -863,6 +931,8 @@ class AdmissionService:
             return True
         self.indexes.deliver_one()
         self.object_store.remove(source_key)
+        for variant in release.install_locks:
+            self.object_store.remove(quarantine_lock_key(candidate_id, variant))
         return True
 
     def _finish_rescan(self, claim: CandidateClaim, *, review: bool) -> None:
