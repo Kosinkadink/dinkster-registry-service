@@ -224,6 +224,58 @@ def test_workflow_rollback_drill_requires_failed_health_and_successful_restorati
         )
 
 
+@pytest.mark.parametrize("kind", ("index", "manifest", "missing", "ambiguous"))
+def test_workflow_deploys_the_unique_runtime_child_and_retains_the_index(
+    tmp_path: Path, kind: str
+) -> None:
+    workflow = (DEPLOY.parents[1] / ".github/workflows/deploy.yml").read_text()
+    script = textwrap.dedent(
+        workflow.split("          python3 - \"$digest\" <<'PY'\n", 1)[1].split("          PY\n", 1)[
+            0
+        ]
+    )
+    child = {"digest": "sha256:" + "c" * 64, "platform": {"os": "linux", "architecture": "amd64"}}
+    manifest = {
+        "manifests": [
+            {"digest": "sha256:" + "d" * 64, "platform": {"os": "unknown"}},
+            {"digest": "sha256:" + "e" * 64, "platform": {"os": "linux", "architecture": "arm64"}},
+        ]
+        + ([child] if kind == "index" else [child, child] if kind == "ambiguous" else [])
+    }
+    docker = tmp_path / "docker"
+    docker.write_text(
+        "#!/usr/bin/env python3\nimport sys\n"
+        + f"assert sys.argv[1:] == ['manifest', 'inspect', {NEW_IMAGE!r}]\n"
+        + f"print({json.dumps({} if kind == 'manifest' else manifest)!r})\n"
+    )
+    docker.chmod(0o700)
+    output = tmp_path / "github-env"
+    result = subprocess.run(
+        [sys.executable, "-c", script, NEW_IMAGE],
+        env={
+            **os.environ,
+            "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+            "GITHUB_ENV": str(output),
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if kind in {"missing", "ambiguous"}:
+        assert result.returncode != 0
+        assert not output.exists()
+        assert "exactly one linux/amd64" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        runtime = (
+            NEW_IMAGE
+            if kind == "manifest"
+            else "registry.fly.io/dinkster-registry@sha256:" + "c" * 64
+        )
+        assert output.read_text() == f"FLY_IMAGE_INDEX={NEW_IMAGE}\nFLY_IMAGE={runtime}\n"
+
+
 @pytest.mark.parametrize("missing", ("", "DINKSTER_CURSOR_SECRET", "S3_SECRET_ACCESS_KEY", "api"))
 def test_workflow_secret_inventory_requires_names_and_never_prints_raw_metadata(
     tmp_path: Path, missing: str

@@ -639,6 +639,8 @@ def run_executable_probe(
             "--index-url",
             configured.probe_package_index_url,
             "--no-sources",
+            "--torch-backend",
+            "cpu",
             *[str(requirement) for requirement in requirements],
         ]
         try:
@@ -652,6 +654,11 @@ def run_executable_probe(
                 (_block("probe.dependencies-unavailable", "Dependency provisioning failed."),)
             )
         if completed.returncode or completed.timed_out or completed.output_limit:
+            operator_details = _probe_operator_details(
+                completed, "dependency-installer", configured.probe_operator_tail_bytes
+            )
+            operator_details["timedOut"] = completed.timed_out
+            operator_details["limitedStream"] = completed.output_limit
             return StageResult(
                 (
                     _block(
@@ -660,6 +667,7 @@ def run_executable_probe(
                         "within the limits.",
                     ),
                 ),
+                operator_details=operator_details,
             )
         # Never run site.addsitedir: dependency .pth files must not run before
         # the trusted harness or gain the ability to replace it at startup.
