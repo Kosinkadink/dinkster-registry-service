@@ -125,6 +125,14 @@ jobs:
           echo "forbidden_paths=none"
       - name: Run command help smoke test
         run: docker run --rm --network none dinkster-registry:test dinkster-registry --help
+      - name: Load bubblewrap AppArmor profile
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap apparmor-profiles
+          if [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] &&
+             [[ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1 ]]; then
+            sudo apparmor_parser -r /usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          fi
       - name: Inspect container namespace capability
         run: |
           docker run --rm --interactive --network none --privileged dinkster-registry:test python - <<'PY'
@@ -179,6 +187,9 @@ jobs:
             dinkster-registry:test \
             bash -ec 'alembic upgrade head; python scripts/check-release-packs.py /tmp/official-packs --download-only; python scripts/check-release-packs.py /tmp/official-packs'
           SH
+      - name: Report AppArmor denials
+        if: failure()
+        run: sudo dmesg | grep 'apparmor="DENIED"' || true
 
   deploy:
     needs: [checks, conformance, container]
