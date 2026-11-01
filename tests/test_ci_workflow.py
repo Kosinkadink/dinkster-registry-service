@@ -26,6 +26,8 @@ def test_every_ci_job_uses_the_cpu_runner_contract_and_timeout() -> None:
     assert "DINKSTER_REPO_TOKEN" not in deployment
     assert "continue-on-error" not in source
     assert "gpu" not in source.lower()
+    assert "python scripts/check-release-packs.py /tmp/official-packs --download-only" in source
+    assert "python scripts/check-release-packs.py /tmp/official-packs'" in source
 
 
 def test_postgres_uses_dynamic_loopback_ports_without_bridge_networks() -> None:
@@ -33,7 +35,7 @@ def test_postgres_uses_dynamic_loopback_ports_without_bridge_networks() -> None:
     postgres = (WORKFLOW.parents[2] / "scripts" / "with-test-postgres.sh").read_text()
 
     assert "\n    services:" not in source
-    assert source.count("bash scripts/with-test-postgres.sh ") == 3
+    assert source.count("bash scripts/with-test-postgres.sh ") == 4
     assert "--network host" in postgres
     assert 's.bind(("127.0.0.1", 0))' in postgres
     assert "-c listen_addresses=127.0.0.1" in postgres

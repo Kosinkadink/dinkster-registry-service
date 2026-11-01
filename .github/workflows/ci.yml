@@ -144,6 +144,14 @@ jobs:
           test "$(docker inspect --format '{{.State.Running}}' "$name")" = true
           docker exec "$name" python conformance/run.py "$DINKSTER_PUBLIC_BASE_URL"
           SH
+      - name: Admit every published official pack and verify release-lock digests
+        run: |
+          bash scripts/with-test-postgres.sh bash -e <<'SH'
+          docker run --rm --privileged --network host \
+            --env DINKSTER_DATABASE_URL \
+            dinkster-registry:test \
+            bash -ec 'alembic upgrade head; python scripts/check-release-packs.py /tmp/official-packs --download-only; python scripts/check-release-packs.py /tmp/official-packs'
+          SH
 
   deploy:
     needs: [checks, conformance, container]
