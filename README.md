@@ -62,11 +62,13 @@ secret prerequisites, migration/runtime credential separation, first deploy,
 health-checked rollback and the required live evidence.
 
 The [immutable-image deploy workflow](.github/workflows/deploy.yml) runs on X570
-after main's CI gates and only when production is enabled. The successful
-landed-commit deployment run and deliberate failed-health rollback receipt are
-not yet available; [issue586](https://github.com/Kosinkadink/comfy-vibe-station/issues/586)
-tracks them. Neither the workflow file nor local simulations claim live
-acceptance. Do not enable a health-only deployment while admission is blocked.
+after main's CI gates and only when production is enabled. The
+[landed deployment run](https://github.com/Kosinkadink/dinkster-registry-service/actions/runs/41271898612)
+for commit `6c08e1a347bc7b1a1150ba8d1ed4d4d49006d879` deployed both Machines
+and verified automatic restoration after a deliberate failed health check.
+[Issue586](https://github.com/Kosinkadink/comfy-vibe-station/issues/586) tracks
+the remaining live publish and public conformance acceptance separately.
+Do not enable a health-only deployment while admission is blocked.
 
 Pull requests and main pushes run checks, HTTP conformance, and container
 validation in GitHub Actions. Each validation job has a 10-minute bound;

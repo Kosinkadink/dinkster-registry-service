@@ -303,6 +303,15 @@ def test_probe_installs_declared_dependencies_and_cleans_environment(
     if version != "1.0":
         assert result.blocked
         assert result.findings[0].code == "probe.dependencies-unresolved"
+        assert result.operator_details is not None
+        assert result.operator_details["returnCode"] != 0
+        assert result.operator_details["timedOut"] is False
+        assert result.operator_details["limitedStream"] is None
+        assert "probe-dependency" in result.operator_details["stderrTail"]
+        assert (
+            len(result.operator_details["stderrTail"]) <= ServerSettings().probe_operator_tail_bytes
+        )
+        assert "probe-dependency" not in result.findings[0].message
     else:
         assert not result.blocked, result
         assert result.data is not None
