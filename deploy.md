@@ -107,7 +107,8 @@ The image runs uid10001, not root. Fly starts `bash scripts/start-service.sh`.
 It detects the upstream full bubblewrap user/PID namespace jail before starting
 the API and scanner; a degraded or unavailable jail fails startup. Both children
 are supervised: either exiting terminates its sibling and fails the Machine.
-The API binds IPv6 port8000; `/healthz` performs an uncached database `SELECT 1`.
+Fly sets `HTTP_HOST=0.0.0.0` for IPv4 proxy and health-check reachability on
+port8000; `/healthz` performs an uncached database `SELECT 1`.
 There is no fixture seeding or migration in runtime startup.
 
 Local Docker's seccomp/AppArmor can deny namespaces even when Fly's guest

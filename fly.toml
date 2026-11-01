@@ -9,6 +9,7 @@ kill_timeout = "30s"
 [env]
   DINKSTER_ENV = "production"
   DINKSTER_PUBLIC_BASE_URL = "https://registry.dinkster.org"
+  HTTP_HOST = "0.0.0.0"
 
 [deploy]
   strategy = "rolling"
