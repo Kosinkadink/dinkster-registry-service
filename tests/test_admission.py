@@ -18,21 +18,21 @@ from typing import Any
 from uuid import UUID
 
 import pytest
-from dinkster_workers.sandbox import ProbeJail
-from fastapi.testclient import TestClient
-from sqlalchemy import func, select
-
-import dinkster_registry_service.admission as admission_module
-from dinkster_registry_service.admission import AdmissionService, quarantine_object_key
-from dinkster_registry_service.admission_checks import (
+from dinkster_registry.archive_admission import (
     StageResult,
     extracted_archive,
     run_doctor_static,
     run_executable_probe,
     run_fast_security,
     run_ingest_integrity,
-    run_manifest_admission,
 )
+from dinkster_workers.sandbox import ProbeJail
+from fastapi.testclient import TestClient
+from sqlalchemy import func, select
+
+import dinkster_registry_service.admission as admission_module
+from dinkster_registry_service.admission import AdmissionService, quarantine_object_key
+from dinkster_registry_service.admission_checks import run_manifest_admission
 from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
 from dinkster_registry_service.database import (
@@ -186,7 +186,7 @@ def test_probe_refuses_degraded_bubblewrap_jail(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(
-        "dinkster_registry_service.admission_checks.detect_probe_jail",
+        "dinkster_registry.archive_admission.detect_probe_jail",
         lambda: ProbeJail(bwrap="/usr/bin/true", user_namespaces=False),
     )
     result = run_executable_probe(_fixture_source(tmp_path), require_isolation=True)
@@ -303,6 +303,15 @@ def test_probe_installs_declared_dependencies_and_cleans_environment(
     if version != "1.0":
         assert result.blocked
         assert result.findings[0].code == "probe.dependencies-unresolved"
+        assert result.operator_details is not None
+        assert result.operator_details["returnCode"] != 0
+        assert result.operator_details["timedOut"] is False
+        assert result.operator_details["limitedStream"] is None
+        assert "probe-dependency" in result.operator_details["stderrTail"]
+        assert (
+            len(result.operator_details["stderrTail"]) <= ServerSettings().probe_operator_tail_bytes
+        )
+        assert "probe-dependency" not in result.findings[0].message
     else:
         assert not result.blocked, result
         assert result.data is not None
@@ -591,6 +600,32 @@ def test_manifest_name_matches_and_submission_owns_version(
             assert release is not None and release.version == submitted_version
     else:
         _assert_rejected(service, candidate_id, "manifest.invalid")
+
+
+@pytest.mark.parametrize("submitted_version", ("1.2.3", "1.2.4"))
+def test_declared_pack_version_matches_submission_and_retains_engine_range(
+    database: Database, tmp_path: Path, submitted_version: str
+) -> None:
+    source = _fixture_source(tmp_path)
+    manifest = source / "dinkster-pack.toml"
+    manifest.write_text(
+        manifest.read_text().replace("[pack]\n", '[pack]\nversion = "1.2.3"\nengine = ">=5,<6"\n')
+    )
+    service = _service(database, tmp_path)
+    candidate_id = service.submit(
+        build_registry_fixture_archive(source),
+        pack_name="example-pack",
+        version=submitted_version,
+    )
+    if submitted_version != "1.2.3":
+        _assert_rejected(service, candidate_id, "manifest.invalid")
+        return
+    assert service.run_once()
+    assert service.status(candidate_id).status == "accepted"
+    with database.session() as session:
+        release = session.scalar(select(ReleaseRecord))
+        assert release is not None and release.version == "1.2.3"
+        assert release.manifest["dinkster"] == ">=5,<6"
 
 
 @pytest.mark.parametrize("publisher", (None, "dinkster"))

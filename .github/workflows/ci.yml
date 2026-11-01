@@ -11,6 +11,13 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+      - uses: superfly/flyctl-actions/setup-flyctl@98172f70657cb3e15db199af139be99bd3e61200
+        with:
+          version: 0.5.1
+      - name: Validate Fly service configuration
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: flyctl config validate --config fly.toml
       - uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: false
@@ -129,7 +136,7 @@ jobs:
             --network host \
             --env DINKSTER_DATABASE_URL \
             --env DINKSTER_PUBLIC_BASE_URL \
-            --env HTTP_HOST=127.0.0.1 \
+            --env HTTP_HOST="$(python3 -c 'import tomllib; print(tomllib.load(open("fly.toml", "rb"))["env"]["HTTP_HOST"])')" \
             --env HTTP_PORT="$http_port" \
             --env DINKSTER_CURSOR_SECRET=container-conformance-secret-at-least-32-bytes \
             dinkster-registry:test \

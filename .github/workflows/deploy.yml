@@ -77,7 +77,28 @@ jobs:
             --tag "$image" .
           docker push "$image"
           digest=$(docker image inspect "$image" --format '{{index .RepoDigests 0}}')
-          printf 'FLY_IMAGE=%s\n' "$digest" >> "$GITHUB_ENV"
+          python3 - "$digest" <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          index = sys.argv[1]
+          manifest = json.loads(subprocess.check_output(
+              ["docker", "manifest", "inspect", index], text=True, timeout=60,
+          ))
+          if "manifests" in manifest:
+              children = [entry["digest"] for entry in manifest["manifests"]
+                          if entry.get("platform", {}).get("os") == "linux"
+                          and entry.get("platform", {}).get("architecture") == "amd64"]
+              if len(children) != 1 or not re.fullmatch(r"sha256:[0-9a-f]{64}", children[0]):
+                  raise SystemExit("Expected exactly one linux/amd64 image in the pushed index")
+              runtime = index.split("@", 1)[0] + "@" + children[0]
+          else:
+              runtime = index
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"FLY_IMAGE_INDEX={index}\nFLY_IMAGE={runtime}\n")
+          PY
       - name: Migrate with short-lived administrator credentials
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
@@ -122,8 +143,8 @@ jobs:
       - name: Record deployment evidence
         if: always()
         run: |
-          printf 'Commit: %s\nImage: %s\nRun: %s/%s/actions/runs/%s\n' \
-            "$GITHUB_SHA" "${FLY_IMAGE:-not-built}" "$GITHUB_SERVER_URL" \
+          printf 'Commit: %s\nImage index: %s\nRuntime image: %s\nRun: %s/%s/actions/runs/%s\n' \
+            "$GITHUB_SHA" "${FLY_IMAGE_INDEX:-not-built}" "${FLY_IMAGE:-not-built}" "$GITHUB_SERVER_URL" \
             "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" >> "$GITHUB_STEP_SUMMARY"
       - name: Remove registry credentials
         if: always()

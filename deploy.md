@@ -7,6 +7,10 @@ nonroot API and lease-based scanner. PostgreSQL holds metadata and durable
 outbox/leases; R2 holds quarantine, immutable artifacts and static JSON indexes.
 No user data depends on a Machine filesystem. Temporary extracted submissions
 and dependency directories are disposable and removed after each scan.
+The executable probe resolves the manifest's CPU requirements using uv's CPU
+PyTorch backend; it does not provision CUDA wheels for this CPU-only scan.
+Provisioning failures retain bounded installer output and timeout status in
+operator-only scan details, never in public findings.
 
 ## Prerequisites and deployment gate
 
@@ -66,7 +70,11 @@ after all three succeed, and production is enabled, the reusable
 [deploy workflow](.github/workflows/deploy.yml) runs. It checks out `github.sha`,
 builds with that revision label on X570, pushes the image to the existing Fly
 registry, and resolves an immutable `registry.fly.io/dinkster-registry@sha256:...`
-digest. No repository credential is supplied to the build. Registry Docker
+linux/amd64 image digest. When the push produces an OCI index, the workflow
+retains its digest for provenance and deploys the unique linux/amd64 child so
+Fly's runtime identity and first-deployment cleanup compare the same image.
+Missing or ambiguous platform children stop deployment.
+No repository credential is supplied to the build. Registry Docker
 credentials use a private per-run directory that is removed afterward.
 
 Before image push, migration or deployment, the workflow reads only
@@ -107,7 +115,8 @@ The image runs uid10001, not root. Fly starts `bash scripts/start-service.sh`.
 It detects the upstream full bubblewrap user/PID namespace jail before starting
 the API and scanner; a degraded or unavailable jail fails startup. Both children
 are supervised: either exiting terminates its sibling and fails the Machine.
-The API binds IPv6 port8000; `/healthz` performs an uncached database `SELECT 1`.
+Fly sets `HTTP_HOST=0.0.0.0` for IPv4 proxy and health-check reachability on
+port8000; `/healthz` performs an uncached database `SELECT 1`.
 There is no fixture seeding or migration in runtime startup.
 
 Local Docker's seccomp/AppArmor can deny namespaces even when Fly's guest
