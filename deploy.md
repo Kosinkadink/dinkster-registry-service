@@ -58,8 +58,8 @@ any command fails. Do not paste values into issues or threads. Do not run
 
 The repository already has `FLY_API_TOKEN` availability handed over by
 foundations. Never create or change Actions secrets or deploy keys. All jobs
-use `fromJSON(vars.CI_RUNNERS).linux` on X570; private hosted Actions are not a
-fallback. `FLY_DEPLOY_ENABLED` is the explicit production enable switch. Keep
+use `fromJSON(vars.CI_RUNNERS).linux`, configured as `["ubuntu-latest"]` for
+hosted Ubuntu. `FLY_DEPLOY_ENABLED` is the explicit production enable switch. Keep
 it disabled until the service and release gate are ready. Do not dispatch,
 rerun or cancel workflows to obtain deployment evidence.
 
@@ -68,7 +68,7 @@ rerun or cancel workflows to obtain deployment evidence.
 Natural pushes to `main` run checks, conformance and container validation. Only
 after all three succeed, and production is enabled, the reusable
 [deploy workflow](.github/workflows/deploy.yml) runs. It checks out `github.sha`,
-builds with that revision label on X570, pushes the image to the existing Fly
+builds with that revision label on hosted Ubuntu, pushes the image to the existing Fly
 registry, and resolves an immutable `registry.fly.io/dinkster-registry@sha256:...`
 linux/amd64 image digest. When the push produces an OCI index, the workflow
 retains its digest for provenance and deploys the unique linux/amd64 child so

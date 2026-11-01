@@ -61,7 +61,7 @@ processes and full probe-isolation preflight. See [deploy.md](deploy.md) for
 secret prerequisites, migration/runtime credential separation, first deploy,
 health-checked rollback and the required live evidence.
 
-The [immutable-image deploy workflow](.github/workflows/deploy.yml) runs on X570
+The [immutable-image deploy workflow](.github/workflows/deploy.yml) runs on hosted Ubuntu
 after main's CI gates and only when production is enabled. The
 [landed deployment run](https://github.com/Kosinkadink/dinkster-registry-service/actions/runs/41271898612)
 for commit `6c08e1a347bc7b1a1150ba8d1ed4d4d49006d879` deployed both Machines
@@ -73,17 +73,17 @@ Do not enable a health-only deployment while admission is blocked.
 Pull requests and main pushes run checks, HTTP conformance, and container
 validation in GitHub Actions. Each validation job has a 10-minute bound;
 the enabled main-only deployment has a separate 30-minute bound. The required
-`CI_RUNNERS` repository variable routes all three CPU-only jobs to the
-repository's one temporary X570 runner:
+`CI_RUNNERS` repository variable routes all three CPU-only jobs and deployment
+to hosted Ubuntu runners:
 
 ```json
-{"linux":["self-hosted","linux","x64"],"windows":["windows-latest"],"macos":["macos-latest"],"forkLinux":["ubuntu-latest"]}
+{"linux":["ubuntu-latest"],"windows":["windows-latest"],"macos":["macos-latest"],"forkLinux":["ubuntu-latest"]}
 ```
 
-The runner has no `gpu` label, and the workflows do not run GPU validation.
+The workflows do not require a self-hosted runner or run GPU validation.
 CI PostgreSQL uses host networking with an ephemeral loopback-only port; image
-probes use no network. This avoids bridge/veth churn on the shared host. The
-persistent runner keeps its uv cache locally without uploading the shared cache.
+probes use no network. Each hosted job has its own Docker daemon and temporary
+workspace; dependency setup does not require a persistent local cache.
 
 ## Self-host with SQLite
 
