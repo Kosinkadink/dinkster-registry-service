@@ -395,6 +395,11 @@ startup. Invalid values stop the process with an error naming the variable.
 credentials or configuration. The scanner image includes uv; host-process
 scanners must also have uv on PATH.
 
+Packs declaring `[pack] node-source = "remote-gateway-catalog"` may publish an
+empty offline node catalog. The validated declaration is retained as
+`manifest.nodeSource`; undeclared empty packs and entry/schema errors still
+reject, and the declaration does not bypass network, ownership or security checks.
+
 ## Development
 
 The package targets Python 3.12 and commits `uv.lock`. The hosted service's

@@ -129,6 +129,50 @@ def test_mandatory_stage_functions_accept_the_registry_fixture(
     assert not security.blocked
 
 
+@pytest.mark.parametrize(
+    ("declared", "entry"),
+    ((False, "empty"), (True, "empty"), (True, "broken"), (True, "invalid-schema")),
+)
+def test_catalog_declaration_accepts_only_a_valid_empty_catalog(
+    database: Database, database_url: str, tmp_path: Path, declared: bool, entry: str
+) -> None:
+    source = _fixture_source(tmp_path)
+    manifest = source / "dinkster-pack.toml"
+    if declared:
+        manifest.write_text(
+            manifest.read_text().replace(
+                "[pack]\n", '[pack]\nnode-source = "remote-gateway-catalog"\n'
+            )
+        )
+    nodes = source / "nodes.py"
+    if entry == "empty":
+        nodes.write_text("PACK_NODES = []\n")
+    elif entry == "broken":
+        nodes.write_text('raise RuntimeError("broken entry")\n')
+    else:
+        nodes.write_text(
+            nodes.read_text().replace('node_type="example-pack.resize"', 'node_type=""')
+        )
+    service = _service(database, tmp_path)
+    candidate_id = service.submit(
+        build_registry_fixture_archive(source), pack_name="example-pack", version="1.2.3"
+    )
+    assert service.run_once()
+    status = service.status(candidate_id)
+    accepted = declared and entry == "empty"
+    assert status.status == ("accepted" if accepted else "rejected")
+    with _client(database_url, tmp_path / "objects") as client:
+        response = client.get("/v1/packs/example-pack/versions/1.2.3")
+        assert response.status_code == (200 if accepted else 404)
+        if accepted:
+            assert response.json()["manifest"]["nodeSource"] == "remote-gateway-catalog"
+            assert response.json()["nodes"] == []
+        else:
+            assert any(finding.effect == "block" for finding in status.findings)
+            if not declared:
+                assert any(finding.code == "probe.no-schemas" for finding in status.findings)
+
+
 def test_isolated_probe_refuses_to_degrade_on_macos(tmp_path: Path) -> None:
     if sys.platform == "linux":
         pytest.skip("the container smoke test covers Linux isolation")

@@ -135,6 +135,7 @@ class ReleaseManifest(ResponseModel):
     sandbox: Sandbox
     python_requirements: list[str]
     dependencies: list[ReleaseDependency]
+    node_source: Literal["remote-gateway-catalog"] | None = None
 
 
 class ReleaseNode(ResponseModel):

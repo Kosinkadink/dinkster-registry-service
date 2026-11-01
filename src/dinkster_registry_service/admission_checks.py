@@ -229,6 +229,7 @@ def _manifest_payload(manifest: PackManifest, release: dict[str, object]) -> dic
             "writableMounts": manifest.sandbox.writable_mounts,
         },
         "pythonRequirements": list(manifest.requires),
+        "nodeSource": manifest.node_source,
         "dependencies": [
             {"packName": dependency.pack, "versionRange": dependency.version}
             for dependency in manifest.dependencies
@@ -833,7 +834,11 @@ def _run_executable_probe(
     )
     if observed_gpu and not manifest.sandbox.gpu:
         findings.append(_review("probe.undeclared-gpu", "Import initialized an undeclared GPU."))
-    if not schemas and not any(finding.effect == "block" for finding in findings):
+    if (
+        not schemas
+        and manifest.node_source != "remote-gateway-catalog"
+        and not any(finding.effect == "block" for finding in findings)
+    ):
         findings.append(_block("probe.no-schemas", "Pack probe returned no node schemas."))
     return StageResult(tuple(findings), {"schemas": schemas}, operator_details)
 
