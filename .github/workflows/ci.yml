@@ -125,6 +125,24 @@ jobs:
           echo "forbidden_paths=none"
       - name: Run command help smoke test
         run: docker run --rm --network none dinkster-registry:test dinkster-registry --help
+      - name: Inspect container namespace capability
+        run: |
+          docker run --rm --interactive --network none --privileged dinkster-registry:test python - <<'PY'
+          import dataclasses
+          import subprocess
+          from pathlib import Path
+          from dinkster_workers.sandbox import detect_bubblewrap
+
+          print(dataclasses.asdict(detect_bubblewrap()), flush=True)
+          for name in ("user/max_user_namespaces", "kernel/unprivileged_userns_clone", "kernel/apparmor_restrict_unprivileged_userns"):
+              path = Path("/proc/sys") / name
+              print(f"{name}={path.read_text().strip() if path.exists() else 'absent'}", flush=True)
+          result = subprocess.run(
+              ["bwrap", "--unshare-user", "--unshare-pid", "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "/usr/bin/true"],
+              capture_output=True, text=True, timeout=10,
+          )
+          print(f"namespace_probe_exit={result.returncode} stderr={result.stderr.strip()}")
+          PY
       - name: Run isolated executable probe
         run: docker run --rm --network none --privileged dinkster-registry:test python scripts/check-isolated-probe.py
       - name: Run container conformance suite
