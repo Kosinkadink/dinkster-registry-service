@@ -441,6 +441,8 @@ def _probe_environment() -> dict[str, str]:
         ),
         "LANG": "C.UTF-8",
         "PYTHONNOUSERSITE": "1",
+        "UV_CONCURRENT_DOWNLOADS": "1",
+        "UV_CONCURRENT_INSTALLS": "1",
     }
 
 
