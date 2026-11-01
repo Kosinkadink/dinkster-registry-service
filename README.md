@@ -133,8 +133,15 @@ are rootless, uncompressed ZIP files with sorted paths, ZIP epoch timestamps,
 
 Submission, status, and re-scan commands connect directly to the database and
 object store. HTTP publishing and review routes require bearer authentication;
-there is no unauthenticated publishing path. The scanner runs these mandatory
-checks in order:
+there is no unauthenticated publishing path.
+
+Archive checks come from the pinned public `dinkster_registry.archive_admission`
+library, also used by engine CI. The service retains catalog ownership, grants,
+version collisions, active dependency checks, quarantine, leases, promotion and
+index publication. Its validated probe settings use the public `ProbeSettings`
+contract; no private source checkout or repository token is needed by engine CI.
+
+The scanner runs these mandatory checks in order:
 
 1. `ingest_integrity`: verifies size, BLAKE3, ZIP structure and CRCs, safe
    paths, regular files, limits, stored compression, and deterministic bytes.
@@ -159,9 +166,13 @@ checks in order:
    inventories native, executable, bytecode-only, and obfuscated content.
 
 The submission URL or CLI version is the release version; `[pack.release]` is
-not required or read. Optional `dinkster`, `license`, and `repository` metadata
-comes from `[pack]`. Missing version ranges and licenses are reported as empty
-strings, not invented compatibility or license claims. Dinkster's host/API
+not required or read. Optional paired `[pack] version` and `engine` declarations
+use the public compatibility schema; a declared version must match submission,
+and the engine range is retained in catalog metadata, not matched against the
+registry server's engine. Legacy packs without the pair remain accepted without
+inventing a compatible engine range. Optional `dinkster`, `license`, and `repository`
+metadata comes from `[pack]`. Missing version ranges and licenses are reported as
+empty strings, not invented compatibility or license claims. Dinkster's host/API
 contracts remain mandatory. Reserved namespaces require the registry-local
 `dinkster` publisher, not merely a publisher string in the submitted manifest.
 Exact node-ID claims retain their spelling using Dinkster's shared grammar.

@@ -9,12 +9,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID
 
-from dinkster_schema import canonical_claim, canonical_name, claims_conflict
-from packaging.version import Version
-from sqlalchemy import and_, or_, select, text
-from sqlalchemy.orm import Session
-
-from .admission_checks import (
+from dinkster_registry.archive_admission import (
     SCAN_POLICY_VERSION,
     AdmissionFinding,
     StageResult,
@@ -23,8 +18,13 @@ from .admission_checks import (
     run_executable_probe,
     run_fast_security,
     run_ingest_integrity,
-    run_manifest_admission,
 )
+from dinkster_schema import canonical_claim, canonical_name, claims_conflict
+from packaging.version import Version
+from sqlalchemy import and_, or_, select, text
+from sqlalchemy.orm import Session
+
+from .admission_checks import run_manifest_admission
 from .artifacts import MANIFEST_NAME
 from .database import (
     ArtifactRecord,

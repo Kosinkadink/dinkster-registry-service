@@ -11,9 +11,9 @@ from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from dinkster_registry.archive_admission import run_executable_probe
 from dinkster_schema import SCHEMA_WIRE_VERSION, schema_from_wire, schema_signature
 
-from dinkster_registry_service.admission_checks import run_executable_probe
 from dinkster_registry_service.seed import FIXTURE_ROOT
 from dinkster_registry_service.settings import ServerSettings
 
