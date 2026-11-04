@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tomllib
@@ -16,8 +17,23 @@ from dinkster_registry_service.digests import artifact_digest
 from dinkster_registry_service.identifiers import require_canonical_pack_name
 from dinkster_registry_service.versioning import require_public_version
 
-RELEASE_TAG = "main-ba24f1e0029af6fcf0565706f72a1fe2d44a5d10"
-RELEASE_URL = f"https://github.com/Kosinkadink/Dinkster/releases/download/{RELEASE_TAG}"
+PIN_URL = (
+    "https://api.github.com/repos/Kosinkadink/Dinkster-Environments/"
+    "contents/consumer-pins.json?ref=main"
+)
+
+
+def release_pin(document: dict) -> dict:
+    if document["format"] != "dinkster.consumer-pins/1":
+        raise ValueError("Unsupported consumer pin format")
+    pin = document["consumers"]["dinkster-registry"]
+    if (
+        pin["repository"] != "Kosinkadink/Dinkster"
+        or not re.fullmatch(r"(?:main-|v)[A-Za-z0-9._+-]+", pin["releaseTag"])
+        or not re.fullmatch(r"[0-9a-f]{40}", pin["commit"])
+    ):
+        raise ValueError("Invalid official-packs release pin")
+    return pin
 
 
 def cli(*arguments: str) -> str:
@@ -32,9 +48,21 @@ def main() -> None:
     parser.add_argument("--download-only", action="store_true")
     args = parser.parse_args()
     directory = args.directory
+    selection = directory / "consumer-pins.json"
     if args.download_only:
+        request = urllib.request.Request(
+            PIN_URL, headers={"Accept": "application/vnd.github.raw+json"}
+        )
+        with urllib.request.urlopen(request, timeout=60) as response:
+            document = response.read()
+        pin = release_pin(json.loads(document))
         directory.mkdir(parents=True, exist_ok=True)
-        with urllib.request.urlopen(f"{RELEASE_URL}/official-packs.lock", timeout=60) as response:
+        selection.write_bytes(document)
+    else:
+        pin = release_pin(json.loads(selection.read_bytes()))
+    release_url = "https://github.com/Kosinkadink/Dinkster/releases/download/" + pin["releaseTag"]
+    if args.download_only:
+        with urllib.request.urlopen(f"{release_url}/official-packs.lock", timeout=60) as response:
             (directory / "official-packs.lock").write_bytes(response.read())
     lock = json.loads((directory / "official-packs.lock").read_bytes())
     assert lock["format"] == "dinkster.lock/1"
@@ -46,10 +74,10 @@ def main() -> None:
         name = require_canonical_pack_name(pack["pack"])
         version = require_public_version(pack["version"])
         assert pack["publisher"] == "dinkster"
-        assert pack["source"] == f"git:Kosinkadink/Dinkster@{RELEASE_TAG.removeprefix('main-')}"
+        assert pack["source"] == f"git:Kosinkadink/Dinkster@{pin['commit']}"
         archive = directory / f"{name}-{version}.zip"
         if args.download_only:
-            with urllib.request.urlopen(f"{RELEASE_URL}/{archive.name}", timeout=60) as response:
+            with urllib.request.urlopen(f"{release_url}/{archive.name}", timeout=60) as response:
                 archive.write_bytes(response.read())
         assert artifact_digest(archive.read_bytes()) == pack["artifactDigest"], name
         with zipfile.ZipFile(archive) as source:
