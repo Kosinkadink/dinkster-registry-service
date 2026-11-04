@@ -1,4 +1,4 @@
-"""Admit the exact official ZIPs from a pinned Dinkster release."""
+"""Admit pinned official ZIPs from the independently published pack registry."""
 
 from __future__ import annotations
 
@@ -16,8 +16,7 @@ from dinkster_registry_service.digests import artifact_digest
 from dinkster_registry_service.identifiers import require_canonical_pack_name
 from dinkster_registry_service.versioning import require_public_version
 
-RELEASE_TAG = "main-ba24f1e0029af6fcf0565706f72a1fe2d44a5d10"
-RELEASE_URL = f"https://github.com/Kosinkadink/Dinkster/releases/download/{RELEASE_TAG}"
+REGISTRY_URL = "https://registry.dinkster.org"
 
 
 def cli(*arguments: str) -> str:
@@ -34,9 +33,7 @@ def main() -> None:
     directory = args.directory
     if args.download_only:
         directory.mkdir(parents=True, exist_ok=True)
-        with urllib.request.urlopen(f"{RELEASE_URL}/official-packs.lock", timeout=60) as response:
-            (directory / "official-packs.lock").write_bytes(response.read())
-    lock = json.loads((directory / "official-packs.lock").read_bytes())
+    lock = json.loads(Path(__file__).with_name("release-packs.lock").read_bytes())
     assert lock["format"] == "dinkster.lock/1"
     packs = lock["packs"]
     assert len(packs) == 14
@@ -46,14 +43,32 @@ def main() -> None:
         name = require_canonical_pack_name(pack["pack"])
         version = require_public_version(pack["version"])
         assert pack["publisher"] == "dinkster"
-        assert pack["source"] == f"git:Kosinkadink/Dinkster@{RELEASE_TAG.removeprefix('main-')}"
+        assert pack["source"] == f"registry:{REGISTRY_URL}"
         archive = directory / f"{name}-{version}.zip"
         if args.download_only:
-            with urllib.request.urlopen(f"{RELEASE_URL}/{archive.name}", timeout=60) as response:
-                archive.write_bytes(response.read())
+            with urllib.request.urlopen(f"{REGISTRY_URL}/v1/packs/{name}", timeout=60) as response:
+                owner = json.load(response)
+            assert owner["name"] == name and owner["owner"]["slug"] == pack["publisher"], name
+            with urllib.request.urlopen(
+                f"{REGISTRY_URL}/v1/packs/{name}/versions/{version}", timeout=60
+            ) as response:
+                release = json.load(response)
+            assert release["packName"] == name and release["version"] == version, name
+            assert release["state"] == "active", name
+            assert release["artifact"]["digest"] == pack["artifactDigest"], name
+            with urllib.request.urlopen(
+                f"{REGISTRY_URL}/v1/artifacts/{pack['artifactDigest']}", timeout=60
+            ) as response:
+                data = response.read()
+            assert len(data) == release["artifact"]["size"], name
+            archive.write_bytes(data)
         assert artifact_digest(archive.read_bytes()) == pack["artifactDigest"], name
         with zipfile.ZipFile(archive) as source:
             manifest = tomllib.loads(source.read("dinkster-pack.toml").decode())
+        assert manifest["pack"]["name"] == name, name
+        if "version" in manifest["pack"]:
+            assert manifest["pack"]["version"] == version, name
+        assert manifest["pack"]["publisher"] == pack["publisher"], name
         dependencies = set(manifest["pack"].get("dependencies", {}))
         pending[name] = (pack, archive, dependencies)
         print(f"verified {name} {version} {pack['artifactDigest']}", flush=True)
