@@ -487,3 +487,13 @@ uv build --all-packages
 CI runs these checks against PostgreSQL 16, starts the HTTP conformance runner,
 builds the container without dependency credentials, inspects image contents,
 runs the isolated probe under bubblewrap, and runs conformance against the image.
+
+The container also downloads and admits all 14 official packs pinned by
+`scripts/release-packs.lock`. This fixture names independently published registry
+versions and BLAKE3 digests, not ephemeral engine releases. The download check
+verifies public publisher ownership, release identity, size, archive digest and
+manifest identity before the full isolated admission check. Legacy manifests may
+omit a version; declared versions must match, as in ordinary admission. Fixture
+updates select published versions explicitly and commit their immutable digests;
+CI never follows latest versions. Engine release retention cannot delete these
+registry-owned artifacts, and no engine release asset publication is required.

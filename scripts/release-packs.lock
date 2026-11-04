@@ -1,0 +1,103 @@
+{
+  "format": "dinkster.lock/1",
+  "packs": [
+    {
+      "pack": "dinkster-nodes-comfy",
+      "version": "0.0.13",
+      "publisher": "dinkster",
+      "source": "registry:https://registry.dinkster.org",
+      "artifactDigest": "blake3:841f02fa18c1cb23c44f3f171b23bbe6cc16ee7d6440f8da18510724936fd159"
+    },
+    {
+      "pack": "dinkster-nodes-foundation",
+      "version": "0.0.3.dev1793496999",
+      "publisher": "dinkster",
+      "source": "registry:https://registry.dinkster.org",
+      "artifactDigest": "blake3:1ad0cbd2feedae8c1bf05d81d4b2bd7036d7a4b2af1c4a7a6be075171104d4e0"
+    },
+    {
+      "pack": "dinkster-nodes-image",
+      "version": "0.0.4",
+      "publisher": "dinkster",
+      "source": "registry:https://registry.dinkster.org",
+      "artifactDigest": "blake3:67cc455f6d8f5ecbc098ff553fbb3bddf0e5fc4b5dbbb021874294b21e3d7547"
+    },
+    {
+      "pack": "dinkster-nodes-media-io",
+      "version": "0.0.3.dev1793496999",
+      "publisher": "dinkster",
+      "source": "registry:https://registry.dinkster.org",
+      "artifactDigest": "blake3:ffd30121c5bc4399008990b230f800620a2c5d678470092e37ec63c9cad554f8"
+    },
+    {
+      "pack": "dinkster-nodes-remote",
+      "version": "0.0.3.dev1793496999",
+      "publisher": "dinkster",
+      "source": "registry:https://registry.dinkster.org",
+      "artifactDigest": "blake3:612bc9744773e0387a3b869e1dc65f21a545803b638806cf412eb830b5c0394c"
+    },
+    {
+      "pack": "dinkster-vision-birefnet",
+      "version": "0.0.3",
+      "publisher": "dinkster",
+      "source": "registry:https://registry.dinkster.org",
+      "artifactDigest": "blake3:921320363e6f14e9075e469eedb8491365835a9b1c23a4a925e1a7bf82207cf5"
+    },
+    {
+      "pack": "dinkster-vision-depth-anything-v2",
+      "version": "0.0.3.dev1793496999",
+      "publisher": "dinkster",
+      "source": "registry:https://registry.dinkster.org",
+      "artifactDigest": "blake3:2cde56a37c5434e8d9e09f6835136146e804d85736ab432751798fd8ff379712"
+    },
+    {
+      "pack": "dinkster-vision-depth-anything-v3",
+      "version": "0.0.3",
+      "publisher": "dinkster",
+      "source": "registry:https://registry.dinkster.org",
+      "artifactDigest": "blake3:9af3a2ec0b82634beb17e7626cbf5abfb691aadbfb790d039dbefa9d0384c848"
+    },
+    {
+      "pack": "dinkster-vision-detr",
+      "version": "0.0.3.dev1793496999",
+      "publisher": "dinkster",
+      "source": "registry:https://registry.dinkster.org",
+      "artifactDigest": "blake3:85852b2e72191788e8ff4e746e1efcca8df32228c03aac15590710c630c06880"
+    },
+    {
+      "pack": "dinkster-vision-efficient-sam",
+      "version": "0.0.3.dev1793496999",
+      "publisher": "dinkster",
+      "source": "registry:https://registry.dinkster.org",
+      "artifactDigest": "blake3:0222cbb6a5d2734f22872f8d441b8e080c777a291829c275dc683a79a6f7930a"
+    },
+    {
+      "pack": "dinkster-vision-hed",
+      "version": "0.0.3.dev1793496999",
+      "publisher": "dinkster",
+      "source": "registry:https://registry.dinkster.org",
+      "artifactDigest": "blake3:189f1e12c17fd137290d2c061e78bd82b0680d95e14b547553a5f0a166613efd"
+    },
+    {
+      "pack": "dinkster-vision-rtdetr",
+      "version": "0.0.3.dev1793496999",
+      "publisher": "dinkster",
+      "source": "registry:https://registry.dinkster.org",
+      "artifactDigest": "blake3:8f98526afd6a32d60fbc270aeab90edb1f613486edbc459ee185747f49f00278"
+    },
+    {
+      "pack": "dinkster-vision-sam31",
+      "version": "0.0.3.dev1793496999",
+      "publisher": "dinkster",
+      "source": "registry:https://registry.dinkster.org",
+      "artifactDigest": "blake3:f9c954009ec033aeb92dd4e496f9cd6da0680b0eafe07c6961b2df9e9c458c0c"
+    },
+    {
+      "pack": "dinkster-vision-upscale",
+      "version": "0.0.3.dev1793496999",
+      "publisher": "dinkster",
+      "source": "registry:https://registry.dinkster.org",
+      "artifactDigest": "blake3:bfbab62c2c64f48908221a85ff5b46b034fb5f273a1f610ddade14a549d09baf"
+    }
+  ]
+}
