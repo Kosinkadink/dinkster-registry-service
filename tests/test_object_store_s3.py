@@ -4,6 +4,7 @@ import hashlib
 import os
 import shutil
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -22,6 +23,7 @@ from dinkster_registry_service.object_store import (
     ObjectStoreError,
     S3ObjectStore,
 )
+from dinkster_registry_service.principals import PrincipalRepository
 from dinkster_registry_service.seed import FIXTURE_ROOT, seed_fixtures
 from dinkster_registry_service.settings import ServerSettings
 
@@ -145,12 +147,14 @@ def test_production_api_downloads_from_s3_without_local_artifacts(
     assert not local_root.exists()
 
 
+@pytest.mark.parametrize("publisher", (None, "dinkster"))
 def test_accepted_publish_updates_both_s3_indexes_with_conditional_get(
     database: Database,
     database_url: str,
     s3_store: S3ObjectStore,
     s3_endpoint_url: str,
     tmp_path: Path,
+    publisher: str | None,
 ) -> None:
     source = tmp_path / "pack"
     shutil.copytree(FIXTURE_ROOT / "example-pack", source)
@@ -169,12 +173,51 @@ def test_accepted_publish_updates_both_s3_indexes_with_conditional_get(
         s3_secret_access_key=TEST_S3_SECRET_ACCESS_KEY,
         s3_region=TEST_S3_REGION,
     )
+    if publisher is not None:
+        principals = PrincipalRepository(database)
+        principals.register_user("operator")
+        principals.register_publisher(publisher, "operator", datetime.now(UTC).isoformat())
     service = AdmissionService(database, s3_store, settings=settings, require_isolation=False)
     with TestClient(create_app(settings)) as client:
         assert client.get("/packs/index.json").status_code == 404
-        candidate = service.submit(archive, pack_name="example-pack", version="1.2.3")
+        candidate = service.submit(
+            archive, pack_name="example-pack", version="1.2.3", publisher=publisher
+        )
         assert service.run_once()
         assert service.status(candidate).status == "accepted"
+        schema_key = "packs/example-pack/1.2.3/schemas.json"
+        schemas = client.get(f"/{schema_key}")
+        assert schemas.status_code == 200
+        assert schemas.content == s3_store.read(schema_key)
+        assert (
+            schemas.content == client.get("/v1/packs/example-pack/versions/1.2.3/schemas").content
+        )
+        assert client.head(f"/{schema_key}").headers["etag"] == schemas.headers["etag"]
+        assert (
+            client.get(
+                f"/{schema_key}", headers={"If-None-Match": schemas.headers["etag"]}
+            ).status_code
+            == 304
+        )
+        metadata = s3_store._client.head_object(Bucket=s3_store.bucket, Key=schema_key)
+        assert metadata["ContentType"] == "application/json"
+        assert metadata["CacheControl"] == "public, max-age=60"
+        discovery = client.get("/schemas/index.json")
+        assert discovery.status_code == 200
+        if publisher is None:
+            assert discovery.json() == {"schemaVersion": 1, "items": []}
+        else:
+            assert discovery.json()["items"] == [
+                {
+                    "name": "example-pack",
+                    "publisher": "dinkster",
+                    "version": "1.2.3",
+                    "displayName": "Example Pack",
+                    "platforms": ["darwin", "linux"],
+                    "url": schema_key,
+                    "digest": "sha256:" + hashlib.sha256(schemas.content).hexdigest(),
+                }
+            ]
         etags = {}
         for key in ("packs/index.json", "locales/index.json"):
             response = client.get(f"/{key}")
@@ -204,11 +247,21 @@ def test_accepted_publish_updates_both_s3_indexes_with_conditional_get(
         old_key = "translations/index.json"
         s3_store.put(old_key, s3_store.read("locales/index.json"))
         assert client.get(f"/{old_key}").status_code == 404
-        second = service.submit(archive, pack_name="example-pack", version="1.2.4")
+        second = service.submit(
+            archive, pack_name="example-pack", version="1.2.4", publisher=publisher
+        )
         assert service.run_once()
         assert service.status(second).status == "accepted"
         for key, etag in etags.items():
             response = client.get(f"/{key}", headers={"If-None-Match": etag})
             assert response.status_code == 200
             assert [item["version"] for item in response.json()["items"]] == ["1.2.3", "1.2.4"]
+        refreshed = client.get(
+            "/schemas/index.json", headers={"If-None-Match": discovery.headers["etag"]}
+        )
+        if publisher is None:
+            assert refreshed.status_code == 304
+        else:
+            assert refreshed.status_code == 200
+            assert [item["version"] for item in refreshed.json()["items"]] == ["1.2.4"]
     assert not settings.object_store_root.exists()

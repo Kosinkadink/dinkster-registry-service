@@ -1,16 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
+from packaging.version import Version
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from .database import ArtifactRecord, Database, OutboxRecord, PackRecord, ReleaseRecord
 from .ids import uuid7
 from .object_store import ObjectStore, ObjectStoreError
+from .repository import CatalogRepository
 
 
 def queue_index_rebuild(session: Session) -> None:
@@ -55,12 +58,36 @@ class StaticIndexes:
             select(PackRecord, ReleaseRecord, ArtifactRecord)
             .join(ReleaseRecord, ReleaseRecord.pack_id == PackRecord.id)
             .join(ArtifactRecord, ArtifactRecord.digest == ReleaseRecord.artifact_digest)
-            .where(PackRecord.visibility == "public", ReleaseRecord.state == "active")
             .order_by(PackRecord.name, ReleaseRecord.version)
         ).all()
         packs = []
         locales = []
+        schemas: dict[str, dict[str, object]] = {}
         for pack, release, artifact in rows:
+            schema_key = f"packs/{pack.name}/{release.version}/schemas.json"
+            if pack.visibility != "public" or release.state not in {"active", "yanked"}:
+                self.object_store.remove(schema_key)
+                continue
+            body = (
+                CatalogRepository.schema_response(session, pack, release)
+                .model_dump_json(by_alias=True)
+                .encode("utf-8")
+            )
+            self.object_store.put(schema_key, body)
+            if release.state != "active":
+                continue
+            if pack.publisher_id == "dinkster":
+                previous = schemas.get(pack.name)
+                if previous is None or Version(release.version) > Version(str(previous["version"])):
+                    schemas[pack.name] = {
+                        "name": pack.name,
+                        "publisher": pack.publisher_id,
+                        "version": release.version,
+                        "displayName": pack.display_name,
+                        "platforms": release.manifest["platforms"],
+                        "url": schema_key,
+                        "digest": "sha256:" + hashlib.sha256(body).hexdigest(),
+                    }
             entry = {
                 "name": pack.name,
                 "version": release.version,
@@ -70,7 +97,11 @@ class StaticIndexes:
             }
             packs.append(entry)
             locales.append({**entry, "catalogs": release.manifest.get("localeCatalogs", [])})
-        for key, items in (("packs/index.json", packs), ("locales/index.json", locales)):
+        for key, items in (
+            ("packs/index.json", packs),
+            ("locales/index.json", locales),
+            ("schemas/index.json", list(schemas.values())),
+        ):
             data = json.dumps(
                 {"schemaVersion": 1, "items": items},
                 ensure_ascii=True,

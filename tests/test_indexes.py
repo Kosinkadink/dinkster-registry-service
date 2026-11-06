@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import threading
@@ -9,13 +10,136 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import select, text
 
 from dinkster_registry_service.cli import main
-from dinkster_registry_service.database import Database, OutboxRecord, PackRecord, ReleaseRecord
+from dinkster_registry_service.database import (
+    Database,
+    OutboxRecord,
+    PackRecord,
+    PublisherRecord,
+    ReleaseNodeRecord,
+    ReleaseRecord,
+)
+from dinkster_registry_service.ids import uuid7
 from dinkster_registry_service.indexes import StaticIndexes, queue_index_rebuild
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore, ObjectStoreError
 from dinkster_registry_service.seed import seed_fixtures
+
+
+def test_static_schemas_match_dynamic_routes_and_select_current_first_party_release(
+    seeded_catalog: tuple[Database, LocalFilesystemObjectStore], client: TestClient
+) -> None:
+    database, store = seeded_catalog
+    assert client.get("/schemas/index.json").status_code == 404
+    with database.session() as session, session.begin():
+        session.add(PublisherRecord(id="dinkster", display_name="Dinkster"))
+        session.flush()
+        pack = session.scalar(select(PackRecord).where(PackRecord.name == "example-pack"))
+        assert pack is not None
+        pack.publisher_id = "dinkster"
+        original = session.scalar(select(ReleaseRecord).where(ReleaseRecord.pack_id == pack.id))
+        assert original is not None
+        nodes = list(
+            session.scalars(
+                select(ReleaseNodeRecord).where(ReleaseNodeRecord.release_id == original.id)
+            )
+        )
+        for version, state in (("1.10.0", "active"), ("1.9.0", "active"), ("2.0.0", "yanked")):
+            release = ReleaseRecord(
+                **{
+                    column.name: getattr(original, column.name)
+                    for column in ReleaseRecord.__table__.columns
+                    if column.name not in {"id", "version", "version_key", "state"}
+                },
+                id=uuid7(),
+                version=version,
+                version_key=version,
+                state=state,
+            )
+            session.add(release)
+            session.flush()
+            for node in nodes:
+                session.add(
+                    ReleaseNodeRecord(
+                        **{
+                            column.name: getattr(node, column.name)
+                            for column in ReleaseNodeRecord.__table__.columns
+                            if column.name != "release_id"
+                        },
+                        release_id=release.id,
+                    )
+                )
+    indexes = StaticIndexes(database, store, "http://testserver")
+    assert indexes.rebuild() == 4
+    response = client.get("/schemas/index.json", headers={"Origin": "https://editor.example"})
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "*"
+    assert response.headers["access-control-expose-headers"] == "ETag"
+    schema_body = store.read("packs/example-pack/1.10.0/schemas.json")
+    assert response.json() == {
+        "schemaVersion": 1,
+        "items": [
+            {
+                "name": "example-pack",
+                "publisher": "dinkster",
+                "version": "1.10.0",
+                "displayName": "Example Pack",
+                "platforms": ["linux-x86_64", "macos-arm64"],
+                "url": "packs/example-pack/1.10.0/schemas.json",
+                "digest": "sha256:" + hashlib.sha256(schema_body).hexdigest(),
+            }
+        ],
+    }
+    for version in ("1.2.3", "1.9.0", "1.10.0", "2.0.0"):
+        path = f"/packs/example-pack/{version}/schemas.json"
+        static = client.get(path)
+        dynamic = client.get(f"/v1/packs/example-pack/versions/{version}/schemas")
+        assert static.status_code == dynamic.status_code == 200
+        assert static.content == dynamic.content == store.read(path.lstrip("/"))
+        assert static.json()["schemas"][0]["schema"]["displayName"] == "Example Resize"
+    # Third-party schemas are mirrored, but are not first-party search entries.
+    third_party = client.get("/packs/color-tools/0.4.0/schemas.json")
+    assert third_party.content == client.get("/v1/packs/color-tools/versions/0.4.0/schemas").content
+    for path in ("/schemas/index.json", "/packs/example-pack/1.10.0/schemas.json"):
+        static = client.get(path)
+        head = client.head(path)
+        assert head.status_code == 200 and head.content == b""
+        assert head.headers["content-length"] == str(len(static.content))
+        assert head.headers["etag"] == static.headers["etag"]
+        cached = client.get(path, headers={"If-None-Match": static.headers["etag"]})
+        assert cached.status_code == 304 and cached.content == b""
+        assert cached.headers["access-control-allow-origin"] == "*"
+        preflight = client.options(
+            path,
+            headers={
+                "Origin": "https://editor.example",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "If-None-Match",
+            },
+        )
+        assert preflight.status_code == 204
+        assert preflight.headers["access-control-allow-headers"] == "If-None-Match"
+    before = response.content
+    indexes.rebuild()
+    assert client.get("/schemas/index.json").content == before
+    with database.session() as session, session.begin():
+        current = session.scalar(select(ReleaseRecord).where(ReleaseRecord.version == "1.10.0"))
+        assert current is not None
+        current.state = "quarantined"
+    indexes.rebuild()
+    assert client.get("/schemas/index.json").json()["items"][0]["version"] == "1.9.0"
+    assert client.get("/packs/example-pack/1.10.0/schemas.json").status_code == 404
+    assert not store.exists("packs/example-pack/1.10.0/schemas.json")
+    with database.session() as session, session.begin():
+        for release in session.scalars(
+            select(ReleaseRecord).where(ReleaseRecord.state == "active")
+        ):
+            release.state = "quarantined"
+    indexes.rebuild()
+    assert client.get("/schemas/index.json").json()["items"] == []
+    assert client.get("/packs/example-pack/2.0.0/schemas.json").status_code == 200
 
 
 def test_index_retry_repairs_partial_publication(database: Database, tmp_path: Path) -> None:
