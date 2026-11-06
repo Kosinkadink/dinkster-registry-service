@@ -12,7 +12,7 @@ from botocore.exceptions import BotoCoreError, ClientError  # type: ignore[impor
 
 MAX_ARTIFACT_SIZE = 64 * 1024 * 1024
 READ_CHUNK_SIZE = 64 * 1024
-INDEX_KEYS = frozenset({"packs/index.json", "locales/index.json"})
+INDEX_KEYS = frozenset({"packs/index.json", "locales/index.json", "schemas/index.json"})
 
 
 class ObjectStoreError(RuntimeError):
@@ -169,7 +169,16 @@ class S3ObjectStore:
         if not 1 <= len(data) <= MAX_ARTIFACT_SIZE:
             raise ObjectStoreError(f"object size must be between 1 and {MAX_ARTIFACT_SIZE} bytes")
         try:
-            self._client.put_object(Bucket=self.bucket, Key=key, Body=data, IfNoneMatch="*")
+            self._client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=data,
+                IfNoneMatch="*",
+                ContentType="application/json"
+                if key.endswith(".json")
+                else "application/octet-stream",
+                **({"CacheControl": "public, max-age=60"} if key.endswith("/schemas.json") else {}),
+            )
         except ClientError as error:
             if not self._is_precondition_failure(error):
                 self._raise_storage_error(error)

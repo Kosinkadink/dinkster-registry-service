@@ -406,23 +406,29 @@ class CatalogRepository:
             release = self._release(session, pack.id, version)
             if release is None or release.state not in {"active", "yanked"}:
                 return None
-            return SchemasResponse.model_validate(
-                {
-                    "packName": pack.name,
-                    "version": release.version,
-                    "schemas": [
-                        {
-                            "nodeType": node.node_type,
-                            "schemaVersion": node.schema_version,
-                            "schemaWireVersion": node.schema_wire_version,
-                            "schemaSignature": node.schema_signature,
-                            "role": node.role,
-                            "schema": node.schema,
-                        }
-                        for node in self._nodes(session, release.id)
-                    ],
-                }
-            )
+            return self.schema_response(session, pack, release)
+
+    @classmethod
+    def schema_response(
+        cls, session: Session, pack: PackRecord, release: ReleaseRecord
+    ) -> SchemasResponse:
+        return SchemasResponse.model_validate(
+            {
+                "packName": pack.name,
+                "version": release.version,
+                "schemas": [
+                    {
+                        "nodeType": node.node_type,
+                        "schemaVersion": node.schema_version,
+                        "schemaWireVersion": node.schema_wire_version,
+                        "schemaSignature": node.schema_signature,
+                        "role": node.role,
+                        "schema": node.schema,
+                    }
+                    for node in cls._nodes(session, release.id)
+                ],
+            }
+        )
 
     @staticmethod
     def _template_wire(template: dict[str, Any]) -> dict[str, object]:

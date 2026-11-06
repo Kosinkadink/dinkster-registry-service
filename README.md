@@ -25,23 +25,45 @@ array of locale, SHA-256 digest, and path within the same ZIP. An empty array
 means the release carries no locale catalog. Quarantine queues a rebuild to
 remove the release from both lists.
 
+The same rebuild writes `packs/<name>/<version>/schemas.json` for every public
+active or yanked release. These are the admission probe's stored wire schemas,
+byte-identical to `GET /v1/packs/<name>/versions/<version>/schemas`; no schema
+file is required inside the archive. Files retain the `packName`, `version`,
+and `schemas` envelope, including each node's wire version, signature and role.
+Schemas of releases no longer publicly readable are removed on rebuild.
+
+`schemas/index.json` contains `schemaVersion: 1` and one `items` entry per
+first-party pack with an active public release. First-party means authenticated
+publisher `dinkster`, not a matching pack-name prefix. Each entry has `name`,
+`publisher`, `version`, `displayName`, `platforms`, `url`, and `digest`. The
+highest active PEP 440 version wins. The digest is SHA-256 of the exact schema
+file bytes, prefixed with `sha256:`. The URL is relative to the static prefix,
+for example `packs/dinkster-upscale/1.0.0/schemas.json`, so a client resolves it
+against its configured prefix, not against `schemas/`. Schema files are written
+before their index. A mirror copies these directories unchanged and needs no
+dynamic registry routes for schema discovery or preview.
+
 The service serves the stored bytes at `/packs/index.json` and
-`/locales/index.json`, with content-derived ETags and `If-None-Match`
-support (304). The object-store indexes have a 60-second public cache lifetime.
-Artifact bytes remain immutable; only these two index keys can be replaced.
-Production stores all three in R2 through the S3 API, not on local disk.
+`/locales/index.json`, plus the schema index and files, with GET/HEAD,
+content-derived ETags and `If-None-Match` support (304). Read-only public CORS
+exposes ETag and permits conditional browser requests; mirror operators must
+provide equivalent CORS headers when serving a different browser origin.
+The object-store indexes have a 60-second public cache lifetime. Artifact and
+per-version schema bytes remain immutable; only the three index keys can be
+replaced. Production stores these objects in R2 through the S3 API, not on
+local disk.
 
 Index delivery is eventually consistent with SQL acceptance. A storage outage
 does not undo an accepted artifact: the scanner retries the durable event after
-five seconds. Each object replacement is atomic, but the pair is not a single
+five seconds. Each object replacement is atomic, but the set is not a single
 transaction; a failure between writes can temporarily expose different
-snapshots. A retry rebuilds both from current catalog state. PostgreSQL advisory
+snapshots. A retry rebuilds all indexes from current catalog state. PostgreSQL advisory
 transaction locks serialize snapshot reads and writes across replicas; SQLite
 uses an immediate transaction. A slower writer cannot overwrite a newer
 snapshot after another writer completes. Before any publish or rebuild, index
 requests return 404 rather than synthesizing a different database view.
 
-Operators can rebuild both indexes from current catalog state with the same
+Operators can rebuild the indexes from current catalog state with the same
 database and object-store environment settings used by the service:
 
 ```sh

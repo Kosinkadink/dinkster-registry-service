@@ -379,19 +379,41 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             etag_context={"endpoint": "health"},
         )
 
-    @app.get("/packs/index.json")
-    @app.get("/locales/index.json")
+    @app.api_route("/packs/index.json", methods=["GET", "HEAD", "OPTIONS"])
+    @app.api_route("/locales/index.json", methods=["GET", "HEAD", "OPTIONS"])
+    @app.api_route("/schemas/index.json", methods=["GET", "HEAD", "OPTIONS"])
     def static_index(request: Request) -> Response:
         _query(request, EmptyQuery)
+        cors = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "If-None-Match",
+            "Access-Control-Expose-Headers": "ETag",
+        }
+        if request.method == "OPTIONS":
+            return Response(status_code=204, headers=cors)
         try:
             body = object_store.read(request.url.path.lstrip("/"))
         except FileNotFoundError:
             raise _not_found("The static index has not been published.") from None
         etag = f'"{blake3(body).hexdigest()}"'
-        headers = {"ETag": etag, "Cache-Control": PUBLIC_CACHE}
+        headers = {"ETag": etag, "Cache-Control": PUBLIC_CACHE, **cors}
         if _etag_matches(request.headers.get("if-none-match", ""), etag):
             return Response(status_code=304, headers=headers)
-        return Response(body, media_type="application/json", headers=headers)
+        return Response(
+            b"" if request.method == "HEAD" else body,
+            media_type="application/json",
+            headers={**headers, "Content-Length": str(len(body))},
+        )
+
+    @app.api_route(
+        "/packs/{canonical_name}/{canonical_version}/schemas.json",
+        methods=["GET", "HEAD", "OPTIONS"],
+    )
+    def static_schemas(request: Request, canonical_name: str, canonical_version: str) -> Response:
+        _pack_name(canonical_name)
+        _version(canonical_version)
+        return static_index(request)
 
     @app.post("/v1/publish/{canonical_name}/versions/{canonical_version}")
     async def publish(request: Request, canonical_name: str, canonical_version: str) -> Response:
