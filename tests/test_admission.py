@@ -1219,7 +1219,7 @@ def _assert_reviewed_rescan_decision(
         assert response.status_code == (200 if accepted else 404)
         if not accepted:
             assert service.run_once()
-        for key in ("packs/index.json", "translations/index.json"):
+        for key in ("packs/index.json", "locales/index.json"):
             index = client.get(f"/{key}")
             assert index.status_code == 200
             assert [item["name"] for item in index.json()["items"]] == (

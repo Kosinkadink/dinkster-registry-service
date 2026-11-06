@@ -23,7 +23,7 @@ def test_index_retry_repairs_partial_publication(database: Database, tmp_path: P
         fail = True
 
         def replace_index(self, key: str, data: bytes) -> None:
-            if self.fail and key == "translations/index.json":
+            if self.fail and key == "locales/index.json":
                 raise ObjectStoreError("synthetic index failure")
             super().replace_index(key, data)
 
@@ -34,7 +34,7 @@ def test_index_retry_repairs_partial_publication(database: Database, tmp_path: P
     indexes = StaticIndexes(database, store, "http://testserver")
     assert indexes.deliver_one()
     assert store.exists("packs/index.json")
-    assert not store.exists("translations/index.json")
+    assert not store.exists("locales/index.json")
     with database.session() as session, session.begin():
         event = session.scalar(select(OutboxRecord).where(OutboxRecord.topic == "indexes.rebuild"))
         assert event is not None
@@ -43,7 +43,7 @@ def test_index_retry_repairs_partial_publication(database: Database, tmp_path: P
     store.fail = False
     assert indexes.deliver_one()
     assert not indexes.deliver_one()
-    for key in ("packs/index.json", "translations/index.json"):
+    for key in ("packs/index.json", "locales/index.json"):
         payload = json.loads(store.read(key))
         assert {item["name"] for item in payload["items"]} == {"example-pack", "color-tools"}
 
@@ -100,7 +100,7 @@ def test_concurrent_rebuilds_cannot_overwrite_newer_catalog(
             release.set()
         assert first.result(timeout=10) == 2
         assert second.result(timeout=10) == 1
-    for key in ("packs/index.json", "translations/index.json"):
+    for key in ("packs/index.json", "locales/index.json"):
         assert [item["name"] for item in json.loads(store.read(key))["items"]] == ["example-pack"]
 
 
@@ -136,7 +136,7 @@ def test_sqlite_rebuild_is_deterministic_and_excludes_quarantined_releases(
             ],
         )
         main()
-        assert capsys.readouterr().out == "Published pack and translation indexes for 1 releases.\n"
+        assert capsys.readouterr().out == "Published pack and locale indexes for 1 releases.\n"
         assert store.read("packs/index.json") == before
         assert [item["name"] for item in json.loads(before)["items"]] == ["example-pack"]
     finally:

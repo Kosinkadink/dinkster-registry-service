@@ -121,7 +121,7 @@ def main() -> None:
             count = StaticIndexes(
                 database, settings.create_object_store(), settings.public_base_url
             ).rebuild()
-            print(f"Published pack and translation indexes for {count} releases.")
+            print(f"Published pack and locale indexes for {count} releases.")
         finally:
             database.dispose()
         return

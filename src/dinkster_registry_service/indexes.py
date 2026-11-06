@@ -59,7 +59,7 @@ class StaticIndexes:
             .order_by(PackRecord.name, ReleaseRecord.version)
         ).all()
         packs = []
-        translations = []
+        locales = []
         for pack, release, artifact in rows:
             entry = {
                 "name": pack.name,
@@ -69,8 +69,8 @@ class StaticIndexes:
                 "url": f"{self.public_base_url}/v1/artifacts/{artifact.digest}",
             }
             packs.append(entry)
-            translations.append({**entry, "catalogs": release.manifest.get("localeCatalogs", [])})
-        for key, items in (("packs/index.json", packs), ("translations/index.json", translations)):
+            locales.append({**entry, "catalogs": release.manifest.get("localeCatalogs", [])})
+        for key, items in (("packs/index.json", packs), ("locales/index.json", locales)):
             data = json.dumps(
                 {"schemaVersion": 1, "items": items},
                 ensure_ascii=True,

@@ -16,17 +16,17 @@ operator-review candidates are never visible through public catalog routes.
 ## Static public indexes
 
 Every accepted publish queues a durable rebuild of `packs/index.json` and
-`translations/index.json` in the configured object store and immediately
+`locales/index.json` in the configured object store and immediately
 attempts delivery. Both contain deterministic JSON with `schemaVersion: 1` and
 an `items` array of active public releases, ordered by pack name and version
 text. Each entry includes `name`, `version`, BLAKE3 `digest`, byte `size`, and
-the artifact download `url`. Translation entries also contain `catalogs`, an
+the artifact download `url`. Locale entries also contain `catalogs`, an
 array of locale, SHA-256 digest, and path within the same ZIP. An empty array
 means the release carries no locale catalog. Quarantine queues a rebuild to
 remove the release from both lists.
 
 The service serves the stored bytes at `/packs/index.json` and
-`/translations/index.json`, with content-derived ETags and `If-None-Match`
+`/locales/index.json`, with content-derived ETags and `If-None-Match`
 support (304). The object-store indexes have a 60-second public cache lifetime.
 Artifact bytes remain immutable; only these two index keys can be replaced.
 Production stores all three in R2 through the S3 API, not on local disk.
