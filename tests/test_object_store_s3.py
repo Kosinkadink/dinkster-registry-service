@@ -176,7 +176,7 @@ def test_accepted_publish_updates_both_s3_indexes_with_conditional_get(
         assert service.run_once()
         assert service.status(candidate).status == "accepted"
         etags = {}
-        for key in ("packs/index.json", "translations/index.json"):
+        for key in ("packs/index.json", "locales/index.json"):
             response = client.get(f"/{key}")
             assert response.status_code == 200
             assert response.content == s3_store.read(key)
@@ -193,7 +193,7 @@ def test_accepted_publish_updates_both_s3_indexes_with_conditional_get(
             conditional = client.get(f"/{key}", headers={"If-None-Match": etags[key]})
             assert conditional.status_code == 304
             assert conditional.content == b""
-            if key == "translations/index.json":
+            if key == "locales/index.json":
                 assert items[0]["catalogs"] == [
                     {
                         "locale": "en",
@@ -201,6 +201,9 @@ def test_accepted_publish_updates_both_s3_indexes_with_conditional_get(
                         "digest": "sha256:" + hashlib.sha256(catalog).hexdigest(),
                     }
                 ]
+        old_key = "translations/index.json"
+        s3_store.put(old_key, s3_store.read("locales/index.json"))
+        assert client.get(f"/{old_key}").status_code == 404
         second = service.submit(archive, pack_name="example-pack", version="1.2.4")
         assert service.run_once()
         assert service.status(second).status == "accepted"

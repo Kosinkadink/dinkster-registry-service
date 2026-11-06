@@ -380,7 +380,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         )
 
     @app.get("/packs/index.json")
-    @app.get("/translations/index.json")
+    @app.get("/locales/index.json")
     def static_index(request: Request) -> Response:
         _query(request, EmptyQuery)
         try:
