@@ -114,7 +114,7 @@ class StaticIndexes:
             for variant in wheel_variants:
                 projects[variant][pack.name].append(
                     f'<a href="{html.escape(link, quote=True)}">'
-                    f'{html.escape(wheel["filename"])}</a>'
+                    f"{html.escape(wheel['filename'])}</a>"
                 )
             locks = {}
             for variant, lock in release.install_locks.items():

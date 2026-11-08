@@ -90,9 +90,7 @@ def build_registry_fixture_archive(source: Path) -> bytes:
         + "".join(f"Requires-Dist: {value}\n" for value in pack.get("requires", []))
         + "\n"
     ).encode()
-    entries[f"{dist}/WHEEL"] = (
-        b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
-    )
+    entries[f"{dist}/WHEEL"] = b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
     record = io.StringIO()
     writer = csv.writer(record, lineterminator="\n")
     for path, payload in sorted(entries.items()):
