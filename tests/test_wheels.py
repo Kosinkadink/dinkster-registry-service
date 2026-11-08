@@ -1,0 +1,115 @@
+from __future__ import annotations
+
+import base64
+import csv
+import hashlib
+import io
+import zipfile
+
+import pytest
+
+from dinkster_registry_service.wheels import WheelError, extracted_wheel, inspect_wheel
+
+
+def wheel_bytes(
+    *,
+    name: str = "demo-nodes",
+    package: str = "demo_nodes",
+    library: bool = False,
+    extra: dict[str, bytes] | None = None,
+) -> bytes:
+    dist = f"{name.replace('-', '_')}-1.2.3.dist-info"
+    files = {
+        f"{dist}/METADATA": (
+            f"Metadata-Version: 2.4\nName: {name}\nVersion: 1.2.3\n"
+            "Requires-Dist: demo-core>=2\n\n"
+        ).encode(),
+        f"{dist}/WHEEL": b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        f"{package}/__init__.py": b"ANSWER = 42\n",
+    }
+    if not library:
+        files[f"{package}/dinkster-pack.toml"] = (
+            f'[pack]\nname = "{name}"\nversion = "1.2.3"\n'
+        ).encode()
+        files[f"{package}/locales/en.json"] = b'{"title":"Example"}'
+    files.update(extra or {})
+    record = io.StringIO()
+    writer = csv.writer(record, lineterminator="\n")
+    for path, payload in sorted(files.items()):
+        digest = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=")
+        writer.writerow((path, "sha256=" + digest.decode(), str(len(payload))))
+    writer.writerow((f"{dist}/RECORD", "", ""))
+    files[f"{dist}/RECORD"] = record.getvalue().encode()
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path, payload in files.items():
+            archive.writestr(path, payload)
+    return output.getvalue()
+
+
+def test_wheel_identity_and_probe_assets() -> None:
+    data = wheel_bytes()
+    wheel = inspect_wheel(data, "demo-nodes", "1.2.3")
+    assert wheel.filename == "demo_nodes-1.2.3-py3-none-any.whl"
+    assert wheel.imports == ("demo_nodes",)
+    assert wheel.requirements == ("demo-core>=2",)
+    assert wheel.sha256 == hashlib.sha256(data).hexdigest()
+    assert not wheel.library
+    with extracted_wheel(data, wheel) as root:
+        assert (root / "demo_nodes/__init__.py").read_bytes() == b"ANSWER = 42\n"
+        assert (root / "locales/en.json").read_bytes() == b'{"title":"Example"}'
+        assert (root / "dinkster-pack.toml").read_bytes() == (
+            root / "demo_nodes/dinkster-pack.toml"
+        ).read_bytes()
+        assert not (root / "__init__.py").exists()
+
+
+def test_library_is_identified_by_absence_of_manifest() -> None:
+    wheel = inspect_wheel(wheel_bytes(library=True), "demo-nodes", "1.2.3")
+    assert wheel.library
+    assert wheel.manifest_path is None
+    assert wheel.imports == ("demo_nodes",)
+
+
+@pytest.mark.parametrize(
+    ("path", "code"),
+    [
+        ("demo_nodes/startup.pth", "wheel.pth-forbidden"),
+        ("demo_nodes-1.2.3.dist-info/entry_points.txt", "wheel.entry-point-forbidden"),
+        ("demo_nodes-1.2.3.data/scripts/demo", "wheel.entry-point-forbidden"),
+        ("unrelated/__init__.py", "wheel.import-name"),
+        ("../escaped.py", "wheel.invalid"),
+        ("demo_nodes/../escaped.py", "wheel.invalid"),
+        ("demo_nodes\\escaped.py", "wheel.invalid"),
+    ],
+)
+def test_wheel_refuses_unsafe_members_with_named_error(path: str, code: str) -> None:
+    with pytest.raises(WheelError) as error:
+        inspect_wheel(wheel_bytes(extra={path: b"payload"}), "demo-nodes", "1.2.3")
+    assert error.value.code == code
+
+
+def test_wheel_refuses_mismatched_distribution_and_tampered_record() -> None:
+    with pytest.raises(WheelError) as error:
+        inspect_wheel(wheel_bytes(name="other-name"), "demo-nodes", "1.2.3")
+    assert error.value.code == "wheel.distribution-name"
+    data = wheel_bytes()
+    rewritten = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data)) as source, zipfile.ZipFile(rewritten, "w") as output:
+        for info in source.infolist():
+            payload = source.read(info)
+            if info.filename == "demo_nodes/__init__.py":
+                payload = b"ANSWER = 43\n"
+            output.writestr(info, payload)
+    with pytest.raises(WheelError, match="RECORD does not match") as error:
+        inspect_wheel(rewritten.getvalue(), "demo-nodes", "1.2.3")
+    assert error.value.code == "wheel.invalid"
+
+
+def test_old_zip_is_not_a_wheel() -> None:
+    data = io.BytesIO()
+    with zipfile.ZipFile(data, "w") as archive:
+        archive.writestr("dinkster-pack.toml", '[pack]\nname = "demo-nodes"\n')
+    with pytest.raises(WheelError) as error:
+        inspect_wheel(data.getvalue(), "demo-nodes", "1.2.3")
+    assert error.value.code == "wheel.required"
