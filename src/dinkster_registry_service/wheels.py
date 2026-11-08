@@ -16,12 +16,14 @@ from email import policy
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
 
+from dinkster_registry.archive_admission import AdmissionFinding, StageResult, run_fast_security
 from packaging.requirements import Requirement
 from packaging.tags import Tag, parse_tag
 from packaging.utils import canonicalize_name, parse_wheel_filename
 from packaging.version import Version
 
 from .artifacts import ARCHIVE_LIMIT, ENTRY_LIMIT, EXPANDED_LIMIT, FILE_LIMIT, PATH_BYTE_LIMIT
+from .digests import artifact_digest
 
 
 class WheelError(ValueError):
@@ -135,6 +137,36 @@ def inspect_wheel(data: bytes, name: str, version: str) -> Wheel:
         raise
     except (ValueError, KeyError, UnicodeError, csv.Error, zipfile.BadZipFile) as exc:
         raise _invalid(str(exc)) from exc
+
+
+def run_wheel_integrity(
+    data: bytes, size: int, digest: str, name: str, version: str
+) -> StageResult:
+    try:
+        if len(data) != size:
+            raise WheelError("integrity.size-mismatch", "Object length differs from submission.")
+        if artifact_digest(data) != digest:
+            raise WheelError("integrity.digest-mismatch", "Object BLAKE3 differs from submission.")
+        inspect_wheel(data, name, version)
+    except WheelError as exc:
+        return StageResult((AdmissionFinding(exc.code, "error", "block", str(exc)),))
+    return StageResult(data={"artifactDigest": digest, "size": size})
+
+
+def run_wheel_security(data: bytes) -> StageResult:
+    # Reuse the content scanner's signatures without its root-manifest layout
+    # restriction. Every original byte is scanned; this view is never published.
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data)) as source, zipfile.ZipFile(output, "w") as target:
+        files = _members(source)
+        files["dinkster-pack.toml"] = b"[pack]\n"
+        for name, payload in files.items():
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.create_system = 3
+            info.external_attr = 0o644 << 16
+            info.compress_type = zipfile.ZIP_STORED
+            target.writestr(info, payload)
+    return run_fast_security(output.getvalue())
 
 
 def _inspect_wheel(data: bytes, name: str, version: str) -> Wheel:

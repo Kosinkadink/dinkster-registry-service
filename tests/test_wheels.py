@@ -5,9 +5,18 @@ import csv
 import hashlib
 import io
 import zipfile
+from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import select
 
+from dinkster_registry_service.admission import AdmissionService
+from dinkster_registry_service.app import create_app
+from dinkster_registry_service.database import Database, NamespaceGrantRecord, ReleaseRecord
+from dinkster_registry_service.indexes import StaticIndexes
+from dinkster_registry_service.object_store import LocalFilesystemObjectStore
+from dinkster_registry_service.settings import ServerSettings
 from dinkster_registry_service.wheels import WheelError, extracted_wheel, inspect_wheel
 
 
@@ -112,3 +121,47 @@ def test_old_zip_is_not_a_wheel() -> None:
     with pytest.raises(WheelError) as error:
         inspect_wheel(data.getvalue(), "demo-nodes", "1.2.3")
     assert error.value.code == "wheel.required"
+
+
+def test_library_admission_static_download_collision_and_yank(tmp_path: Path) -> None:
+    url = f"sqlite:///{tmp_path / 'catalog.db'}"
+    database = Database(url)
+    store = LocalFilesystemObjectStore(tmp_path / "objects")
+    service = AdmissionService(database, store, require_isolation=False)
+    data = wheel_bytes(library=True)
+    candidate = service.submit(data, pack_name="demo-nodes", version="1.2.3")
+    assert service.run_once()
+    assert service.status(candidate).status == "accepted"
+    with database.session() as session:
+        assert list(session.scalars(select(NamespaceGrantRecord))) == []
+    app = create_app(ServerSettings(database_url=url, object_store_root=store.root))
+    with TestClient(app) as client:
+        index = client.get("/static/cpu/simple/demo-nodes/")
+        assert index.status_code == 200
+        wheel = inspect_wheel(data, "demo-nodes", "1.2.3")
+        assert f"#sha256={wheel.sha256}" in index.text
+        assert index.text.count(f">{wheel.filename}</a>") == 1
+        entry = client.get("/static/packs/index.json").json()["items"][0]
+        assert entry["sha256"] == wheel.sha256
+        assert client.get("/static/" + entry["url"]).content == data
+        denied = client.put("/static/cpu/simple/demo-nodes/", content=b"changed")
+        assert denied.status_code == 400
+        assert denied.json()["error"]["code"] == "invalid_request"
+        assert client.get("/static/cpu/simple/demo-nodes/").content == index.content
+        assert client.get("/static/quarantine/uploads/secret").status_code == 404
+        assert client.get("/static/translations/index.json").json()["items"] == []
+        conflict = service.submit(
+            wheel_bytes(name="other-library", library=True),
+            pack_name="other-library",
+            version="1.2.3",
+        )
+        assert service.run_once()
+        assert service.status(conflict).reason == "wheel.import-conflict"
+        with database.session() as session, session.begin():
+            release = session.scalar(select(ReleaseRecord))
+            assert release is not None
+            release.state = "yanked"
+        StaticIndexes(database, store, "http://testserver").rebuild()
+        assert wheel.filename not in client.get("/static/cpu/simple/demo-nodes/").text
+        assert client.get("/static/packs/index.json").json()["items"] == []
+    database.dispose()

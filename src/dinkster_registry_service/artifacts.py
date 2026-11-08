@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import base64
+import csv
+import hashlib
 import io
+import re
+import tomllib
 import unicodedata
 import zipfile
 from pathlib import Path
@@ -68,9 +73,36 @@ def _entries(source: Path) -> list[tuple[str, bytes]]:
 
 
 def build_registry_fixture_archive(source: Path) -> bytes:
+    manifest = (source / MANIFEST_NAME).read_text()
+    pack = tomllib.loads(manifest)["pack"]
+    name = pack["name"]
+    version = pack.get("version", "1.2.3")
+    package = name.replace("-", "_").replace(".", "_")
+    dist = f"{package}-{version}.dist-info"
+    entries = {f"{package}/{path}": data for path, data in _entries(source)}
+    # The fixture sources keep short entry names for direct probe tests; a
+    # published wheel binds those entries to its only installed package.
+    manifest = re.sub(r'"nodes:', f'"{package}.nodes:', manifest)
+    entries[f"{package}/{MANIFEST_NAME}"] = manifest.encode()
+    entries.setdefault(f"{package}/__init__.py", b"")
+    entries[f"{dist}/METADATA"] = (
+        f"Metadata-Version: 2.4\nName: {name}\nVersion: {version}\n"
+        + "".join(f"Requires-Dist: {value}\n" for value in pack.get("requires", []))
+        + "\n"
+    ).encode()
+    entries[f"{dist}/WHEEL"] = (
+        b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+    )
+    record = io.StringIO()
+    writer = csv.writer(record, lineterminator="\n")
+    for path, payload in sorted(entries.items()):
+        digest = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode()
+        writer.writerow((path, f"sha256={digest}", len(payload)))
+    writer.writerow((f"{dist}/RECORD", "", ""))
+    entries[f"{dist}/RECORD"] = record.getvalue().encode()
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
-        for relative, payload in _entries(source):
+        for relative, payload in sorted(entries.items()):
             info = zipfile.ZipInfo(relative, date_time=_ZIP_EPOCH)
             info.create_system = 3
             info.external_attr = _FILE_MODE
@@ -84,5 +116,7 @@ def build_registry_fixture_archive(source: Path) -> bytes:
 
 def build_registry_fixture_archive_with_digests(source: Path) -> tuple[bytes, str, str]:
     data = build_registry_fixture_archive(source)
-    manifest = (source / MANIFEST_NAME).read_bytes()
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        path = next(name for name in archive.namelist() if name.endswith("/" + MANIFEST_NAME))
+        manifest = archive.read(path)
     return data, artifact_digest(data), artifact_digest(manifest)

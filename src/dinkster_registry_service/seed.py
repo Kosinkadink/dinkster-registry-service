@@ -35,8 +35,9 @@ from .database import (
 from .digests import artifact_object_key
 from .object_store import ObjectStore
 from .versioning import public_version_key, require_public_version
+from .wheels import inspect_wheel
 
-MEDIA_TYPE = "application/vnd.dinkster.pack+zip"
+MEDIA_TYPE = "application/zip"
 FIXTURE_ROOT = Path("fixtures/packs")
 
 
@@ -320,6 +321,16 @@ def seed_fixtures(database: Database, object_store: ObjectStore) -> SeedResult:
     for fixture in FIXTURES:
         source = FIXTURE_ROOT / fixture.name
         archive, digest, manifest_digest = build_registry_fixture_archive_with_digests(source)
+        wheel = inspect_wheel(archive, fixture.name, fixture.version)
+        manifest = _manifest(fixture, source)
+        manifest["wheel"] = {
+            "filename": wheel.filename,
+            "sha256": wheel.sha256,
+            "imports": list(wheel.imports),
+            "library": False,
+            "tags": sorted(str(tag) for tag in wheel.tags),
+            "manifestPath": wheel.manifest_path,
+        }
         object_key = artifact_object_key(digest)
         object_store.put(object_key, archive)
 
@@ -404,7 +415,7 @@ def seed_fixtures(database: Database, object_store: ObjectStore) -> SeedResult:
                     ),
                     published_by_principal_id=fixture.principal_id,
                     artifact_digest=digest,
-                    manifest=_manifest(fixture, source),
+                    manifest=manifest,
                 )
                 session.add(release)
                 session.flush()

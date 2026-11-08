@@ -3,17 +3,59 @@
 The Dinkster Registry is a FastAPI service for publishing, browsing, and
 downloading Dinkster node packs. The same `dinkster-registry-service`
 distribution and `dinkster_registry_service` import run with PostgreSQL for a
-hosted catalog or SQLite for a self-hosted registry. Immutable pack archives
+hosted catalog or SQLite for a self-hosted registry. Immutable pack wheels
 live behind an object-store interface; development uses the local filesystem
 implementation.
 
-Operators can submit pack archives to quarantine through the in-process CLI.
+Operators can submit pack wheels to quarantine through the in-process CLI.
 Lease-based scanner workers validate every candidate and promote accepted bytes
 to immutable artifact storage. Bearer-authenticated HTTP routes accept publisher
 submissions and operator review decisions. Pending, rejected, and
 operator-review candidates are never visible through public catalog routes.
 
+## Wheel identity and admission
+
+Only wheels are publishable; the old Dinkster ZIP and source distributions are
+refused with `wheel.required`. Wheel `METADATA` Name equals the submitted pack
+name exactly. A pack ships exactly one top-level import package, named by
+replacing every `-` and `.` in its pack name with `_`. The original manifest
+is `<import_package>/dinkster-pack.toml`; relative assets live beside it.
+`Requires-Dist` matches the manifest's `requires`. Standard WHEEL tags and
+RECORD hashes describe every installed file. The registry checks them before
+extracting or executing any publisher code. Admitted versions are immutable.
+
+Named refusals include `wheel.distribution-name`, `wheel.import-name`,
+`wheel.pth-forbidden`, `wheel.entry-point-forbidden` (including console scripts),
+`wheel.import-conflict`, and `wheel.requires-pack`. Malformed or unsafe wheels
+fail with `wheel.invalid`. Import ownership is checked again while catalog
+promotion is serialized; concurrent submissions cannot claim the same import.
+These rules apply equally to first-party and third-party publishers.
+
+A library wheel has no manifest, node schemas or namespace claims. It uses the
+same admission and simple index as packs. Shared code belongs in such a library,
+not a Python dependency on another pack. A distribution cannot switch between
+library and pack identity (`wheel.library-claims`). A types pack still has a
+manifest and is a pack, even when it has zero nodes.
+
 ## Static public indexes
+
+All installer reads use `/static/`. The registry writes PEP 503 pages at
+`/static/<variant>/simple/<normalized-name>/` and the corresponding simple root.
+The `cpu` view always exists; admitted installation locks declare additional
+variant views. Project links contain the wheel filename and a relative URL to
+`../../../wheels/<sha256>/<filename>.whl#sha256=<sha256>`. This SHA-256 hashes the
+complete wheel bytes. The registry's BLAKE3 artifact identity remains separate.
+Yanked releases are absent from the simple index. Universal wheel pages have
+identical bytes across variants. There is no publisher route for editing an
+index: the static prefix supports only GET, HEAD and OPTIONS.
+
+`/static/packs/index.json` carries exact wheel filenames, hashes and prefix-relative
+URLs, plus admitted installation locks. `/static/locks/` holds those immutable
+lock bytes. Schemas, locale catalogs and translation records are indexed at
+`/static/schemas/index.json`, `/static/locales/index.json` and
+`/static/translations/index.json`. Relative JSON URLs resolve against `/static/`,
+not against the directory containing the JSON index. An installer uses the
+recorded pins, never unrestricted dependency resolution against the simple index.
 
 Every accepted publish queues a durable rebuild of `packs/index.json` and
 `locales/index.json` in the configured object store and immediately
@@ -21,7 +63,7 @@ attempts delivery. Both contain deterministic JSON with `schemaVersion: 1` and
 an `items` array of active public releases, ordered by pack name and version
 text. Each entry includes `name`, `version`, BLAKE3 `digest`, byte `size`, and
 the artifact download `url`. Locale entries also contain `catalogs`, an
-array of locale, SHA-256 digest, and path within the same ZIP. An empty array
+array of locale, SHA-256 digest, and path within the same wheel. An empty array
 means the release carries no locale catalog. Quarantine queues a rebuild to
 remove the release from both lists.
 
@@ -43,13 +85,13 @@ against its configured prefix, not against `schemas/`. Schema files are written
 before their index. A mirror copies these directories unchanged and needs no
 dynamic registry routes for schema discovery or preview.
 
-The service serves the stored bytes at `/packs/index.json` and
-`/locales/index.json`, plus the schema index and files, with GET/HEAD,
+The service serves the stored bytes at `/static/packs/index.json` and
+`/static/locales/index.json`, plus the schema index and files, with GET/HEAD,
 content-derived ETags and `If-None-Match` support (304). Read-only public CORS
 exposes ETag and permits conditional browser requests; mirror operators must
 provide equivalent CORS headers when serving a different browser origin.
 The object-store indexes have a 60-second public cache lifetime. Artifact and
-per-version schema bytes remain immutable; only the three index keys can be
+per-version schema bytes remain immutable; only the JSON and simple index keys can be
 replaced. Production stores these objects in R2 through the S3 API, not on
 local disk.
 

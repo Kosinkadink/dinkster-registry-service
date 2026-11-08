@@ -5,7 +5,9 @@ from pathlib import Path
 from dinkster_registry.archive_admission import AdmissionFinding, StageResult
 from dinkster_registry.archive_admission import run_manifest_admission as check_archive_manifest
 from dinkster_schema import claims_conflict
+from packaging.requirements import Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.utils import canonicalize_name
 from packaging.version import Version
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -17,6 +19,45 @@ from .database import (
     ReleaseRecord,
 )
 from .versioning import VersionError, public_version_key
+from .wheels import Wheel, WheelError
+
+
+def check_wheel_catalog(wheel: Wheel, session: Session) -> None:
+    """Check again under the promotion lock so concurrent scans cannot claim an import."""
+    rows = session.execute(
+        select(PackRecord, ReleaseRecord).join(
+            ReleaseRecord, ReleaseRecord.pack_id == PackRecord.id
+        )
+    ).all()
+    required = {canonicalize_name(Requirement(value).name) for value in wheel.requirements}
+    for pack, release in rows:
+        previous = release.manifest.get("wheel", {})
+        library = previous.get("library", False)
+        if pack.name == wheel.name:
+            if library != wheel.library:
+                raise WheelError("wheel.library-claims", "A distribution cannot change pack kind.")
+            continue
+        imports = previous.get("imports", [pack.name.replace("-", "_").replace(".", "_")])
+        if set(imports).intersection(wheel.imports):
+            raise WheelError(
+                "wheel.import-conflict", f"Top-level import already belongs to {pack.name!r}."
+            )
+        if canonicalize_name(pack.name) in required and not library:
+            raise WheelError(
+                "wheel.requires-pack", f"Requires-Dist names pack {pack.name!r}, not a library."
+            )
+        if not wheel.library:
+            existing_requirements = release.manifest.get("pythonRequirements", [])
+            if any(
+                canonicalize_name(Requirement(value).name) == canonicalize_name(wheel.name)
+                for value in existing_requirements
+            ):
+                raise WheelError(
+                    "wheel.requires-pack",
+                    f"Existing release {pack.name!r} requires this name as a library.",
+                )
+    if not wheel.library and canonicalize_name(wheel.name) in required:
+        raise WheelError("wheel.requires-pack", "A pack cannot require itself as a library.")
 
 
 def run_manifest_admission(

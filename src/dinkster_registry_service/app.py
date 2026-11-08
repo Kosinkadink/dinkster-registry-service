@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import logging
+import re
 import zipfile
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
@@ -379,11 +380,26 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             etag_context={"endpoint": "health"},
         )
 
-    @app.api_route("/packs/index.json", methods=["GET", "HEAD", "OPTIONS"])
-    @app.api_route("/locales/index.json", methods=["GET", "HEAD", "OPTIONS"])
-    @app.api_route("/schemas/index.json", methods=["GET", "HEAD", "OPTIONS"])
-    def static_index(request: Request) -> Response:
+    @app.api_route("/static/{path:path}", methods=["GET", "HEAD", "OPTIONS"])
+    def static_index(request: Request, path: str) -> Response:
         _query(request, EmptyQuery)
+        if (
+            not path
+            or any(part in {"", ".", ".."} for part in path.rstrip("/").split("/"))
+            or "\\" in path
+        ):
+            raise _not_found("The static file was not found.")
+        if path.endswith("/"):
+            path += "index.html"
+        allowed = (
+            re.fullmatch(r"(?:packs|schemas|locales|translations)/index\.json", path)
+            or re.fullmatch(r"[a-z0-9-]+/simple/(?:[a-z0-9-]+/)?index\.html", path)
+            or re.fullmatch(r"packs/[a-z0-9-]+/[^/]+/schemas\.json", path)
+            or re.fullmatch(r"wheels/[0-9a-f]{64}/[A-Za-z0-9_.+-]+\.whl", path)
+            or re.fullmatch(r"locks/blake3/[0-9a-f]{64}\.json", path)
+        )
+        if not allowed:
+            raise _not_found("The static file was not found.")
         cors = {
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
@@ -393,7 +409,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         if request.method == "OPTIONS":
             return Response(status_code=204, headers=cors)
         try:
-            body = object_store.read(request.url.path.lstrip("/"))
+            body = object_store.read(f"static/{path}")
         except FileNotFoundError:
             raise _not_found("The static index has not been published.") from None
         etag = f'"{blake3(body).hexdigest()}"'
@@ -402,18 +418,13 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             return Response(status_code=304, headers=headers)
         return Response(
             b"" if request.method == "HEAD" else body,
-            media_type="application/json",
+            media_type="text/html"
+            if path.endswith(".html")
+            else "application/octet-stream"
+            if path.endswith(".whl")
+            else "application/json",
             headers={**headers, "Content-Length": str(len(body))},
         )
-
-    @app.api_route(
-        "/packs/{canonical_name}/{canonical_version}/schemas.json",
-        methods=["GET", "HEAD", "OPTIONS"],
-    )
-    def static_schemas(request: Request, canonical_name: str, canonical_version: str) -> Response:
-        _pack_name(canonical_name)
-        _version(canonical_version)
-        return static_index(request)
 
     @app.post("/v1/publish/{canonical_name}/versions/{canonical_version}")
     async def publish(request: Request, canonical_name: str, canonical_version: str) -> Response:
