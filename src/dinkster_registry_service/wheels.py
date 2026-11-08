@@ -200,6 +200,12 @@ def _inspect_wheel(data: bytes, name: str, version: str) -> Wheel:
     tags = frozenset(tag for value in wheel.get_all("Tag", []) for tag in parse_tag(str(value)))
     if not tags:
         raise _invalid("Wheel must declare compatibility tags.")
+    if tags != {Tag("py3", "none", "any")} or wheel["Root-Is-Purelib"] != "true":
+        raise WheelError(
+            "wheel.platform-unsupported",
+            "Only py3-none-any releases are supported; native wheel sets are tracked at "
+            "https://github.com/Kosinkadink/comfy-vibe-station/issues/670.",
+        )
     build = str(wheel.get("Build", ""))
     filename = f"{distribution}-{version}-" + (f"{build}-" if build else "")
     filename += (

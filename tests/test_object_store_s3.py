@@ -158,8 +158,16 @@ def test_accepted_publish_updates_both_s3_indexes_with_conditional_get(
 ) -> None:
     source = tmp_path / "pack"
     shutil.copytree(FIXTURE_ROOT / "example-pack", source)
+    manifest = source / "dinkster-pack.toml"
+    manifest.write_text(
+        manifest.read_text()
+        .replace('publisher = "dinkster"\n', "")
+        .replace('namespaces = ["example"]', 'namespaces = ["example-pack"]')
+    )
+    nodes = source / "nodes.py"
+    nodes.write_text(nodes.read_text().replace("example.", "example-pack."))
     source.joinpath("locales").mkdir()
-    catalog = b'{"nodes":{"example.resize":{"displayName":"Resize"}}}'
+    catalog = b'{"nodes":{"example-pack.resize":{"displayName":"Resize"}}}'
     source.joinpath("locales/en.json").write_bytes(catalog)
     archive = build_registry_fixture_archive(source)
     settings = ServerSettings(

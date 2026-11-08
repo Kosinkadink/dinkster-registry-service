@@ -60,6 +60,7 @@ def _fixture_source(tmp_path: Path, name: str = "example-pack") -> Path:
     shutil.copytree(FIXTURE_ROOT / "example-pack", source)
     manifest_path = source / "dinkster-pack.toml"
     manifest = manifest_path.read_text()
+    manifest = manifest.replace('publisher = "dinkster"\n', "")
     manifest = manifest.replace('name = "example-pack"', f'name = "{name}"')
     manifest = manifest.replace('namespaces = ["example"]', f'namespaces = ["{name}"]')
     manifest_path.write_text(manifest)
@@ -644,7 +645,9 @@ def test_official_claims_require_registry_publisher_and_keep_exact_ids(
     source = _fixture_source(tmp_path, "official-pack")
     manifest = source / "dinkster-pack.toml"
     manifest.write_text(
-        manifest.read_text().replace(
+        manifest.read_text()
+        .replace("[pack]\n", '[pack]\npublisher = "dinkster"\n')
+        .replace(
             'namespaces = ["official-pack"]',
             'namespaces = ["std", "ExampleResize", "ExampleSave"]',
         )
@@ -677,7 +680,7 @@ def test_official_claims_require_registry_publisher_and_keep_exact_ids(
 
 
 @pytest.mark.parametrize("publisher", ("example-org", "other-org", None))
-@pytest.mark.parametrize("claim", ("shared", "shared.child"))
+@pytest.mark.parametrize("claim", ("shared-child", "shared-child-grandchild"))
 def test_namespace_overlap_is_exclusive_to_a_publisher(
     database: Database, tmp_path: Path, publisher: str | None, claim: str
 ) -> None:
@@ -686,17 +689,11 @@ def test_namespace_overlap_is_exclusive_to_a_publisher(
     for name in ("example-org", "other-org"):
         principals.register_publisher(name, "operator", datetime.now(UTC).isoformat())
     service = _service(database, tmp_path)
-    for name, owner, namespace in (
-        ("first-pack", "example-org", "shared"),
-        ("second-pack", publisher, claim),
+    for name, owner in (
+        ("shared", "example-org"),
+        (claim, publisher),
     ):
         source = _fixture_source(tmp_path, name)
-        manifest = source / "dinkster-pack.toml"
-        manifest.write_text(
-            manifest.read_text().replace(
-                f'namespaces = ["{name}"]', f'namespaces = ["{name}", "{namespace}"]'
-            )
-        )
         candidate = service.submit(
             build_registry_fixture_archive(source),
             pack_name=name,
@@ -705,7 +702,7 @@ def test_namespace_overlap_is_exclusive_to_a_publisher(
         )
         assert service.run_once()
         status = service.status(candidate)
-        if name == "first-pack" or publisher == "example-org":
+        if name == "shared" or publisher == "example-org":
             assert status.status == "accepted", status
         else:
             assert status.status == "rejected"
@@ -715,7 +712,11 @@ def test_namespace_overlap_is_exclusive_to_a_publisher(
 @pytest.mark.parametrize("publisher", ("example-org", "other-org", None))
 @pytest.mark.parametrize(
     ("first_claim", "second_claim"),
-    (("shared", "shared"), ("shared", "shared.child"), ("shared.child", "shared")),
+    (
+        ("shared", "shared-child"),
+        ("shared", "shared-child-grandchild"),
+        ("shared-child", "shared"),
+    ),
 )
 def test_promotion_rechecks_namespace_grants_after_both_candidates_scan(
     database: Database,
@@ -730,17 +731,11 @@ def test_promotion_rechecks_namespace_grants_after_both_candidates_scan(
         principals.register_publisher(name, "operator", datetime.now(UTC).isoformat())
     service = _service(database, tmp_path)
     candidates = []
-    for name, owner, namespace in (
-        ("first-pack", "example-org", first_claim),
-        ("second-pack", publisher, second_claim),
+    for name, owner in (
+        (first_claim, "example-org"),
+        (second_claim, publisher),
     ):
         source = _fixture_source(tmp_path, name)
-        manifest = source / "dinkster-pack.toml"
-        manifest.write_text(
-            manifest.read_text().replace(
-                f'namespaces = ["{name}"]', f'namespaces = ["{name}", "{namespace}"]'
-            )
-        )
         (source / "extension.so").write_bytes(b"synthetic native inventory fixture")
         candidate = service.submit(
             build_registry_fixture_archive(source),

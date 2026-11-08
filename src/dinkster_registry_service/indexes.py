@@ -76,18 +76,23 @@ class StaticIndexes:
         for pack, release, artifact in rows:
             relative_schema_key = f"packs/{pack.name}/{release.version}/schemas.json"
             schema_key = f"static/{relative_schema_key}"
+            wheel = release.manifest.get("wheel")
+            library = wheel is not None and wheel["library"]
             if pack.visibility != "public" or release.state not in {"active", "yanked"}:
                 self.object_store.remove(schema_key)
                 continue
-            body = (
-                CatalogRepository.schema_response(session, pack, release)
-                .model_dump_json(by_alias=True)
-                .encode("utf-8")
-            )
-            self.object_store.put(schema_key, body)
+            if library:
+                self.object_store.remove(schema_key)
+            else:
+                body = (
+                    CatalogRepository.schema_response(session, pack, release)
+                    .model_dump_json(by_alias=True)
+                    .encode("utf-8")
+                )
+                self.object_store.put(schema_key, body)
             if release.state != "active":
                 continue
-            if pack.publisher_id == "dinkster":
+            if pack.publisher_id == "dinkster" and not library:
                 previous = schemas.get(pack.name)
                 if previous is None or Version(release.version) > Version(str(previous["version"])):
                     schemas[pack.name] = {
@@ -99,7 +104,6 @@ class StaticIndexes:
                         "url": relative_schema_key,
                         "digest": "sha256:" + hashlib.sha256(body).hexdigest(),
                     }
-            wheel = release.manifest.get("wheel")
             if wheel is None:
                 continue
             wheel_key = f"wheels/{wheel['sha256']}/{wheel['filename']}"
@@ -138,8 +142,9 @@ class StaticIndexes:
                 "requires": release.manifest.get("pythonRequirements", []),
             }
             packs.append(entry)
-            locales.append({**entry, "catalogs": release.manifest.get("localeCatalogs", [])})
-            if pack.publisher_id == "dinkster":
+            if not library:
+                locales.append({**entry, "catalogs": release.manifest.get("localeCatalogs", [])})
+            if pack.publisher_id == "dinkster" and not library:
                 translations.extend(release.manifest.get("translations", []))
         for variant in sorted(variants):
             root_links = []

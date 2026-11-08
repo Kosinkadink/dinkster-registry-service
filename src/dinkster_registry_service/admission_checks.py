@@ -4,7 +4,12 @@ from pathlib import Path
 
 from dinkster_registry.archive_admission import AdmissionFinding, StageResult
 from dinkster_registry.archive_admission import run_manifest_admission as check_archive_manifest
-from dinkster_schema import claims_conflict
+from dinkster_schema import (
+    claims_conflict,
+    comfy_alias_registry_to_wire,
+    comfy_group_registry_to_wire,
+)
+from dinkster_workers.manifest import load_manifest
 from packaging.requirements import Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import canonicalize_name
@@ -75,6 +80,38 @@ def run_manifest_admission(
     assert result.data is not None
     metadata = result.data
     try:
+        manifest = load_manifest(root / "dinkster-pack.toml")
+        if manifest.publisher and manifest.publisher != publisher:
+            return StageResult(
+                (
+                    AdmissionFinding(
+                        "manifest.publisher-mismatch",
+                        "error",
+                        "block",
+                        "Manifest publisher differs from the authenticated publisher.",
+                    ),
+                )
+            )
+        if manifest.comfy_aliases is not None or manifest.comfy_groups is not None:
+            if publisher != "dinkster":
+                raise ValueError("translation records require the Dinkster publisher")
+            metadata["translations"] = [
+                {
+                    "name": pack_name,
+                    "version": release_version,
+                    "publisher": publisher,
+                    "aliases": (
+                        comfy_alias_registry_to_wire(manifest.comfy_aliases)
+                        if manifest.comfy_aliases is not None
+                        else None
+                    ),
+                    "groups": (
+                        comfy_group_registry_to_wire(manifest.comfy_groups)
+                        if manifest.comfy_groups is not None
+                        else None
+                    ),
+                }
+            ]
         pack = session.scalar(select(PackRecord).where(PackRecord.name == pack_name))
         if pack is not None and not rescan:
             conflict = session.scalar(

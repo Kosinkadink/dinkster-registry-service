@@ -10,11 +10,24 @@ import subprocess
 import threading
 import urllib.request
 import zipfile
+from datetime import UTC, datetime
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+from dinkster_schema import (
+    SCHEMA_WIRE_VERSION,
+    ComfyAliasConfidence,
+    ComfyAliasRecord,
+    ComfyAliasRegistry,
+    ComfyAliasSource,
+    ComfyAliasSourceSchema,
+    NodeSchema,
+    ReplacementCase,
+    ReplacementRule,
+    comfy_alias_registry_to_wire,
+)
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
@@ -25,6 +38,7 @@ from dinkster_registry_service.database import Database, NamespaceGrantRecord, R
 from dinkster_registry_service.digests import artifact_digest
 from dinkster_registry_service.indexes import StaticIndexes
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore
+from dinkster_registry_service.principals import PrincipalRepository
 from dinkster_registry_service.seed import FIXTURE_ROOT
 from dinkster_registry_service.settings import ServerSettings
 from dinkster_registry_service.wheels import WheelError, extracted_wheel, inspect_wheel
@@ -90,6 +104,22 @@ def test_library_is_identified_by_absence_of_manifest() -> None:
     assert wheel.library
     assert wheel.manifest_path is None
     assert wheel.imports == ("demo_nodes",)
+
+
+@pytest.mark.parametrize("library", (False, True))
+@pytest.mark.parametrize("tag", ("cp312-cp312-manylinux_2_17_x86_64", "py3-none-win_amd64"))
+def test_native_release_is_refused(library: bool, tag: str) -> None:
+    data = wheel_bytes(
+        library=library,
+        extra={
+            "demo_nodes-1.2.3.dist-info/WHEEL": (
+                f"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: {tag}\n"
+            ).encode()
+        },
+    )
+    with pytest.raises(WheelError) as error:
+        inspect_wheel(data, "demo-nodes", "1.2.3")
+    assert error.value.code == "wheel.platform-unsupported"
 
 
 @pytest.mark.parametrize(
@@ -165,12 +195,19 @@ def test_library_admission_static_download_collision_and_yank(tmp_path: Path) ->
             "pythonRequirements": ["demo-core>=2"],
         }
         assert detail.json()["nodes"] == []
+        versions = client.get("/v1/packs/demo-nodes/versions")
+        assert versions.status_code == 200
+        assert versions.json()["items"][0]["dinkster"] is None
+        assert versions.json()["items"][0]["license"] is None
         denied = client.put("/static/cpu/simple/demo-nodes/", content=b"changed")
         assert denied.status_code == 400
         assert denied.json()["error"]["code"] == "invalid_request"
         assert client.get("/static/cpu/simple/demo-nodes/").content == index.content
         assert client.get("/static/quarantine/uploads/secret").status_code == 404
         assert client.get("/static/translations/index.json").json()["items"] == []
+        assert client.get("/static/locales/index.json").json()["items"] == []
+        assert client.get("/static/schemas/index.json").json()["items"] == []
+        assert client.get("/static/packs/demo-nodes/1.2.3/schemas.json").status_code == 404
         conflict = service.submit(
             wheel_bytes(name="other-library", library=True),
             pack_name="other-library",
@@ -186,6 +223,123 @@ def test_library_admission_static_download_collision_and_yank(tmp_path: Path) ->
         assert wheel.filename not in client.get("/static/cpu/simple/demo-nodes/").text
         assert client.get("/static/packs/index.json").json()["items"] == []
     database.dispose()
+
+
+@pytest.mark.parametrize("publisher", (None, "dinkster"))
+def test_library_reserved_name_requires_authenticated_publisher(
+    tmp_path: Path, publisher: str | None
+) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'catalog.db'}")
+    store = LocalFilesystemObjectStore(tmp_path / "objects")
+    service = AdmissionService(database, store, require_isolation=False)
+    try:
+        if publisher is not None:
+            principals = PrincipalRepository(database)
+            principals.register_user("operator")
+            principals.register_publisher(publisher, "operator", datetime.now(UTC).isoformat())
+        candidate = service.submit(
+            wheel_bytes(name="dinkster-core", package="dinkster_core", library=True),
+            pack_name="dinkster-core",
+            version="1.2.3",
+            publisher=publisher,
+        )
+        assert service.run_once()
+        if publisher is None:
+            assert service.status(candidate).reason == "wheel.reserved-name"
+            with database.session() as session:
+                assert list(session.scalars(select(ReleaseRecord))) == []
+        else:
+            assert service.status(candidate).status == "accepted"
+    finally:
+        database.dispose()
+
+
+@pytest.mark.parametrize(
+    "publisher,carrier,declared_publisher",
+    [
+        ("dinkster", "example.resize", "dinkster"),
+        (None, "example.resize", ""),
+        (None, "example.resize", "dinkster"),
+        ("dinkster", "example.resize", "someone-else"),
+        ("dinkster", "example.missing", "dinkster"),
+    ],
+)
+def test_translation_records_require_publisher_and_valid_carrier(
+    tmp_path: Path, publisher: str | None, carrier: str, declared_publisher: str
+) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'catalog.db'}")
+    store = LocalFilesystemObjectStore(tmp_path / "objects")
+    service = AdmissionService(database, store, require_isolation=False)
+    source = tmp_path / "pack"
+    shutil.copytree(FIXTURE_ROOT / "example-pack", source)
+    manifest_path = source / "dinkster-pack.toml"
+    manifest_path.write_text(
+        manifest_path.read_text().replace(
+            'publisher = "dinkster"', f'publisher = "{declared_publisher}"'
+        )
+    )
+    alias = comfy_alias_registry_to_wire(
+        ComfyAliasRegistry(
+            source_schemas=(
+                ComfyAliasSourceSchema(NodeSchema(node_type="legacy.resize"), SCHEMA_WIRE_VERSION),
+            ),
+            records=(
+                ComfyAliasRecord(
+                    id="comfy_alias:legacy-pack/Resize",
+                    mapping_kind="op",
+                    carrier=carrier,
+                    source=ComfyAliasSource(
+                        "legacy-pack", "Resize", "legacy.resize", "fixture-revision"
+                    ),
+                    replacement=ReplacementRule("legacy.resize", (ReplacementCase(to=carrier),)),
+                    confidence=ComfyAliasConfidence("exact", ("fixture-evidence",)),
+                ),
+            ),
+        )
+    )
+    (source / "comfy-aliases.json").write_text(json.dumps(alias))
+    try:
+        if publisher is not None:
+            principals = PrincipalRepository(database)
+            principals.register_user("operator")
+            principals.register_publisher(publisher, "operator", datetime.now(UTC).isoformat())
+        candidate = service.submit(
+            build_registry_fixture_archive(source),
+            pack_name="example-pack",
+            version="1.2.3",
+            publisher=publisher,
+        )
+        assert service.run_once()
+        status = service.status(candidate)
+        if declared_publisher and declared_publisher != publisher:
+            assert status.reason == "manifest.publisher-mismatch"
+        elif publisher is None:
+            assert status.reason == "manifest.invalid"
+        elif carrier == "example.missing":
+            assert status.reason == "translations.invalid"
+        else:
+            assert status.status == "accepted", status
+            index = json.loads(store.read("static/translations/index.json"))
+            assert index == {
+                "schemaVersion": 1,
+                "items": [
+                    {
+                        "name": "example-pack",
+                        "version": "1.2.3",
+                        "publisher": "dinkster",
+                        "aliases": alias,
+                        "groups": None,
+                    }
+                ],
+            }
+            with database.session() as session, session.begin():
+                release = session.scalar(select(ReleaseRecord))
+                assert release is not None
+                release.state = "yanked"
+            StaticIndexes(database, store, "http://testserver").rebuild()
+            assert json.loads(store.read("static/translations/index.json"))["items"] == []
+    finally:
+        database.dispose()
 
 
 def test_static_only_pinned_install_imports_library_and_refuses_pack_requirement(
@@ -214,6 +368,9 @@ def test_static_only_pinned_install_imports_library_and_refuses_pack_requirement
         settings=ServerSettings(probe_package_index_url=f"{origin}/static/cpu/simple"),
     )
     try:
+        principals = PrincipalRepository(database)
+        principals.register_user("operator")
+        principals.register_publisher("dinkster", "operator", datetime.now(UTC).isoformat())
         library = wheel_bytes(name="demo-core", package="demo_core", library=True, requirements=())
         candidate = service.submit(library, pack_name="demo-core", version="1.2.3")
         assert service.run_once()
@@ -261,7 +418,11 @@ def test_static_only_pinned_install_imports_library_and_refuses_pack_requirement
             for variant in ("cpu", "cuda")
         }
         candidate = service.submit(
-            pack, pack_name="example-pack", version="1.2.3", locks=json.dumps(locks).encode()
+            pack,
+            pack_name="example-pack",
+            version="1.2.3",
+            publisher="dinkster",
+            locks=json.dumps(locks).encode(),
         )
         assert service.run_once()
         assert service.status(candidate).status == "accepted", service.status(candidate)

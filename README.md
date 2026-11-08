@@ -23,6 +23,9 @@ is `<import_package>/dinkster-pack.toml`; relative assets live beside it.
 `Requires-Dist` matches the manifest's `requires`. Standard WHEEL tags and
 RECORD hashes describe every installed file. The registry checks them before
 extracting or executing any publisher code. Admitted versions are immutable.
+Releases must be `py3-none-any`; other tags or non-pure wheels fail with
+`wheel.platform-unsupported`. Native release sets are tracked separately in
+[native wheel sets](https://github.com/Kosinkadink/comfy-vibe-station/issues/670).
 
 Named refusals include `wheel.distribution-name`, `wheel.import-name`,
 `wheel.pth-forbidden`, `wheel.entry-point-forbidden` (including console scripts),
@@ -36,6 +39,13 @@ same admission and simple index as packs. Shared code belongs in such a library,
 not a Python dependency on another pack. A distribution cannot switch between
 library and pack identity (`wheel.library-claims`). A types pack still has a
 manifest and is a pack, even when it has zero nodes.
+Reserved library names require the authenticated `dinkster` publisher
+(`wheel.reserved-name`). A declared manifest publisher must match the authenticated
+publisher (`manifest.publisher-mismatch`); declaring a name never grants authority.
+Alias and group records require the `dinkster` publisher, and their carriers and
+replacement references are checked against the probed schemas
+(`translations.invalid`). Libraries appear in the install index but not the schema,
+locale or translation catalogs.
 
 ## Static public indexes
 
@@ -194,9 +204,9 @@ the `example-pack` archive. It recomputes BLAKE3 over the response bytes and
 compares the result and byte count with the download ticket.
 
 The fixture seed is idempotent. Re-running the service keeps the same pack,
-release, digest, and object identities. The included fixture source archives
-are rootless, uncompressed ZIP files with sorted paths, ZIP epoch timestamps,
-0644 modes, and no links or extra fields.
+release, digest, and object identities. The included fixture wheels contain
+package-relative manifests and assets with standard METADATA, WHEEL and hashed
+RECORD files, sorted paths, fixed timestamps and no links.
 
 ## Release admission
 

@@ -86,8 +86,8 @@ class ReleaseSummary(ResponseModel):
     published_at: datetime
     artifact_digest: str
     artifact_size: int
-    dinkster: str
-    license: str
+    dinkster: str | None
+    license: str | None
     platforms: list[str]
     node_types: list[str]
     trust_summary: TrustSummary
