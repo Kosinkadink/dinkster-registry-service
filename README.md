@@ -577,12 +577,9 @@ CI runs these checks against PostgreSQL 16, starts the HTTP conformance runner,
 builds the container without dependency credentials, inspects image contents,
 runs the isolated probe under bubblewrap, and runs conformance against the image.
 
-The container also downloads and admits all 14 official packs pinned by
-`scripts/release-packs.lock`. This fixture names independently published registry
-versions and BLAKE3 digests, not ephemeral engine releases. The download check
-verifies public publisher ownership, release identity, size, archive digest and
-manifest identity before the full isolated admission check. Legacy manifests may
-omit a version; declared versions must match, as in ordinary admission. Fixture
-updates select published versions explicitly and commit their immutable digests;
-CI never follows latest versions. Engine release retention cannot delete these
-registry-owned artifacts, and no engine release asset publication is required.
+The container also admits the unchanged first-party wheel in `fixtures/wheels`,
+pinned by source commit, size and SHA-256 in `scripts/release-packs.lock`.
+It checks wheel identity before isolated admission, then verifies static artifact
+bytes and schema ids. The remote pack has an empty node catalog without a gateway;
+the separate isolated-probe fixture covers populated schemas. This replaces the
+withdrawn ZIP-release download check; CI does not depend on the live registry.

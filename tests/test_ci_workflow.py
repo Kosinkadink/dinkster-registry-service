@@ -26,8 +26,7 @@ def test_every_ci_job_uses_the_cpu_runner_contract_and_timeout() -> None:
     assert "DINKSTER_REPO_TOKEN" not in deployment
     assert "continue-on-error" not in source
     assert "gpu" not in source.lower()
-    assert "python scripts/check-release-packs.py /tmp/official-packs --download-only" in source
-    assert "python scripts/check-release-packs.py /tmp/official-packs'" in source
+    assert "python scripts/check-release-packs.py'" in source
 
 
 def test_postgres_uses_dynamic_loopback_ports_without_bridge_networks() -> None:

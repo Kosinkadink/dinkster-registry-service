@@ -26,6 +26,7 @@ from dinkster_schema import (
     schema_from_wire,
 )
 from dinkster_workers.manifest import load_manifest
+from packaging.requirements import Requirement
 from packaging.version import Version
 from sqlalchemy import and_, or_, select, text
 from sqlalchemy.orm import Session
@@ -1099,7 +1100,9 @@ class AdmissionService:
                         )
                 if not manifest.blocked and manifest.data is not None:
                     metadata = manifest.data
-                    if set(metadata["pythonRequirements"]) != set(wheel.requirements):
+                    if {Requirement(value) for value in metadata["pythonRequirements"]} != {
+                        Requirement(value) for value in wheel.requirements
+                    }:
                         manifest = StageResult(
                             (
                                 AdmissionFinding(

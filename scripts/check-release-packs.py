@@ -1,22 +1,26 @@
-"""Admit pinned official ZIPs from the independently published pack registry."""
+"""Admit an unchanged first-party wheel through the isolated production probe."""
 
 from __future__ import annotations
 
-import argparse
+import hashlib
 import json
 import os
 import subprocess
 import sys
-import tomllib
-import urllib.request
-import zipfile
 from pathlib import Path
 
-from dinkster_registry_service.digests import artifact_digest
-from dinkster_registry_service.identifiers import require_canonical_pack_name
-from dinkster_registry_service.versioning import require_public_version
+from dinkster_registry_service.wheels import inspect_wheel
 
-REGISTRY_URL = "https://registry.dinkster.org"
+
+def verify_fixture(directory: Path, lock: dict[str, object]) -> Path:
+    wheel = directory / str(lock["filename"])
+    data = wheel.read_bytes()
+    assert len(data) == lock["size"], "fixture size mismatch"
+    assert hashlib.sha256(data).hexdigest() == lock["sha256"], "fixture hash mismatch"
+    inspected = inspect_wheel(data, str(lock["name"]), str(lock["version"]))
+    assert inspected.filename == wheel.name
+    assert not inspected.library
+    return wheel
 
 
 def cli(*arguments: str) -> str:
@@ -26,102 +30,41 @@ def cli(*arguments: str) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("directory", type=Path)
-    parser.add_argument("--download-only", action="store_true")
-    args = parser.parse_args()
-    directory = args.directory
-    if args.download_only:
-        directory.mkdir(parents=True, exist_ok=True)
-    lock = json.loads(Path(__file__).with_name("release-packs.lock").read_bytes())
-    assert lock["format"] == "dinkster.lock/1"
-    packs = lock["packs"]
-    assert len(packs) == 14
-    assert len({pack["pack"] for pack in packs}) == 14
-    pending = {}
-    for pack in packs:
-        name = require_canonical_pack_name(pack["pack"])
-        version = require_public_version(pack["version"])
-        assert pack["publisher"] == "dinkster"
-        assert pack["source"] == f"registry:{REGISTRY_URL}"
-        archive = directory / f"{name}-{version}.zip"
-        if args.download_only:
-            with urllib.request.urlopen(f"{REGISTRY_URL}/v1/packs/{name}", timeout=60) as response:
-                owner = json.load(response)
-            assert owner["name"] == name and owner["owner"]["slug"] == pack["publisher"], name
-            with urllib.request.urlopen(
-                f"{REGISTRY_URL}/v1/packs/{name}/versions/{version}", timeout=60
-            ) as response:
-                release = json.load(response)
-            assert release["packName"] == name and release["version"] == version, name
-            assert release["state"] == "active", name
-            assert release["artifact"]["digest"] == pack["artifactDigest"], name
-            with urllib.request.urlopen(
-                f"{REGISTRY_URL}/v1/artifacts/{pack['artifactDigest']}", timeout=60
-            ) as response:
-                data = response.read()
-            assert len(data) == release["artifact"]["size"], name
-            archive.write_bytes(data)
-        assert artifact_digest(archive.read_bytes()) == pack["artifactDigest"], name
-        with zipfile.ZipFile(archive) as source:
-            manifest = tomllib.loads(source.read("dinkster-pack.toml").decode())
-        assert manifest["pack"]["name"] == name, name
-        if "version" in manifest["pack"]:
-            assert manifest["pack"]["version"] == version, name
-        assert manifest["pack"]["publisher"] == pack["publisher"], name
-        dependencies = set(manifest["pack"].get("dependencies", {}))
-        pending[name] = (pack, archive, dependencies)
-        print(f"verified {name} {version} {pack['artifactDigest']}", flush=True)
-    if args.download_only:
-        return
     assert os.environ.get("DINKSTER_DATABASE_URL"), "a disposable migrated database is required"
+    lock = json.loads(Path(__file__).with_name("release-packs.lock").read_bytes())
+    wheel = verify_fixture(Path("fixtures/wheels"), lock)
     cli("admin", "add-user", "release-check")
     cli("admin", "add-publisher", "dinkster", "--owner", "release-check")
-    completed: set[str] = set()
-    failures = []
-    while pending:
-        available = sorted(name for name, (_, _, deps) in pending.items() if deps <= completed)
-        assert available, f"unresolved release dependencies: {sorted(pending)}"
-        for name in available:
-            pack, archive, _ = pending.pop(name)
-            candidate = cli(
-                "submit",
-                str(archive),
-                "--pack",
-                name,
-                "--version",
-                pack["version"],
-                "--publisher",
-                "dinkster",
-                "--submitted-by",
-                "release-check",
-            )
-            for _ in range(4):
-                cli("scanner", "--once")
-                status = json.loads(cli("status", candidate))
-                if status["status"] in {"accepted", "rejected", "review"}:
-                    break
-            result = {
-                "pack": name,
-                "version": pack["version"],
-                "status": status["status"],
-                "reason": status["reason"],
-                "digest": status["digest"],
-                "lockDigestMatches": status["digest"] == pack["artifactDigest"],
-                "blockingCodes": sorted(
-                    {
-                        finding["code"]
-                        for finding in status["findings"]
-                        if finding["effect"] == "block"
-                    }
-                ),
-            }
-            completed.add(name)
-            print(json.dumps(result, sort_keys=True), flush=True)
-            if status["status"] != "accepted" or not result["lockDigestMatches"]:
-                failures.append(result)
-    assert len(completed) == 14
-    assert not failures, failures
+    candidate = cli(
+        "submit",
+        str(wheel),
+        "--pack",
+        lock["name"],
+        "--version",
+        lock["version"],
+        "--publisher",
+        "dinkster",
+        "--submitted-by",
+        "release-check",
+    )
+    for _ in range(4):
+        cli("scanner", "--once")
+        status = json.loads(cli("status", candidate))
+        if status["status"] in {"accepted", "rejected", "review"}:
+            break
+    print(json.dumps(status, sort_keys=True), flush=True)
+    assert status["status"] == "accepted", status
+    root = Path(os.environ["DINKSTER_OBJECT_STORE_ROOT"])
+    (entry,) = json.loads((root / "static/packs/index.json").read_bytes())["items"]
+    (published,) = entry["wheels"]
+    assert (entry["name"], entry["version"]) == (lock["name"], lock["version"])
+    assert published["sha256"] == lock["sha256"]
+    assert (root / "static" / published["url"]).read_bytes() == wheel.read_bytes()
+    schemas = json.loads(
+        (root / f"static/packs/{lock['name']}/{lock['version']}/schemas.json").read_bytes()
+    )["schemas"]
+    assert sorted(item["nodeType"] for item in schemas) == lock["nodeTypes"]
+    print(f"accepted real wheel with {len(schemas)} node schemas", flush=True)
 
 
 if __name__ == "__main__":
