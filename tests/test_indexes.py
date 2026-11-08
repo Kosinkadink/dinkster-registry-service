@@ -182,6 +182,80 @@ def test_static_schemas_match_dynamic_routes_and_select_current_first_party_rele
     assert client.get("/static/packs/example-pack/2.0.0/schemas.json").status_code == 200
 
 
+def test_replacements_keep_first_party_alternatives_and_complete_group_rules(
+    seeded_catalog: tuple[Database, LocalFilesystemObjectStore], client: TestClient
+) -> None:
+    database, store = seeded_catalog
+    rule = {
+        "from": "deprecated.resize",
+        "cases": [
+            {
+                "to": "example.resize",
+                "when": {"kind": "valueEquals", "input": "mode", "value": "image"},
+            },
+            {
+                "to": "example.resize",
+                "when": {"kind": "valueEquals", "input": "mode", "value": "mask"},
+            },
+        ],
+    }
+    with database.session() as session, session.begin():
+        session.add(PublisherRecord(id="dinkster", display_name="Dinkster"))
+        session.flush()
+        for pack in session.scalars(select(PackRecord)):
+            release = session.scalar(select(ReleaseRecord).where(ReleaseRecord.pack_id == pack.id))
+            assert release is not None
+            session.add(
+                ReleaseRecord(
+                    **{
+                        column.name: getattr(release, column.name)
+                        for column in ReleaseRecord.__table__.columns
+                        if column.name not in {"id", "version", "version_key", "manifest"}
+                    },
+                    id=uuid7(),
+                    version="3.0.0",
+                    version_key="3.0.0",
+                    manifest={
+                        **release.manifest,
+                        "translations": [
+                            {
+                                "groups": {
+                                    "records": [{"carrier": "example.resize", "replacement": rule}]
+                                }
+                            }
+                        ],
+                    },
+                )
+            )
+            if pack.name == "example-pack":
+                pack.publisher_id = "dinkster"
+    indexes = StaticIndexes(database, store, "http://testserver")
+    indexes.rebuild()
+    first = {
+        "pack": "example-pack",
+        "version": "3.0.0",
+        "target": "example.resize",
+        "rule": rule,
+    }
+    assert client.get("/static/replacements/index.json").json()["items"] == [
+        {"from": "deprecated.resize", "candidates": [first]}
+    ]
+    with database.session() as session, session.begin():
+        other_pack = session.scalar(select(PackRecord).where(PackRecord.name == "color-tools"))
+        assert other_pack is not None
+        other_pack.publisher_id = "dinkster"
+    indexes.rebuild()
+    assert client.get("/static/replacements/index.json").json()["items"] == [
+        {
+            "from": "deprecated.resize",
+            "candidates": [
+                {**first, "pack": "color-tools"},
+                first,
+            ],
+        }
+    ]
+
+
 def test_index_retry_repairs_partial_publication(database: Database, tmp_path: Path) -> None:
     class FailingStore(LocalFilesystemObjectStore):
         fail = True
