@@ -144,6 +144,13 @@ def test_library_admission_static_download_collision_and_yank(tmp_path: Path) ->
         entry = client.get("/static/packs/index.json").json()["items"][0]
         assert entry["sha256"] == wheel.sha256
         assert client.get("/static/" + entry["url"]).content == data
+        detail = client.get("/v1/packs/demo-nodes/versions/1.2.3")
+        assert detail.status_code == 200
+        assert detail.json()["manifest"] == {
+            "kind": "library",
+            "pythonRequirements": ["demo-core>=2"],
+        }
+        assert detail.json()["nodes"] == []
         denied = client.put("/static/cpu/simple/demo-nodes/", content=b"changed")
         assert denied.status_code == 400
         assert denied.json()["error"]["code"] == "invalid_request"

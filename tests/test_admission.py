@@ -20,11 +20,8 @@ from uuid import UUID
 import pytest
 from dinkster_registry.archive_admission import (
     StageResult,
-    extracted_archive,
     run_doctor_static,
     run_executable_probe,
-    run_fast_security,
-    run_ingest_integrity,
 )
 from dinkster_workers.sandbox import ProbeJail
 from fastapi.testclient import TestClient
@@ -50,6 +47,12 @@ from dinkster_registry_service.object_store import LocalFilesystemObjectStore, O
 from dinkster_registry_service.principals import PrincipalRepository
 from dinkster_registry_service.seed import FIXTURE_ROOT, seed_fixtures
 from dinkster_registry_service.settings import ServerSettings
+from dinkster_registry_service.wheels import (
+    extracted_wheel,
+    inspect_wheel,
+    run_wheel_integrity,
+    run_wheel_security,
+)
 
 
 def _fixture_source(tmp_path: Path, name: str = "example-pack") -> Path:
@@ -65,8 +68,13 @@ def _fixture_source(tmp_path: Path, name: str = "example-pack") -> Path:
     return source
 
 
-def _archive(tmp_path: Path, name: str = "example-pack") -> bytes:
-    return build_registry_fixture_archive(_fixture_source(tmp_path, name))
+def _archive(tmp_path: Path, name: str = "example-pack", version: str = "1.2.3") -> bytes:
+    source = _fixture_source(tmp_path, name)
+    manifest = source / "dinkster-pack.toml"
+    manifest.write_text(
+        manifest.read_text().replace("[pack]\n", f'[pack]\nversion = "{version}"\nengine = ">=0"\n')
+    )
+    return build_registry_fixture_archive(source)
 
 
 def _service(
@@ -115,13 +123,15 @@ def test_mandatory_stage_functions_accept_the_registry_fixture(
     database: Database, tmp_path: Path
 ) -> None:
     archive = _archive(tmp_path)
-    assert not run_ingest_integrity(archive, len(archive), artifact_digest(archive)).blocked
-    with extracted_archive(archive) as root:
+    assert not run_wheel_integrity(
+        archive, len(archive), artifact_digest(archive), "example-pack", "1.2.3"
+    ).blocked
+    with extracted_wheel(archive, inspect_wheel(archive, "example-pack", "1.2.3")) as root:
         with database.session() as session:
             manifest = run_manifest_admission(root, "example-pack", "1.2.3", session)
         doctor = run_doctor_static(root)
         probe = run_executable_probe(root, require_isolation=False)
-    security = run_fast_security(archive)
+    security = run_wheel_security(archive)
     assert not manifest.blocked
     assert not doctor.blocked
     assert not probe.blocked
@@ -558,7 +568,7 @@ def test_malformed_zip_rejects(database: Database, tmp_path: Path) -> None:
     service = _service(database, tmp_path)
     data = b"not a zip archive"
     candidate_id = service.submit(data, pack_name="broken-pack", version="1.0")
-    _assert_rejected(service, candidate_id, "integrity.invalid-archive")
+    _assert_rejected(service, candidate_id, "wheel.required")
 
 
 def test_path_traversal_entry_rejects(database: Database, tmp_path: Path) -> None:
@@ -575,31 +585,27 @@ def test_path_traversal_entry_rejects(database: Database, tmp_path: Path) -> Non
             archive.writestr(info, payload)
     service = _service(database, tmp_path)
     candidate_id = service.submit(output.getvalue(), pack_name="unsafe-pack", version="1.0")
-    _assert_rejected(service, candidate_id, "integrity.invalid-archive")
+    _assert_rejected(service, candidate_id, "wheel.invalid")
 
 
 @pytest.mark.parametrize(
-    ("submitted_name", "submitted_version", "accepted"),
-    (("other-pack", "1.2.3", False), ("example-pack", "1.2.4", True)),
+    ("submitted_name", "submitted_version", "code"),
+    (
+        ("other-pack", "1.2.3", "wheel.distribution-name"),
+        ("example-pack", "1.2.4", "wheel.invalid"),
+    ),
 )
-def test_manifest_name_matches_and_submission_owns_version(
+def test_wheel_name_and_version_match_submission(
     database: Database,
     tmp_path: Path,
     submitted_name: str,
     submitted_version: str,
-    accepted: bool,
+    code: str,
 ) -> None:
     service = _service(database, tmp_path)
     archive = _archive(tmp_path)
     candidate_id = service.submit(archive, pack_name=submitted_name, version=submitted_version)
-    if accepted:
-        assert service.run_once()
-        assert service.status(candidate_id).status == "accepted"
-        with database.session() as session:
-            release = session.scalar(select(ReleaseRecord))
-            assert release is not None and release.version == submitted_version
-    else:
-        _assert_rejected(service, candidate_id, "manifest.invalid")
+    _assert_rejected(service, candidate_id, code)
 
 
 @pytest.mark.parametrize("submitted_version", ("1.2.3", "1.2.4"))
@@ -618,7 +624,7 @@ def test_declared_pack_version_matches_submission_and_retains_engine_range(
         version=submitted_version,
     )
     if submitted_version != "1.2.3":
-        _assert_rejected(service, candidate_id, "manifest.invalid")
+        _assert_rejected(service, candidate_id, "wheel.invalid")
         return
     assert service.run_once()
     assert service.status(candidate_id).status == "accepted"
@@ -653,7 +659,7 @@ def test_official_claims_require_registry_publisher_and_keep_exact_ids(
     candidate_id = service.submit(
         build_registry_fixture_archive(source),
         pack_name="official-pack",
-        version="2.0",
+        version="1.2.3",
         publisher=publisher,
     )
     if publisher is None:
@@ -694,7 +700,7 @@ def test_namespace_overlap_is_exclusive_to_a_publisher(
         candidate = service.submit(
             build_registry_fixture_archive(source),
             pack_name=name,
-            version="1.0",
+            version="1.2.3",
             publisher=owner,
         )
         assert service.run_once()
@@ -739,7 +745,7 @@ def test_promotion_rechecks_namespace_grants_after_both_candidates_scan(
         candidate = service.submit(
             build_registry_fixture_archive(source),
             pack_name=name,
-            version="1.0",
+            version="1.2.3",
             publisher=owner,
         )
         assert service.run_once()
@@ -780,7 +786,7 @@ def test_duplicate_semantic_version_rejects(database: Database, tmp_path: Path) 
     store = LocalFilesystemObjectStore(tmp_path / "objects")
     seed_fixtures(database, store)
     service = AdmissionService(database, store, require_isolation=False)
-    archive = _archive(tmp_path)
+    archive = _archive(tmp_path, version="1.2.3.0")
     candidate_id = service.submit(archive, pack_name="example-pack", version="1.2.3.0")
     _assert_rejected(service, candidate_id, "manifest.invalid")
     with database.session() as session:
@@ -818,14 +824,16 @@ def test_active_development_dependency_must_satisfy_version_bounds(
     database: Database, tmp_path: Path, version: str
 ) -> None:
     service = _service(database, tmp_path)
-    dependency = service.submit(_archive(tmp_path), pack_name="example-pack", version=version)
+    dependency = service.submit(
+        _archive(tmp_path, version=version), pack_name="example-pack", version=version
+    )
     assert service.run_once()
     assert service.status(dependency).status == "accepted"
     source = _fixture_source(tmp_path, "dependent-pack")
     manifest = source / "dinkster-pack.toml"
     manifest.write_text(manifest.read_text() + '\n[pack.dependencies]\nexample-pack = ">=1,<2"\n')
     candidate = service.submit(
-        build_registry_fixture_archive(source), pack_name="dependent-pack", version="1.0"
+        build_registry_fixture_archive(source), pack_name="dependent-pack", version="1.2.3"
     )
     assert service.run_once()
     status = service.status(candidate)
@@ -917,10 +925,12 @@ def test_unexpected_scanner_exception_becomes_block_finding(
     service = _service(database, tmp_path)
     candidate_id = service.submit(_archive(tmp_path), pack_name="example-pack", version="1.2.3")
 
-    def fail_integrity(data: bytes, declared_size: int, declared_digest: str) -> None:
+    def fail_integrity(
+        data: bytes, declared_size: int, declared_digest: str, name: str, version: str
+    ) -> None:
         raise RuntimeError("pack-controlled detail")
 
-    monkeypatch.setattr(admission_module, "run_ingest_integrity", fail_integrity)
+    monkeypatch.setattr(admission_module, "run_wheel_integrity", fail_integrity)
     assert service.run_once()
     status = service.status(candidate_id)
     assert (status.status, status.reason) == ("rejected", "scanner.unexpected-error")
@@ -1220,7 +1230,7 @@ def _assert_reviewed_rescan_decision(
         if not accepted:
             assert service.run_once()
         for key in ("packs/index.json", "locales/index.json"):
-            index = client.get(f"/{key}")
+            index = client.get(f"/static/{key}")
             assert index.status_code == 200
             assert [item["name"] for item in index.json()["items"]] == (
                 ["reviewed-rescan-pack"] if accepted else []

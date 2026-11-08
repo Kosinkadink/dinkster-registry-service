@@ -762,7 +762,8 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
                 )
             )
             with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
-                member = archive.getinfo(template["path"])
+                package = name.replace("-", "_").replace(".", "_")
+                member = archive.getinfo(f"{package}/{template['path']}")
                 if member.file_size > MAX_TEMPLATE_ASSET_SIZE:
                     raise ObjectStoreError("template asset exceeds its size limit")
                 data = archive.read(member)

@@ -1055,6 +1055,7 @@ class AdmissionService:
                     manifest = (
                         StageResult(
                             data={
+                                "kind": "library",
                                 "namespaces": [],
                                 "dependencies": [],
                                 "platforms": [],

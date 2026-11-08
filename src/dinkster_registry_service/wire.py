@@ -138,6 +138,11 @@ class ReleaseManifest(ResponseModel):
     node_source: Literal["remote-gateway-catalog"] | None = None
 
 
+class LibraryManifest(ResponseModel):
+    kind: Literal["library"]
+    python_requirements: list[str]
+
+
 class ReleaseNode(ResponseModel):
     node_type: str
     schema_version: int
@@ -230,7 +235,7 @@ class ReleaseDetail(ResponseModel):
     published_by: Publisher
     artifact: ArtifactMetadata
     install_locks: dict[str, InstallationLock] = Field(default_factory=dict)
-    manifest: ReleaseManifest
+    manifest: ReleaseManifest | LibraryManifest
     nodes: list[ReleaseNode]
     trust_signals: TrustSignals
     cloud: CloudEligibility

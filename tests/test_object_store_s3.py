@@ -93,9 +93,9 @@ def test_s3_store_is_immutable_and_streams_verified_objects(s3_store: S3ObjectSt
 
     with pytest.raises(ObjectStoreError, match="different bytes"):
         s3_store.put(key, b"replacement bytes")
-    s3_store.replace_index("packs/index.json", b'{"items":[]}')
-    s3_store.replace_index("packs/index.json", b'{"items":[1]}')
-    assert s3_store.read("packs/index.json") == b'{"items":[1]}'
+    s3_store.replace_index("static/packs/index.json", b'{"items":[]}')
+    s3_store.replace_index("static/packs/index.json", b'{"items":[1]}')
+    assert s3_store.read("static/packs/index.json") == b'{"items":[1]}'
     with pytest.raises(ObjectStoreError, match="only public static indexes"):
         s3_store.replace_index(key, b"replacement bytes")
     assert s3_store.read(key) == data
@@ -179,13 +179,13 @@ def test_accepted_publish_updates_both_s3_indexes_with_conditional_get(
         principals.register_publisher(publisher, "operator", datetime.now(UTC).isoformat())
     service = AdmissionService(database, s3_store, settings=settings, require_isolation=False)
     with TestClient(create_app(settings)) as client:
-        assert client.get("/packs/index.json").status_code == 404
+        assert client.get("/static/packs/index.json").status_code == 404
         candidate = service.submit(
             archive, pack_name="example-pack", version="1.2.3", publisher=publisher
         )
         assert service.run_once()
         assert service.status(candidate).status == "accepted"
-        schema_key = "packs/example-pack/1.2.3/schemas.json"
+        schema_key = "static/packs/example-pack/1.2.3/schemas.json"
         schemas = client.get(f"/{schema_key}")
         assert schemas.status_code == 200
         assert schemas.content == s3_store.read(schema_key)
@@ -202,7 +202,7 @@ def test_accepted_publish_updates_both_s3_indexes_with_conditional_get(
         metadata = s3_store._client.head_object(Bucket=s3_store.bucket, Key=schema_key)
         assert metadata["ContentType"] == "application/json"
         assert metadata["CacheControl"] == "public, max-age=60"
-        discovery = client.get("/schemas/index.json")
+        discovery = client.get("/static/schemas/index.json")
         assert discovery.status_code == 200
         if publisher is None:
             assert discovery.json() == {"schemaVersion": 1, "items": []}
@@ -214,15 +214,15 @@ def test_accepted_publish_updates_both_s3_indexes_with_conditional_get(
                     "version": "1.2.3",
                     "displayName": "Example Pack",
                     "platforms": ["darwin", "linux"],
-                    "url": schema_key,
+                    "url": schema_key.removeprefix("static/"),
                     "digest": "sha256:" + hashlib.sha256(schemas.content).hexdigest(),
                 }
             ]
         etags = {}
         for key in ("packs/index.json", "locales/index.json"):
-            response = client.get(f"/{key}")
+            response = client.get(f"/static/{key}")
             assert response.status_code == 200
-            assert response.content == s3_store.read(key)
+            assert response.content == s3_store.read(f"static/{key}")
             assert response.json()["schemaVersion"] == 1
             items = response.json()["items"]
             assert len(items) == 1
@@ -231,9 +231,9 @@ def test_accepted_publish_updates_both_s3_indexes_with_conditional_get(
                 "1.2.3",
                 artifact_digest(archive),
             )
-            assert client.get(items[0]["url"]).content == archive
+            assert client.get("/static/" + items[0]["url"]).content == archive
             etags[key] = response.headers["ETag"]
-            conditional = client.get(f"/{key}", headers={"If-None-Match": etags[key]})
+            conditional = client.get(f"/static/{key}", headers={"If-None-Match": etags[key]})
             assert conditional.status_code == 304
             assert conditional.content == b""
             if key == "locales/index.json":
@@ -245,19 +245,26 @@ def test_accepted_publish_updates_both_s3_indexes_with_conditional_get(
                     }
                 ]
         old_key = "translations/index.json"
-        s3_store.put(old_key, s3_store.read("locales/index.json"))
+        s3_store.put(old_key, s3_store.read("static/locales/index.json"))
         assert client.get(f"/{old_key}").status_code == 404
+        manifest = source / "dinkster-pack.toml"
+        manifest.write_text(
+            manifest.read_text().replace("[pack]\n", '[pack]\nversion = "1.2.4"\nengine = ">=0"\n')
+        )
         second = service.submit(
-            archive, pack_name="example-pack", version="1.2.4", publisher=publisher
+            build_registry_fixture_archive(source),
+            pack_name="example-pack",
+            version="1.2.4",
+            publisher=publisher,
         )
         assert service.run_once()
         assert service.status(second).status == "accepted"
         for key, etag in etags.items():
-            response = client.get(f"/{key}", headers={"If-None-Match": etag})
+            response = client.get(f"/static/{key}", headers={"If-None-Match": etag})
             assert response.status_code == 200
             assert [item["version"] for item in response.json()["items"]] == ["1.2.3", "1.2.4"]
         refreshed = client.get(
-            "/schemas/index.json", headers={"If-None-Match": discovery.headers["etag"]}
+            "/static/schemas/index.json", headers={"If-None-Match": discovery.headers["etag"]}
         )
         if publisher is None:
             assert refreshed.status_code == 304

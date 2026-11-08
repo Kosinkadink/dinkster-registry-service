@@ -108,10 +108,13 @@ class StaticIndexes:
                 raise ObjectStoreError("Admitted wheel does not match its SHA-256.")
             self.object_store.put(f"static/{wheel_key}", data)
             link = f"../../../{wheel_key}#sha256={wheel['sha256']}"
-            wheel_variants = variants if wheel["tags"] == ["py3-none-any"] else release.install_locks
+            wheel_variants = (
+                variants if wheel["tags"] == ["py3-none-any"] else release.install_locks
+            )
             for variant in wheel_variants:
                 projects[variant][pack.name].append(
-                    f'<a href="{html.escape(link, quote=True)}">{html.escape(wheel["filename"])}</a>'
+                    f'<a href="{html.escape(link, quote=True)}">'
+                    f'{html.escape(wheel["filename"])}</a>'
                 )
             locks = {}
             for variant, lock in release.install_locks.items():

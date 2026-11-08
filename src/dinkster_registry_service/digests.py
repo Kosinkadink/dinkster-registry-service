@@ -28,4 +28,4 @@ def artifact_digest(data: bytes) -> str:
 def artifact_object_key(digest: str) -> str:
     checked = require_blake3_digest(digest)
     hex_digest = checked.removeprefix(DIGEST_PREFIX)
-    return f"artifacts/blake3/{hex_digest[:2]}/{hex_digest}.dinksterpack.zip"
+    return f"artifacts/blake3/{hex_digest[:2]}/{hex_digest}.whl"
