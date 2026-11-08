@@ -33,6 +33,7 @@ from dinkster_registry_service.wire import (
     PackDetail,
     PackPage,
     ReleaseDetail,
+    ReleaseManifest,
     ReleasePage,
     SchemasResponse,
     SecurityBlocksResponse,
@@ -93,6 +94,7 @@ def test_pack_release_and_schema_contracts(client: TestClient) -> None:
     release_response = client.get("/v1/packs/example-pack/versions/1.2.3")
     release = ReleaseDetail.model_validate(release_response.json())
     assert release.artifact.digest == versions.items[0].artifact_digest
+    assert isinstance(release.manifest, ReleaseManifest)
     assert release.manifest.dinkster == ">=0.9rc1,<1"
     assert release.manifest.license == "Apache-2.0"
     assert release.cloud.registry_eligible

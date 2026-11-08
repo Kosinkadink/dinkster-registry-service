@@ -1074,7 +1074,8 @@ class AdmissionService:
                         )
                     )
                 if not manifest.blocked and manifest.data is not None:
-                    if set(manifest.data["pythonRequirements"]) != set(wheel.requirements):
+                    metadata = manifest.data
+                    if set(metadata["pythonRequirements"]) != set(wheel.requirements):
                         manifest = StageResult(
                             (
                                 AdmissionFinding(
@@ -1086,7 +1087,7 @@ class AdmissionService:
                             )
                         )
                     else:
-                        manifest.data["wheel"] = {
+                        metadata["wheel"] = {
                             "filename": wheel.filename,
                             "sha256": wheel.sha256,
                             "imports": list(wheel.imports),

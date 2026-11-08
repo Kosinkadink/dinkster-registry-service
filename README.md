@@ -62,7 +62,9 @@ Every accepted publish queues a durable rebuild of `packs/index.json` and
 attempts delivery. Both contain deterministic JSON with `schemaVersion: 1` and
 an `items` array of active public releases, ordered by pack name and version
 text. Each entry includes `name`, `version`, BLAKE3 `digest`, byte `size`, and
-the artifact download `url`. Locale entries also contain `catalogs`, an
+the artifact download `url`. `publisher` is the authenticated publisher id
+(null for operator submissions without a publisher); `engine` is the manifest's
+engine compatibility range (null for libraries). Locale entries also contain `catalogs`, an
 array of locale, SHA-256 digest, and path within the same wheel. An empty array
 means the release carries no locale catalog. Quarantine queues a rebuild to
 remove the release from both lists.

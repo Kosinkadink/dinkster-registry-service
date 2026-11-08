@@ -126,6 +126,8 @@ class StaticIndexes:
             entry = {
                 "name": pack.name,
                 "version": release.version,
+                "publisher": pack.publisher_id,
+                "engine": None if wheel["library"] else release.manifest["dinkster"],
                 "digest": artifact.digest,
                 "size": artifact.size,
                 "url": wheel_key,
