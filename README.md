@@ -71,13 +71,26 @@ Every accepted publish queues a durable rebuild of `packs/index.json` and
 `locales/index.json` in the configured object store and immediately
 attempts delivery. Both contain deterministic JSON with `schemaVersion: 1` and
 an `items` array of active public releases, ordered by pack name and version
-text. Each entry includes `name`, `version`, BLAKE3 `digest`, byte `size`, and
-the artifact download `url`. `publisher` is the authenticated publisher id
+text. Each entry includes `name`, `version` and a `wheels` array. Each wheel has
+`filename`, whole-file `sha256`, BLAKE3 `digest`, byte `size`, prefix-relative
+download `url` and `tags` (currently `["py3-none-any"]`). These artifact fields
+exist only in `wheels`, never on the release item. `publisher` is the authenticated publisher id
 (null for operator submissions without a publisher); `engine` is the manifest's
 engine compatibility range (null for libraries). Locale entries also contain `catalogs`, an
 array of locale, SHA-256 digest, and path within the same wheel. An empty array
 means the release carries no locale catalog. Quarantine queues a rebuild to
 remove the release from both lists.
+
+`/static/replacements/index.json` contains `schemaVersion: 1` and `items`, with
+one item per migrated `from` type: `{"from":"old.type","candidates":[...]}`.
+Each candidate has `pack`, `version`, `target` (carrier node id), and `rule`
+(the unchanged canonical replacement rule, including its conditions and cases).
+Only the latest active public release of each first-party pack contributes.
+Native schema replacements, alias records and group records contribute; aliases
+are searchable by their source node type and ComfyUI class name. Multiple packs
+may migrate the same source, so candidates are retained rather than silently
+choosing a winner. Targets and their interfaces come from the corresponding
+per-pack schema file. Yank and quarantine rebuild the index without those releases.
 
 The same rebuild writes `packs/<name>/<version>/schemas.json` for every public
 active or yanked release. These are the admission probe's stored wire schemas,

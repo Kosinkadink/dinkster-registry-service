@@ -66,9 +66,22 @@ def test_static_schemas_match_dynamic_routes_and_select_current_first_party_rele
                         **{
                             column.name: getattr(node, column.name)
                             for column in ReleaseNodeRecord.__table__.columns
-                            if column.name != "release_id"
+                            if column.name not in {"release_id", "schema"}
                         },
                         release_id=release.id,
+                        schema={
+                            **node.schema,
+                            "replacements": (
+                                [
+                                    {
+                                        "from": "example.deprecated",
+                                        "cases": [{"to": "example.resize"}],
+                                    }
+                                ]
+                                if node.node_type == "example.resize"
+                                else []
+                            ),
+                        },
                     )
                 )
     indexes = StaticIndexes(database, store, "http://testserver")
@@ -94,6 +107,23 @@ def test_static_schemas_match_dynamic_routes_and_select_current_first_party_rele
             }
         ],
     }
+    replacement_items = client.get("/static/replacements/index.json").json()["items"]
+    assert replacement_items == [
+        {
+            "from": "example.deprecated",
+            "candidates": [
+                {
+                    "pack": "example-pack",
+                    "version": "1.10.0",
+                    "target": "example.resize",
+                    "rule": {
+                        "from": "example.deprecated",
+                        "cases": [{"to": "example.resize"}],
+                    },
+                }
+            ],
+        }
+    ]
     for version in ("1.2.3", "1.9.0", "1.10.0", "2.0.0"):
         path = f"/static/packs/example-pack/{version}/schemas.json"
         static = client.get(path)
@@ -104,7 +134,11 @@ def test_static_schemas_match_dynamic_routes_and_select_current_first_party_rele
     # Third-party schemas are mirrored, but are not first-party search entries.
     third_party = client.get("/static/packs/color-tools/0.4.0/schemas.json")
     assert third_party.content == client.get("/v1/packs/color-tools/versions/0.4.0/schemas").content
-    for path in ("/static/schemas/index.json", "/static/packs/example-pack/1.10.0/schemas.json"):
+    for path in (
+        "/static/schemas/index.json",
+        "/static/replacements/index.json",
+        "/static/packs/example-pack/1.10.0/schemas.json",
+    ):
         static = client.get(path)
         head = client.head(path)
         assert head.status_code == 200 and head.content == b""
@@ -132,6 +166,10 @@ def test_static_schemas_match_dynamic_routes_and_select_current_first_party_rele
         current.state = "quarantined"
     indexes.rebuild()
     assert client.get("/static/schemas/index.json").json()["items"][0]["version"] == "1.9.0"
+    assert (
+        client.get("/static/replacements/index.json").json()["items"][0]["candidates"][0]["version"]
+        == "1.9.0"
+    )
     assert client.get("/static/packs/example-pack/1.10.0/schemas.json").status_code == 404
     assert not store.exists("static/packs/example-pack/1.10.0/schemas.json")
     with database.session() as session, session.begin():

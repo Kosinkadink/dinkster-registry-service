@@ -185,9 +185,12 @@ def test_library_admission_static_download_collision_and_yank(tmp_path: Path) ->
         assert f"#sha256={wheel.sha256}" in index.text
         assert index.text.count(f">{wheel.filename}</a>") == 1
         entry = client.get("/static/packs/index.json").json()["items"][0]
-        assert entry["sha256"] == wheel.sha256
+        assert not {"filename", "sha256", "url", "size", "digest"}.intersection(entry)
+        assert len(entry["wheels"]) == 1
+        assert entry["wheels"][0]["sha256"] == wheel.sha256
+        assert entry["wheels"][0]["tags"] == ["py3-none-any"]
         assert entry["engine"] is None
-        assert client.get("/static/" + entry["url"]).content == data
+        assert client.get("/static/" + entry["wheels"][0]["url"]).content == data
         detail = client.get("/v1/packs/demo-nodes/versions/1.2.3")
         assert detail.status_code == 200
         assert detail.json()["manifest"] == {
@@ -332,12 +335,38 @@ def test_translation_records_require_publisher_and_valid_carrier(
                     }
                 ],
             }
+            expected_rule = {"from": "legacy.resize", "cases": [{"to": "example.resize"}]}
+            app = create_app(
+                ServerSettings(
+                    database_url=f"sqlite:///{tmp_path / 'catalog.db'}",
+                    object_store_root=store.root,
+                )
+            )
+            with TestClient(app) as client:
+                assert client.get("/static/replacements/index.json").json() == {
+                    "schemaVersion": 1,
+                    "items": [
+                        {
+                            "from": source_type,
+                            "candidates": [
+                                {
+                                    "pack": "example-pack",
+                                    "version": "1.2.3",
+                                    "target": "example.resize",
+                                    "rule": expected_rule,
+                                }
+                            ],
+                        }
+                        for source_type in ("Resize", "legacy.resize")
+                    ],
+                }
             with database.session() as session, session.begin():
                 release = session.scalar(select(ReleaseRecord))
                 assert release is not None
                 release.state = "yanked"
             StaticIndexes(database, store, "http://testserver").rebuild()
             assert json.loads(store.read("static/translations/index.json"))["items"] == []
+            assert json.loads(store.read("static/replacements/index.json"))["items"] == []
     finally:
         database.dispose()
 
@@ -442,9 +471,11 @@ def test_static_only_pinned_install_imports_library_and_refuses_pack_requirement
         dependency = json.loads(lock_bytes)["packages"][0]
         assert (dependency["name"], dependency["version"]) == ("demo-core", "1.2.3")
         pinned_wheel = dependency["wheels"][0]
+        pack_wheel = next(w for w in entry["wheels"] if w["tags"] == ["py3-none-any"])
         pins = tmp_path / "requirements.txt"
         pins.write_text(
-            f"{entry['name']} @ {origin}/static/{entry['url']} --hash=sha256:{entry['sha256']}\n"
+            f"{entry['name']} @ {origin}/static/{pack_wheel['url']} "
+            f"--hash=sha256:{pack_wheel['sha256']}\n"
             f"{dependency['name']} @ {pinned_wheel['url']} --hash=sha256:{pinned_wheel['sha256']}\n"
         )
         environment = tmp_path / "environment"

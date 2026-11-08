@@ -234,12 +234,13 @@ def test_accepted_publish_updates_both_s3_indexes_with_conditional_get(
             assert response.json()["schemaVersion"] == 1
             items = response.json()["items"]
             assert len(items) == 1
-            assert (items[0]["name"], items[0]["version"], items[0]["digest"]) == (
+            wheel = items[0]["wheels"][0]
+            assert (items[0]["name"], items[0]["version"], wheel["digest"]) == (
                 "example-pack",
                 "1.2.3",
                 artifact_digest(archive),
             )
-            assert client.get("/static/" + items[0]["url"]).content == archive
+            assert client.get("/static/" + wheel["url"]).content == archive
             etags[key] = response.headers["ETag"]
             conditional = client.get(f"/static/{key}", headers={"If-None-Match": etags[key]})
             assert conditional.status_code == 304

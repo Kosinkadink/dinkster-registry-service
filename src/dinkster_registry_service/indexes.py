@@ -66,6 +66,7 @@ class StaticIndexes:
         locales = []
         translations = []
         schemas: dict[str, dict[str, object]] = {}
+        replacements_by_pack: dict[str, list[dict[str, object]]] = {}
         variants = {
             "cpu",
             *(variant for _, release, _ in rows for variant in release.install_locks),
@@ -104,6 +105,33 @@ class StaticIndexes:
                         "url": relative_schema_key,
                         "digest": "sha256:" + hashlib.sha256(body).hexdigest(),
                     }
+                    rules = [
+                        (rule["from"], item["nodeType"], rule)
+                        for item in json.loads(body)["schemas"]
+                        for rule in item["schema"].get("replacements", [])
+                    ]
+                    for translation in release.manifest.get("translations", []):
+                        for kind in ("aliases", "groups"):
+                            registry = translation.get(kind)
+                            if registry is None:
+                                continue
+                            for record in registry["records"]:
+                                rule = record["replacement"]
+                                rules.append((rule["from"], record["carrier"], rule))
+                                if kind == "aliases":
+                                    source = record["source"]["nodeClass"]
+                                    if source != rule["from"]:
+                                        rules.append((source, record["carrier"], rule))
+                    replacements_by_pack[pack.name] = [
+                        {
+                            "from": source,
+                            "pack": pack.name,
+                            "version": release.version,
+                            "target": target,
+                            "rule": rule,
+                        }
+                        for source, target, rule in rules
+                    ]
             if wheel is None:
                 continue
             wheel_key = f"wheels/{wheel['sha256']}/{wheel['filename']}"
@@ -132,11 +160,16 @@ class StaticIndexes:
                 "version": release.version,
                 "publisher": pack.publisher_id,
                 "engine": None if wheel["library"] else release.manifest["dinkster"],
-                "digest": artifact.digest,
-                "size": artifact.size,
-                "url": wheel_key,
-                "filename": wheel["filename"],
-                "sha256": wheel["sha256"],
+                "wheels": [
+                    {
+                        "digest": artifact.digest,
+                        "size": artifact.size,
+                        "url": wheel_key,
+                        "filename": wheel["filename"],
+                        "sha256": wheel["sha256"],
+                        "tags": wheel["tags"],
+                    }
+                ],
                 "library": wheel["library"],
                 "installLocks": locks,
                 "requires": release.manifest.get("pythonRequirements", []),
@@ -161,11 +194,26 @@ class StaticIndexes:
                 "<!doctype html>\n<html><body>\n" + "\n".join(root_links) + "\n</body></html>\n"
             ).encode("ascii")
             self.object_store.replace_index(f"static/{variant}/simple/index.html", root)
+        replacements: dict[str, list[dict[str, object]]] = {}
+        for entries in replacements_by_pack.values():
+            for entry in entries:
+                source = str(entry["from"])
+                candidate = {key: value for key, value in entry.items() if key != "from"}
+                choices = replacements.setdefault(source, [])
+                if candidate not in choices:
+                    choices.append(candidate)
         for key, items in (
             ("packs/index.json", packs),
             ("locales/index.json", locales),
             ("schemas/index.json", list(schemas.values())),
             ("translations/index.json", translations),
+            (
+                "replacements/index.json",
+                [
+                    {"from": source, "candidates": choices}
+                    for source, choices in sorted(replacements.items())
+                ],
+            ),
         ):
             data = json.dumps(
                 {"schemaVersion": 1, "items": items},
