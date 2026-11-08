@@ -115,9 +115,11 @@ def _verify_record(files: dict[str, bytes], dist_info: str) -> None:
         algorithm, separator, encoded = digest.partition("=")
         if not separator or algorithm not in {"sha256", "sha384", "sha512"}:
             raise _invalid("Every wheel file requires a secure RECORD hash.")
-        expected = base64.urlsafe_b64encode(
-            hashlib.new(algorithm, files[path]).digest()
-        ).rstrip(b"=").decode("ascii")
+        expected = (
+            base64.urlsafe_b64encode(hashlib.new(algorithm, files[path]).digest())
+            .rstrip(b"=")
+            .decode("ascii")
+        )
         if encoded != expected or size != str(len(files[path])):
             raise _invalid(f"Wheel RECORD does not match {path!r}.")
     unsigned = set(files) - {f"{dist_info}/RECORD.jws", f"{dist_info}/RECORD.p7s"}
@@ -168,12 +170,19 @@ def _inspect_wheel(data: bytes, name: str, version: str) -> Wheel:
         raise _invalid("Wheel must declare compatibility tags.")
     build = str(wheel.get("Build", ""))
     filename = f"{distribution}-{version}-" + (f"{build}-" if build else "")
-    filename += "-".join(
-        ".".join(sorted({getattr(tag, field) for tag in tags}))
-        for field in ("interpreter", "abi", "platform")
-    ) + ".whl"
+    filename += (
+        "-".join(
+            ".".join(sorted({getattr(tag, field) for tag in tags}))
+            for field in ("interpreter", "abi", "platform")
+        )
+        + ".whl"
+    )
     parsed_name, parsed_version, _, parsed_tags = parse_wheel_filename(filename)
-    if parsed_name != canonicalize_name(name) or parsed_version != Version(version) or parsed_tags != tags:
+    if (
+        parsed_name != canonicalize_name(name)
+        or parsed_version != Version(version)
+        or parsed_tags != tags
+    ):
         raise _invalid("Wheel tags cannot be represented by its filename.")
     _verify_record(files, dist_info)
     imports: set[str] = set()
@@ -205,8 +214,14 @@ def _inspect_wheel(data: bytes, name: str, version: str) -> Wheel:
     for requirement in requirements:
         Requirement(requirement)
     return Wheel(
-        name, version, filename, hashlib.sha256(data).hexdigest(), tuple(sorted(imports)),
-        requirements, manifest_path, tags,
+        name,
+        version,
+        filename,
+        hashlib.sha256(data).hexdigest(),
+        tuple(sorted(imports)),
+        requirements,
+        manifest_path,
+        tags,
     )
 
 

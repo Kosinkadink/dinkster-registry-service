@@ -21,8 +21,7 @@ def wheel_bytes(
     dist = f"{name.replace('-', '_')}-1.2.3.dist-info"
     files = {
         f"{dist}/METADATA": (
-            f"Metadata-Version: 2.4\nName: {name}\nVersion: 1.2.3\n"
-            "Requires-Dist: demo-core>=2\n\n"
+            f"Metadata-Version: 2.4\nName: {name}\nVersion: 1.2.3\nRequires-Dist: demo-core>=2\n\n"
         ).encode(),
         f"{dist}/WHEEL": b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         f"{package}/__init__.py": b"ANSWER = 42\n",
