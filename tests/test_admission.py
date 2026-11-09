@@ -129,6 +129,23 @@ def test_mandatory_stage_functions_accept_the_registry_fixture(
     assert not security.blocked
 
 
+def test_probe_supports_current_pack_api(tmp_path: Path) -> None:
+    source = _fixture_source(tmp_path)
+    nodes = source / "nodes.py"
+    nodes.write_text(
+        "from dinkster_api.v1 import (TypeRegistry, validate_detection_encoded, "
+        "comfy_resident_meta, inference_nodes)\n"
+        "TypeRegistry().register('EXAMPLE', asset_references_complete=True)\n" + nodes.read_text()
+    )
+    result = run_executable_probe(source, require_isolation=False)
+    assert not result.blocked, result.findings
+    assert result.data is not None
+    assert {schema["nodeType"] for schema in result.data["schemas"]} == {
+        "example-pack.resize",
+        "example-pack.save",
+    }
+
+
 @pytest.mark.parametrize(
     ("declared", "entry"),
     ((False, "empty"), (True, "empty"), (True, "broken"), (True, "invalid-schema")),
