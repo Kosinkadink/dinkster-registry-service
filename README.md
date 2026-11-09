@@ -145,6 +145,20 @@ database and object-store environment settings used by the service:
 uv run dinkster-registry rebuild-indexes
 ```
 
+Operators withdraw exactly one active release with a stored reason:
+
+```sh
+uv run dinkster-registry admin yank example-pack 1.2.3 --reason "Replaced by separate packs."
+```
+
+The command rejects unknown or non-active releases and blank reasons. It commits
+the yanked state and a durable rebuild event, then rebuilds the static indexes
+before reporting success. An object-store failure exits with an error while
+leaving the release yanked and the rebuild queued; use `rebuild-indexes` to retry
+delivery, not another yank. Existing public caches may retain indexes for their
+60-second cache lifetime. Artifact and lock downloads remain available, and the
+version response retains `stateReason`; download tickets include the yank warning.
+
 Seeding development fixtures does not simulate publish acceptance. Run the
 rebuild command after `seed` to expose fixtures through the static indexes.
 

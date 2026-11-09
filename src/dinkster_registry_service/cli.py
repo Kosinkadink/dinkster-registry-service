@@ -12,12 +12,14 @@ from uuid import UUID
 
 import uvicorn
 from dinkster_registry import RegistryError
+from packaging.version import Version
+from sqlalchemy import select
 
 from .admission import AdmissionService
 from .app import create_app
-from .database import Database
-from .indexes import StaticIndexes
-from .object_store import MAX_ARTIFACT_SIZE
+from .database import Database, PackRecord, ReleaseRecord
+from .indexes import StaticIndexes, queue_index_rebuild
+from .object_store import MAX_ARTIFACT_SIZE, ObjectStoreError
 from .principals import PrincipalRepository
 from .seed import seed_fixtures
 from .settings import ServerSettings
@@ -78,10 +80,16 @@ def _parser() -> argparse.ArgumentParser:
     rescan_parser.add_argument("--object-store-root")
 
     admin_parser = subparsers.add_parser(
-        "admin", help="bootstrap users, publishers, operators, and publish tokens"
+        "admin", help="manage users, publishers, tokens, and release withdrawals"
     )
     admin_parser.add_argument("--database-url")
+    admin_parser.add_argument("--object-store-root")
     admin_commands = admin_parser.add_subparsers(dest="admin_command", required=True)
+
+    yank = admin_commands.add_parser("yank", help="withdraw one active release from indexes")
+    yank.add_argument("pack")
+    yank.add_argument("version")
+    yank.add_argument("--reason", required=True)
 
     add_user = admin_commands.add_parser("add-user", help="register a user id")
     add_user.add_argument("user")
@@ -145,7 +153,52 @@ def main() -> None:
         principals = PrincipalRepository(database)
         now = datetime.now(UTC).isoformat()
         try:
-            if args.admin_command == "add-user":
+            if args.admin_command == "yank":
+                if not args.reason.strip():
+                    raise RegistryError("yank reason must not be blank")
+                indexes = StaticIndexes(
+                    database, settings.create_object_store(), settings.public_base_url
+                )
+                with database.session() as session, session.begin():
+                    if not database.is_postgresql:
+                        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+                    release = session.scalar(
+                        select(ReleaseRecord)
+                        .join(PackRecord)
+                        .where(PackRecord.name == args.pack, ReleaseRecord.version == args.version)
+                        .with_for_update(of=ReleaseRecord)
+                    )
+                    if release is None:
+                        raise RegistryError(f"unknown release {args.pack} {args.version}")
+                    if release.state != "active":
+                        raise RegistryError(
+                            f"release is {release.state}; only active can be yanked"
+                        )
+                    release.state = "yanked"
+                    release.state_reason = args.reason
+                    release.state_changed_at = datetime.now(UTC)
+                    pack = session.get(PackRecord, release.pack_id, with_for_update=True)
+                    assert pack is not None
+                    if pack.latest_version == release.version:
+                        alternatives = session.scalars(
+                            select(ReleaseRecord).where(
+                                ReleaseRecord.pack_id == pack.id,
+                                ReleaseRecord.state == "active",
+                            )
+                        )
+                        latest = max(alternatives, key=lambda r: Version(r.version), default=None)
+                        if latest is not None:
+                            pack.latest_version = latest.version
+                    pack.updated_at = release.state_changed_at
+                    queue_index_rebuild(session)
+                try:
+                    indexes.rebuild()
+                except ObjectStoreError as exc:
+                    raise RegistryError(
+                        "release yanked, but index rebuild failed; durable rebuild remains queued"
+                    ) from exc
+                print(f"yanked {args.pack} {args.version}; public indexes rebuilt")
+            elif args.admin_command == "add-user":
                 principals.register_user(args.user)
                 if args.operator:
                     principals.add_operator(args.user, args.user, now)
