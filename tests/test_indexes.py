@@ -124,6 +124,12 @@ def test_static_schemas_match_dynamic_routes_and_select_current_first_party_rele
             ],
         }
     ]
+    assert client.get("/static/replacements/index.json").content == (
+        b'{"items":[{"candidates":[{"pack":"example-pack","rule":'
+        b'{"cases":[{"to":"example.resize"}],"from":"example.deprecated"},'
+        b'"target":"example.resize","version":"1.10.0"}],'
+        b'"from":"example.deprecated"}],"schemaVersion":1}'
+    )
     for version in ("1.2.3", "1.9.0", "1.10.0", "2.0.0"):
         path = f"/static/packs/example-pack/{version}/schemas.json"
         static = client.get(path)
@@ -182,47 +188,59 @@ def test_static_schemas_match_dynamic_routes_and_select_current_first_party_rele
     assert client.get("/static/packs/example-pack/2.0.0/schemas.json").status_code == 200
 
 
-def test_replacements_keep_first_party_alternatives_and_complete_group_rules(
+def test_replacements_keep_first_party_alternatives_and_complete_schema_rules(
     seeded_catalog: tuple[Database, LocalFilesystemObjectStore], client: TestClient
 ) -> None:
     database, store = seeded_catalog
-    rule = {
-        "from": "deprecated.resize",
-        "cases": [
-            {
-                "to": "example.resize",
-                "when": {"kind": "valueEquals", "input": "mode", "value": "image"},
-            },
-            {
-                "to": "example.resize",
-                "when": {"kind": "valueEquals", "input": "mode", "value": "mask"},
-            },
-        ],
-    }
+    cases = [
+        {
+            "to": "example.resize",
+            "when": {"kind": "valueEquals", "input": "mode", "value": "image"},
+        },
+        {
+            "to": "example.resize",
+            "when": {"kind": "valueEquals", "input": "mode", "value": "mask"},
+        },
+    ]
+    rule = {"from": "deprecated.resize", "cases": cases}
     with database.session() as session, session.begin():
         session.add(PublisherRecord(id="dinkster", display_name="Dinkster"))
         session.flush()
         for pack in session.scalars(select(PackRecord)):
             release = session.scalar(select(ReleaseRecord).where(ReleaseRecord.pack_id == pack.id))
             assert release is not None
+            target = "example.resize" if pack.name == "example-pack" else "color.adjust"
+            node = session.scalar(
+                select(ReleaseNodeRecord).where(
+                    ReleaseNodeRecord.release_id == release.id,
+                    ReleaseNodeRecord.node_type == target,
+                )
+            )
+            assert node is not None
+            newer = ReleaseRecord(
+                **{
+                    column.name: getattr(release, column.name)
+                    for column in ReleaseRecord.__table__.columns
+                    if column.name not in {"id", "version", "version_key"}
+                },
+                id=uuid7(),
+                version="3.0.0",
+                version_key="3.0.0",
+            )
+            session.add(newer)
+            session.flush()
             session.add(
-                ReleaseRecord(
+                ReleaseNodeRecord(
                     **{
-                        column.name: getattr(release, column.name)
-                        for column in ReleaseRecord.__table__.columns
-                        if column.name not in {"id", "version", "version_key", "manifest"}
+                        column.name: getattr(node, column.name)
+                        for column in ReleaseNodeRecord.__table__.columns
+                        if column.name not in {"release_id", "schema"}
                     },
-                    id=uuid7(),
-                    version="3.0.0",
-                    version_key="3.0.0",
-                    manifest={
-                        **release.manifest,
-                        "translations": [
-                            {
-                                "groups": {
-                                    "records": [{"carrier": "example.resize", "replacement": rule}]
-                                }
-                            }
+                    release_id=newer.id,
+                    schema={
+                        **node.schema,
+                        "replacements": [
+                            {**rule, "cases": [{**case, "to": target} for case in cases]}
                         ],
                     },
                 )
@@ -249,11 +267,41 @@ def test_replacements_keep_first_party_alternatives_and_complete_group_rules(
         {
             "from": "deprecated.resize",
             "candidates": [
-                {**first, "pack": "color-tools"},
+                {
+                    **first,
+                    "pack": "color-tools",
+                    "target": "color.adjust",
+                    "rule": {
+                        "from": "deprecated.resize",
+                        "cases": [
+                            {
+                                "to": "color.adjust",
+                                "when": {"kind": "valueEquals", "input": "mode", "value": "image"},
+                            },
+                            {
+                                "to": "color.adjust",
+                                "when": {"kind": "valueEquals", "input": "mode", "value": "mask"},
+                            },
+                        ],
+                    },
+                },
                 first,
             ],
         }
     ]
+
+
+def test_unlisted_static_index_is_not_served_or_rewritten(
+    seeded_catalog: tuple[Database, LocalFilesystemObjectStore], client: TestClient
+) -> None:
+    database, store = seeded_catalog
+    key = "static/translations/index.json"
+    old = b'{"items":[],"schemaVersion":1}'
+    store.put(key, old)
+    StaticIndexes(database, store, "http://testserver").rebuild()
+    for method in ("GET", "HEAD", "OPTIONS"):
+        assert client.request(method, "/" + key).status_code == 404
+    assert store.read(key) == old
 
 
 def test_index_retry_repairs_partial_publication(database: Database, tmp_path: Path) -> None:

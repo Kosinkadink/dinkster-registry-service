@@ -4,10 +4,7 @@ from pathlib import Path
 
 from dinkster_registry.archive_admission import AdmissionFinding, StageResult
 from dinkster_registry.archive_admission import run_manifest_admission as check_archive_manifest
-from dinkster_schema import (
-    claims_conflict,
-    comfy_group_registry_to_wire,
-)
+from dinkster_schema import claims_conflict
 from dinkster_workers.manifest import load_manifest
 from packaging.requirements import Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -91,21 +88,6 @@ def run_manifest_admission(
                     ),
                 )
             )
-        if manifest.comfy_groups is not None:
-            if publisher != "dinkster":
-                raise ValueError("translation records require the Dinkster publisher")
-            metadata["translations"] = [
-                {
-                    "name": pack_name,
-                    "version": release_version,
-                    "publisher": publisher,
-                    "groups": (
-                        comfy_group_registry_to_wire(manifest.comfy_groups)
-                        if manifest.comfy_groups is not None
-                        else None
-                    ),
-                }
-            ]
         pack = session.scalar(select(PackRecord).where(PackRecord.name == pack_name))
         if pack is not None and not rescan:
             conflict = session.scalar(

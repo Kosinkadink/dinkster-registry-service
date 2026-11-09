@@ -42,10 +42,7 @@ manifest and is a pack, even when it has zero nodes.
 Reserved library names require the authenticated `dinkster` publisher
 (`wheel.reserved-name`). A declared manifest publisher must match the authenticated
 publisher (`manifest.publisher-mismatch`); declaring a name never grants authority.
-Group records require the `dinkster` publisher, and their carriers and
-replacement references are checked against the probed schemas
-(`translations.invalid`). Libraries appear in the install index but not the schema,
-locale or translation catalogs.
+Libraries appear in the install index but not the schema or locale catalogs.
 
 `[pack.dependencies]` remains distinct from Python `requires`: it permits
 imports of a declared pack's public helpers. Admission stages hash-verified,
@@ -69,9 +66,9 @@ index: the static prefix supports only GET, HEAD and OPTIONS.
 
 `/static/packs/index.json` carries exact wheel filenames, hashes and prefix-relative
 URLs, plus admitted installation locks. `/static/locks/` holds those immutable
-lock bytes. Schemas, locale catalogs and translation records are indexed at
-`/static/schemas/index.json`, `/static/locales/index.json` and
-`/static/translations/index.json`. Relative JSON URLs resolve against `/static/`,
+lock bytes. Schemas and locale catalogs are indexed at
+`/static/schemas/index.json` and `/static/locales/index.json`.
+Relative JSON URLs resolve against `/static/`,
 not against the directory containing the JSON index. An installer uses the
 recorded pins, never unrestricted dependency resolution against the simple index.
 

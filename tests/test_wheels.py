@@ -225,7 +225,8 @@ def test_library_admission_static_download_collision_and_yank(tmp_path: Path) ->
         assert denied.json()["error"]["code"] == "invalid_request"
         assert client.get("/static/cpu/simple/demo-nodes/").content == index.content
         assert client.get("/static/quarantine/uploads/secret").status_code == 404
-        assert client.get("/static/translations/index.json").json()["items"] == []
+        assert not store.exists("static/translations/index.json")
+        assert client.get("/static/translations/index.json").status_code == 404
         assert client.get("/static/locales/index.json").json()["items"] == []
         assert client.get("/static/schemas/index.json").json()["items"] == []
         assert client.get("/static/packs/demo-nodes/1.2.3/schemas.json").status_code == 404
@@ -279,7 +280,6 @@ def test_library_reserved_name_requires_authenticated_publisher(
     "publisher,declared_publisher",
     [
         ("dinkster", "dinkster"),
-        (None, ""),
         (None, "dinkster"),
         ("dinkster", "someone-else"),
     ],
