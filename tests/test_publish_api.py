@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
@@ -15,6 +16,7 @@ from sqlalchemy import select
 from dinkster_registry_service.admission import AdmissionService
 from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
+from dinkster_registry_service.cli import main
 from dinkster_registry_service.database import NamespaceGrantRecord, OutboxRecord, PackRecord
 from dinkster_registry_service.digests import artifact_digest
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore, ObjectStoreError
@@ -104,7 +106,9 @@ def _locks(archive: bytes) -> dict[str, object]:
     }
 
 
-def test_published_locks_bind_archive_base_and_visibility(tmp_path: Path) -> None:
+def test_published_locks_bind_archive_base_and_visibility(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     client, app, token = _client(tmp_path)
     archive = _archive(tmp_path, "locked-pack")
     locks = json.loads(json.dumps(_locks(archive)))
@@ -174,14 +178,32 @@ def test_published_locks_bind_archive_base_and_visibility(tmp_path: Path) -> Non
     changed = json.loads(json.dumps(locks))
     changed["linux-cpu"]["baseId"] = "sha256:" + "3" * 64
     assert publish(changed).status_code == 409
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "dinkster-registry",
+            "admin",
+            "--database-url",
+            f"sqlite:///{tmp_path / 'registry.db'}",
+            "--object-store-root",
+            str(tmp_path / "objects"),
+            "yank",
+            "locked-pack",
+            "1.2.3",
+            "--reason",
+            "Withdrawn",
+        ],
+    )
+    main()
+    assert client.get(lock_url, params=query).content == download.content
+    assert client.get("/static/packs/index.json").json()["items"] == []
+    for variant in ("linux-cpu", "win-cpu"):
+        assert "locked_pack-1.2.3" not in client.get(f"/static/{variant}/simple/locked-pack/").text
+
     with app.state.database.session() as session, session.begin():
         from dinkster_registry_service.database import ReleaseRecord
 
-        release = session.scalar(select(ReleaseRecord))
-        assert release is not None
-        release.state = "yanked"
-    assert client.get(lock_url, params=query).content == download.content
-    with app.state.database.session() as session, session.begin():
         release = session.scalar(select(ReleaseRecord))
         assert release is not None
         release.state = "quarantined"
