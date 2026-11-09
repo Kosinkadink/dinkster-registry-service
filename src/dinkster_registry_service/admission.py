@@ -218,6 +218,7 @@ class AdmissionService:
             for lock in prepared:
                 self.object_store.put(quarantine_lock_key(candidate_id, lock.variant), lock.data)
             with self.database.session() as session, session.begin():
+                supersedes = None
                 if prepared:
                     if self.database.is_postgresql:
                         session.execute(
@@ -226,7 +227,7 @@ class AdmissionService:
                         )
                     else:
                         session.execute(text("BEGIN IMMEDIATE"))
-                    previous = session.scalar(
+                    previous_candidates = session.scalars(
                         select(ReleaseCandidateRecord)
                         .where(
                             ReleaseCandidateRecord.kind == "upload",
@@ -234,24 +235,31 @@ class AdmissionService:
                             ReleaseCandidateRecord.version_key == public_version_key(version),
                             ReleaseCandidateRecord.publisher_id == publisher,
                         )
-                        .order_by(ReleaseCandidateRecord.submitted_at)
-                        .limit(1)
-                    )
-                    if previous is not None:
+                        .order_by(ReleaseCandidateRecord.submitted_at.desc())
+                    ).all()
+                    for recorded in previous_candidates:
                         if (
-                            previous.declared_digest != digest
-                            or previous.declared_size != size
-                            or previous.install_locks != install_locks
+                            recorded.declared_digest != digest
+                            or recorded.declared_size != size
+                            or recorded.install_locks != install_locks
                         ):
                             raise AdmissionError(
                                 "release already has different archive or lock bindings"
                             )
+                    previous = next(
+                        (item for item in previous_candidates if item.status != "rejected"), None
+                    )
+                    if previous is not None:
+                        if previous.status not in {"queued", "scanning", "accepted"}:
+                            raise AdmissionError(f"release candidate is {previous.status}")
                         self.object_store.remove(object_key)
                         for lock in prepared:
                             self.object_store.remove(
                                 quarantine_lock_key(candidate_id, lock.variant)
                             )
                         return previous.id
+                    if previous_candidates:
+                        supersedes = str(previous_candidates[0].id)
                 now = datetime.now(UTC)
                 session.add(
                     ReleaseCandidateRecord(
@@ -288,7 +296,12 @@ class AdmissionService:
                         event_type="release_candidate.submitted",
                         subject_type="release_candidate",
                         subject_id=str(candidate_id),
-                        data={"packName": pack_name, "version": version, "digest": digest},
+                        data={
+                            "packName": pack_name,
+                            "version": version,
+                            "digest": digest,
+                            **({"supersedesCandidateId": supersedes} if supersedes else {}),
+                        },
                     )
                 )
         except BaseException:

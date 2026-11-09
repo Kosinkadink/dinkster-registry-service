@@ -501,7 +501,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             raise ProtocolError(409, "publish_in_progress", str(exc)) from None
         return _json_response(
             request,
-            {"candidateId": str(candidate_id), "status": "queued"},
+            {"candidateId": str(candidate_id), "status": admission.status(candidate_id).status},
             cache_control=NO_STORE,
             status_code=202,
             conditional=False,
