@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -12,7 +13,10 @@ from botocore.exceptions import BotoCoreError, ClientError  # type: ignore[impor
 
 MAX_ARTIFACT_SIZE = 64 * 1024 * 1024
 READ_CHUNK_SIZE = 64 * 1024
-INDEX_KEYS = frozenset({"packs/index.json", "locales/index.json", "schemas/index.json"})
+INDEX_KEYS = frozenset(
+    f"static/{name}/index.json"
+    for name in ("packs", "locales", "schemas", "translations", "replacements")
+)
 
 
 class ObjectStoreError(RuntimeError):
@@ -296,7 +300,14 @@ class S3ObjectStore:
 
 
 def _validate_index(key: str, data: bytes) -> None:
-    if key not in INDEX_KEYS:
+    if (
+        key not in INDEX_KEYS
+        and re.fullmatch(
+            r"static/[a-z0-9]+(?:-[a-z0-9]+)*/simple/(?:[a-z0-9]+(?:-[a-z0-9]+)*/)?index\.html",
+            key,
+        )
+        is None
+    ):
         raise ObjectStoreError("only public static indexes may be replaced")
     if not 1 <= len(data) <= MAX_ARTIFACT_SIZE:
         raise ObjectStoreError(f"index size must be between 1 and {MAX_ARTIFACT_SIZE} bytes")

@@ -1,22 +1,33 @@
-"""Admit pinned official ZIPs from the independently published pack registry."""
+"""Admit an unchanged first-party wheel through the isolated production probe."""
 
 from __future__ import annotations
 
-import argparse
+import hashlib
+import io
 import json
 import os
+import socket
 import subprocess
 import sys
-import tomllib
+import time
+import urllib.error
 import urllib.request
 import zipfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from dinkster_registry_service.digests import artifact_digest
-from dinkster_registry_service.identifiers import require_canonical_pack_name
-from dinkster_registry_service.versioning import require_public_version
+from dinkster_registry_service.wheels import inspect_wheel
 
-REGISTRY_URL = "https://registry.dinkster.org"
+
+def verify_fixture(directory: Path, lock: dict[str, object]) -> Path:
+    wheel = directory / str(lock["filename"])
+    data = wheel.read_bytes()
+    assert len(data) == lock["size"], "fixture size mismatch"
+    assert hashlib.sha256(data).hexdigest() == lock["sha256"], "fixture hash mismatch"
+    inspected = inspect_wheel(data, str(lock["name"]), str(lock["version"]))
+    assert inspected.filename == wheel.name
+    assert not inspected.library
+    return wheel
 
 
 def cli(*arguments: str) -> str:
@@ -26,102 +37,98 @@ def cli(*arguments: str) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("directory", type=Path)
-    parser.add_argument("--download-only", action="store_true")
-    args = parser.parse_args()
-    directory = args.directory
-    if args.download_only:
-        directory.mkdir(parents=True, exist_ok=True)
-    lock = json.loads(Path(__file__).with_name("release-packs.lock").read_bytes())
-    assert lock["format"] == "dinkster.lock/1"
-    packs = lock["packs"]
-    assert len(packs) == 14
-    assert len({pack["pack"] for pack in packs}) == 14
-    pending = {}
-    for pack in packs:
-        name = require_canonical_pack_name(pack["pack"])
-        version = require_public_version(pack["version"])
-        assert pack["publisher"] == "dinkster"
-        assert pack["source"] == f"registry:{REGISTRY_URL}"
-        archive = directory / f"{name}-{version}.zip"
-        if args.download_only:
-            with urllib.request.urlopen(f"{REGISTRY_URL}/v1/packs/{name}", timeout=60) as response:
-                owner = json.load(response)
-            assert owner["name"] == name and owner["owner"]["slug"] == pack["publisher"], name
-            with urllib.request.urlopen(
-                f"{REGISTRY_URL}/v1/packs/{name}/versions/{version}", timeout=60
-            ) as response:
-                release = json.load(response)
-            assert release["packName"] == name and release["version"] == version, name
-            assert release["state"] == "active", name
-            assert release["artifact"]["digest"] == pack["artifactDigest"], name
-            with urllib.request.urlopen(
-                f"{REGISTRY_URL}/v1/artifacts/{pack['artifactDigest']}", timeout=60
-            ) as response:
-                data = response.read()
-            assert len(data) == release["artifact"]["size"], name
-            archive.write_bytes(data)
-        assert artifact_digest(archive.read_bytes()) == pack["artifactDigest"], name
-        with zipfile.ZipFile(archive) as source:
-            manifest = tomllib.loads(source.read("dinkster-pack.toml").decode())
-        assert manifest["pack"]["name"] == name, name
-        if "version" in manifest["pack"]:
-            assert manifest["pack"]["version"] == version, name
-        assert manifest["pack"]["publisher"] == pack["publisher"], name
-        dependencies = set(manifest["pack"].get("dependencies", {}))
-        pending[name] = (pack, archive, dependencies)
-        print(f"verified {name} {version} {pack['artifactDigest']}", flush=True)
-    if args.download_only:
-        return
     assert os.environ.get("DINKSTER_DATABASE_URL"), "a disposable migrated database is required"
+    lock = json.loads(Path(__file__).with_name("release-packs.lock").read_bytes())
+    wheel = verify_fixture(Path("fixtures/wheels"), lock)
     cli("admin", "add-user", "release-check")
     cli("admin", "add-publisher", "dinkster", "--owner", "release-check")
-    completed: set[str] = set()
-    failures = []
-    while pending:
-        available = sorted(name for name, (_, _, deps) in pending.items() if deps <= completed)
-        assert available, f"unresolved release dependencies: {sorted(pending)}"
-        for name in available:
-            pack, archive, _ = pending.pop(name)
-            candidate = cli(
-                "submit",
-                str(archive),
-                "--pack",
-                name,
-                "--version",
-                pack["version"],
-                "--publisher",
-                "dinkster",
-                "--submitted-by",
-                "release-check",
+    token = cli(
+        "admin",
+        "mint-token",
+        "dinkster",
+        "--user",
+        "release-check",
+        "--expires",
+        (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+    )
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    origin = f"http://127.0.0.1:{port}"
+
+    def request(path: str, data: bytes | None = None, *, authenticated: bool = False) -> bytes:
+        headers = {"Authorization": f"Bearer {token}"} if authenticated else {}
+        with urllib.request.urlopen(
+            urllib.request.Request(origin + path, data=data, headers=headers), timeout=30
+        ) as response:
+            return response.read()
+
+    server = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "dinkster_registry_service.cli",
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ]
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            assert server.poll() is None, "HTTP server exited before readiness"
+            try:
+                request("/v1/health")
+                break
+            except urllib.error.URLError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.1)
+        submitted = json.loads(
+            request(
+                f"/v1/publish/{lock['name']}/versions/{lock['version']}",
+                wheel.read_bytes(),
+                authenticated=True,
             )
-            for _ in range(4):
-                cli("scanner", "--once")
-                status = json.loads(cli("status", candidate))
-                if status["status"] in {"accepted", "rejected", "review"}:
-                    break
-            result = {
-                "pack": name,
-                "version": pack["version"],
-                "status": status["status"],
-                "reason": status["reason"],
-                "digest": status["digest"],
-                "lockDigestMatches": status["digest"] == pack["artifactDigest"],
-                "blockingCodes": sorted(
-                    {
-                        finding["code"]
-                        for finding in status["findings"]
-                        if finding["effect"] == "block"
-                    }
-                ),
-            }
-            completed.add(name)
-            print(json.dumps(result, sort_keys=True), flush=True)
-            if status["status"] != "accepted" or not result["lockDigestMatches"]:
-                failures.append(result)
-    assert len(completed) == 14
-    assert not failures, failures
+        )
+        candidate = submitted["candidateId"]
+        assert submitted["status"] == "queued"
+        for _ in range(4):
+            cli("scanner", "--once")
+            status = json.loads(request(f"/v1/publish/{candidate}", authenticated=True))
+            if status["status"] in {"accepted", "rejected", "review"}:
+                break
+        assert status["status"] == "accepted", status
+        (entry,) = json.loads(request("/static/packs/index.json"))["items"]
+        (published,) = entry["wheels"]
+        assert (entry["name"], entry["version"]) == (lock["name"], lock["version"])
+        assert published["sha256"] == lock["sha256"]
+        assert request("/static/" + published["url"]) == wheel.read_bytes()
+        schemas = json.loads(
+            request(f"/static/packs/{lock['name']}/{lock['version']}/schemas.json")
+        )["schemas"]
+        assert sorted(item["nodeType"] for item in schemas) == lock["nodeTypes"]
+        print(
+            f"publisher HTTP upload promoted: {lock['name']}, {len(schemas)} node schemas",
+            flush=True,
+        )
+
+        old = io.BytesIO()
+        with zipfile.ZipFile(old, "w") as archive:
+            archive.writestr("dinkster-pack.toml", '[pack]\nname = "old-pack"\n')
+        queued = json.loads(
+            request("/v1/publish/old-pack/versions/0.0.1", old.getvalue(), authenticated=True)
+        )
+        cli("scanner", "--once")
+        refused = json.loads(request(f"/v1/publish/{queued['candidateId']}", authenticated=True))
+        assert refused["status"] == "rejected", refused
+        assert refused["reason"] == "wheel.required", refused
+        print("queued ZIP refused: wheel.required", flush=True)
+    finally:
+        server.terminate()
+        server.wait(timeout=10)
 
 
 if __name__ == "__main__":

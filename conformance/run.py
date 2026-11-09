@@ -137,10 +137,14 @@ def run_release(base_url: str, lock: dict[str, Any]) -> None:
         raise ConformanceFailure(f"release packs missing from browse: {sorted(missing)}")
     print(f"PASS release browse and conditional GET: {len(expected)} locked packs")
 
-    for path in ("/packs/index.json", "/locales/index.json"):
+    for path in ("/static/packs/index.json", "/static/locales/index.json"):
         response = _request(origin + path)
         index = _json(response)
-        entries = {(item["name"], item["version"], item["digest"]) for item in index["items"]}
+        entries = {
+            (item["name"], item["version"], wheel["digest"])
+            for item in index["items"]
+            for wheel in item["wheels"]
+        }
         if index.get("schemaVersion") != 1 or not expected <= entries:
             raise ConformanceFailure(f"{path} does not contain every locked release and digest")
         check_conditional(origin, path, response)

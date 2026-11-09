@@ -29,6 +29,7 @@ def _archive(tmp_path: Path, name: str, *, native: bool = False) -> bytes:
     manifest = source / "dinkster-pack.toml"
     manifest.write_text(
         manifest.read_text()
+        .replace('publisher = "dinkster"', 'publisher = "example-org"')
         .replace('name = "example-pack"', f'name = "{name}"')
         .replace('namespaces = ["example"]', f'namespaces = ["{name}"]')
     )

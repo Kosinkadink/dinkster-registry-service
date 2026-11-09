@@ -3,27 +3,102 @@
 The Dinkster Registry is a FastAPI service for publishing, browsing, and
 downloading Dinkster node packs. The same `dinkster-registry-service`
 distribution and `dinkster_registry_service` import run with PostgreSQL for a
-hosted catalog or SQLite for a self-hosted registry. Immutable pack archives
+hosted catalog or SQLite for a self-hosted registry. Immutable pack wheels
 live behind an object-store interface; development uses the local filesystem
 implementation.
 
-Operators can submit pack archives to quarantine through the in-process CLI.
+Operators can submit pack wheels to quarantine through the in-process CLI.
 Lease-based scanner workers validate every candidate and promote accepted bytes
 to immutable artifact storage. Bearer-authenticated HTTP routes accept publisher
 submissions and operator review decisions. Pending, rejected, and
 operator-review candidates are never visible through public catalog routes.
 
+## Wheel identity and admission
+
+Only wheels are publishable; the old Dinkster ZIP and source distributions are
+refused with `wheel.required`. Wheel `METADATA` Name equals the submitted pack
+name exactly. A pack ships exactly one top-level import package, named by
+replacing every `-` and `.` in its pack name with `_`. The original manifest
+is `<import_package>/dinkster-pack.toml`; relative assets live beside it.
+`Requires-Dist` matches the manifest's `requires`. Standard WHEEL tags and
+RECORD hashes describe every installed file. The registry checks them before
+extracting or executing any publisher code. Admitted versions are immutable.
+Releases must be `py3-none-any`; other tags or non-pure wheels fail with
+`wheel.platform-unsupported`. Native release sets are tracked separately in
+[native wheel sets](https://github.com/Kosinkadink/comfy-vibe-station/issues/670).
+
+Named refusals include `wheel.distribution-name`, `wheel.import-name`,
+`wheel.pth-forbidden`, `wheel.entry-point-forbidden` (including console scripts),
+`wheel.import-conflict`, and `wheel.requires-pack`. Malformed or unsafe wheels
+fail with `wheel.invalid`. Import ownership is checked again while catalog
+promotion is serialized; concurrent submissions cannot claim the same import.
+These rules apply equally to first-party and third-party publishers.
+
+A library wheel has no manifest, node schemas or namespace claims. It uses the
+same admission and simple index as packs. Shared code belongs in such a library,
+not a Python dependency on another pack. A distribution cannot switch between
+library and pack identity (`wheel.library-claims`). A types pack still has a
+manifest and is a pack, even when it has zero nodes.
+Reserved library names require the authenticated `dinkster` publisher
+(`wheel.reserved-name`). A declared manifest publisher must match the authenticated
+publisher (`manifest.publisher-mismatch`); declaring a name never grants authority.
+Alias and group records require the `dinkster` publisher, and their carriers and
+replacement references are checked against the probed schemas
+(`translations.invalid`). Libraries appear in the install index but not the schema,
+locale or translation catalogs.
+
+`[pack.dependencies]` remains distinct from Python `requires`: it permits
+imports of a declared pack's public helpers. Admission stages hash-verified,
+active dependency wheels and their transitive pack dependencies inside the
+disposable probe root. Their CPU Python requirements are provisioned together;
+the submitted wheel and published manifest remain unchanged. Missing, conflicting
+or corrupt helper dependencies fail with `probe.pack-dependencies-unavailable`.
+Doctor still rejects private imports, and unrelated packs are not staged.
+
 ## Static public indexes
+
+All installer reads use `/static/`. The registry writes PEP 503 pages at
+`/static/<variant>/simple/<normalized-name>/` and the corresponding simple root.
+The `cpu` view always exists; admitted installation locks declare additional
+variant views. Project links contain the wheel filename and a relative URL to
+`../../../wheels/<sha256>/<filename>.whl#sha256=<sha256>`. This SHA-256 hashes the
+complete wheel bytes. The registry's BLAKE3 artifact identity remains separate.
+Yanked releases are absent from the simple index. Universal wheel pages have
+identical bytes across variants. There is no publisher route for editing an
+index: the static prefix supports only GET, HEAD and OPTIONS.
+
+`/static/packs/index.json` carries exact wheel filenames, hashes and prefix-relative
+URLs, plus admitted installation locks. `/static/locks/` holds those immutable
+lock bytes. Schemas, locale catalogs and translation records are indexed at
+`/static/schemas/index.json`, `/static/locales/index.json` and
+`/static/translations/index.json`. Relative JSON URLs resolve against `/static/`,
+not against the directory containing the JSON index. An installer uses the
+recorded pins, never unrestricted dependency resolution against the simple index.
 
 Every accepted publish queues a durable rebuild of `packs/index.json` and
 `locales/index.json` in the configured object store and immediately
 attempts delivery. Both contain deterministic JSON with `schemaVersion: 1` and
 an `items` array of active public releases, ordered by pack name and version
-text. Each entry includes `name`, `version`, BLAKE3 `digest`, byte `size`, and
-the artifact download `url`. Locale entries also contain `catalogs`, an
-array of locale, SHA-256 digest, and path within the same ZIP. An empty array
+text. Each entry includes `name`, `version` and a `wheels` array. Each wheel has
+`filename`, whole-file `sha256`, BLAKE3 `digest`, byte `size`, prefix-relative
+download `url` and `tags` (currently `["py3-none-any"]`). These artifact fields
+exist only in `wheels`, never on the release item. `publisher` is the authenticated publisher id
+(null for operator submissions without a publisher); `engine` is the manifest's
+engine compatibility range (null for libraries). Locale entries also contain `catalogs`, an
+array of locale, SHA-256 digest, and path within the same wheel. An empty array
 means the release carries no locale catalog. Quarantine queues a rebuild to
 remove the release from both lists.
+
+`/static/replacements/index.json` contains `schemaVersion: 1` and `items`, with
+one item per migrated `from` type: `{"from":"old.type","candidates":[...]}`.
+Each candidate has `pack`, `version`, `target` (carrier node id), and `rule`
+(the unchanged canonical replacement rule, including its conditions and cases).
+Only the latest active public release of each first-party pack contributes.
+Native schema replacements, alias records and group records contribute; aliases
+are searchable by their source node type and ComfyUI class name. Multiple packs
+may migrate the same source, so candidates are retained rather than silently
+choosing a winner. Targets and their interfaces come from the corresponding
+per-pack schema file. Yank and quarantine rebuild the index without those releases.
 
 The same rebuild writes `packs/<name>/<version>/schemas.json` for every public
 active or yanked release. These are the admission probe's stored wire schemas,
@@ -43,13 +118,13 @@ against its configured prefix, not against `schemas/`. Schema files are written
 before their index. A mirror copies these directories unchanged and needs no
 dynamic registry routes for schema discovery or preview.
 
-The service serves the stored bytes at `/packs/index.json` and
-`/locales/index.json`, plus the schema index and files, with GET/HEAD,
+The service serves the stored bytes at `/static/packs/index.json` and
+`/static/locales/index.json`, plus the schema index and files, with GET/HEAD,
 content-derived ETags and `If-None-Match` support (304). Read-only public CORS
 exposes ETag and permits conditional browser requests; mirror operators must
 provide equivalent CORS headers when serving a different browser origin.
 The object-store indexes have a 60-second public cache lifetime. Artifact and
-per-version schema bytes remain immutable; only the three index keys can be
+per-version schema bytes remain immutable; only the JSON and simple index keys can be
 replaced. Production stores these objects in R2 through the S3 API, not on
 local disk.
 
@@ -150,9 +225,9 @@ the `example-pack` archive. It recomputes BLAKE3 over the response bytes and
 compares the result and byte count with the download ticket.
 
 The fixture seed is idempotent. Re-running the service keeps the same pack,
-release, digest, and object identities. The included fixture source archives
-are rootless, uncompressed ZIP files with sorted paths, ZIP epoch timestamps,
-0644 modes, and no links or extra fields.
+release, digest, and object identities. The included fixture wheels contain
+package-relative manifests and assets with standard METADATA, WHEEL and hashed
+RECORD files, sorted paths, fixed timestamps and no links.
 
 ## Release admission
 
@@ -168,8 +243,8 @@ contract; no private source checkout or repository token is needed by engine CI.
 
 The scanner runs these mandatory checks in order:
 
-1. `ingest_integrity`: verifies size, BLAKE3, ZIP structure and CRCs, safe
-   paths, regular files, limits, stored compression, and deterministic bytes.
+1. `ingest_integrity`: verifies size, BLAKE3, wheel metadata and RECORD hashes,
+   ZIP structure and CRCs, safe paths, regular files, and size limits.
 2. `manifest`: invokes the pinned Dinkster manifest parser, validates release and
    catalog fields, checks namespace ownership, and rejects version collisions.
 3. `doctor_static`: invokes the pinned Dinkster doctor's static checks against the
@@ -246,8 +321,10 @@ and submit it:
 
 ```sh
 DOCKER_BUILDKIT=1 DINKSTER_SEED_FIXTURES=0 docker-compose up --build --wait
-docker-compose exec -T registry python -c 'from pathlib import Path; from dinkster_registry_service.artifacts import build_registry_fixture_archive; from dinkster_registry_service.seed import FIXTURE_ROOT; Path("/tmp/example-pack.zip").write_bytes(build_registry_fixture_archive(FIXTURE_ROOT / "example-pack"))'
-candidate_id="$(docker-compose exec -T registry dinkster-registry submit /tmp/example-pack.zip --pack example-pack --version 1.2.3)"
+docker-compose exec -T registry dinkster-registry admin add-user operator
+docker-compose exec -T registry dinkster-registry admin add-publisher dinkster --owner operator
+docker-compose exec -T registry python -c 'from pathlib import Path; from dinkster_registry_service.artifacts import build_registry_fixture_archive; from dinkster_registry_service.seed import FIXTURE_ROOT; Path("/tmp/example_pack-1.2.3-py3-none-any.whl").write_bytes(build_registry_fixture_archive(FIXTURE_ROOT / "example-pack"))'
+candidate_id="$(docker-compose exec -T registry dinkster-registry submit /tmp/example_pack-1.2.3-py3-none-any.whl --pack example-pack --version 1.2.3 --publisher dinkster --submitted-by operator)"
 docker-compose exec -T registry dinkster-registry status "$candidate_id"
 curl --fail http://127.0.0.1:18041/v1/packs/example-pack/versions/1.2.3
 ```
@@ -433,7 +510,7 @@ accepted bytes atomically, reads them in bounded chunks, and verifies the
 declared size and BLAKE3 digest before returning them. Objects live at:
 
 ```text
-artifacts/blake3/<first-two-hex>/<64-hex>.dinksterpack.zip
+artifacts/blake3/<first-two-hex>/<64-hex>.whl
 ```
 
 Quarantined uploads live at `quarantine/uploads/<candidate-uuid>` and are not
@@ -510,12 +587,12 @@ CI runs these checks against PostgreSQL 16, starts the HTTP conformance runner,
 builds the container without dependency credentials, inspects image contents,
 runs the isolated probe under bubblewrap, and runs conformance against the image.
 
-The container also downloads and admits all 14 official packs pinned by
-`scripts/release-packs.lock`. This fixture names independently published registry
-versions and BLAKE3 digests, not ephemeral engine releases. The download check
-verifies public publisher ownership, release identity, size, archive digest and
-manifest identity before the full isolated admission check. Legacy manifests may
-omit a version; declared versions must match, as in ordinary admission. Fixture
-updates select published versions explicitly and commit their immutable digests;
-CI never follows latest versions. Engine release retention cannot delete these
-registry-owned artifacts, and no engine release asset publication is required.
+The container also admits the unchanged first-party wheel in `fixtures/wheels`,
+pinned by source commit, size and SHA-256 in `scripts/release-packs.lock`.
+It checks wheel identity, submits through the authenticated HTTP publisher route,
+and runs the isolated scanner through promotion. It then retrieves the static
+index, verifies artifact bytes and schema ids over HTTP, and confirms that a
+queued legacy ZIP is rejected with `wheel.required`.
+The remote pack has an empty node catalog without a gateway;
+the separate isolated-probe fixture covers populated schemas. This replaces the
+withdrawn ZIP-release download check; CI does not depend on the live registry.

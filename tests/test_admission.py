@@ -20,11 +20,8 @@ from uuid import UUID
 import pytest
 from dinkster_registry.archive_admission import (
     StageResult,
-    extracted_archive,
     run_doctor_static,
     run_executable_probe,
-    run_fast_security,
-    run_ingest_integrity,
 )
 from dinkster_workers.sandbox import ProbeJail
 from fastapi.testclient import TestClient
@@ -50,6 +47,12 @@ from dinkster_registry_service.object_store import LocalFilesystemObjectStore, O
 from dinkster_registry_service.principals import PrincipalRepository
 from dinkster_registry_service.seed import FIXTURE_ROOT, seed_fixtures
 from dinkster_registry_service.settings import ServerSettings
+from dinkster_registry_service.wheels import (
+    extracted_wheel,
+    inspect_wheel,
+    run_wheel_integrity,
+    run_wheel_security,
+)
 
 
 def _fixture_source(tmp_path: Path, name: str = "example-pack") -> Path:
@@ -57,6 +60,7 @@ def _fixture_source(tmp_path: Path, name: str = "example-pack") -> Path:
     shutil.copytree(FIXTURE_ROOT / "example-pack", source)
     manifest_path = source / "dinkster-pack.toml"
     manifest = manifest_path.read_text()
+    manifest = manifest.replace('publisher = "dinkster"\n', "")
     manifest = manifest.replace('name = "example-pack"', f'name = "{name}"')
     manifest = manifest.replace('namespaces = ["example"]', f'namespaces = ["{name}"]')
     manifest_path.write_text(manifest)
@@ -65,8 +69,13 @@ def _fixture_source(tmp_path: Path, name: str = "example-pack") -> Path:
     return source
 
 
-def _archive(tmp_path: Path, name: str = "example-pack") -> bytes:
-    return build_registry_fixture_archive(_fixture_source(tmp_path, name))
+def _archive(tmp_path: Path, name: str = "example-pack", version: str = "1.2.3") -> bytes:
+    source = _fixture_source(tmp_path, name)
+    manifest = source / "dinkster-pack.toml"
+    manifest.write_text(
+        manifest.read_text().replace("[pack]\n", f'[pack]\nversion = "{version}"\nengine = ">=0"\n')
+    )
+    return build_registry_fixture_archive(source)
 
 
 def _service(
@@ -115,13 +124,15 @@ def test_mandatory_stage_functions_accept_the_registry_fixture(
     database: Database, tmp_path: Path
 ) -> None:
     archive = _archive(tmp_path)
-    assert not run_ingest_integrity(archive, len(archive), artifact_digest(archive)).blocked
-    with extracted_archive(archive) as root:
+    assert not run_wheel_integrity(
+        archive, len(archive), artifact_digest(archive), "example-pack", "1.2.3"
+    ).blocked
+    with extracted_wheel(archive, inspect_wheel(archive, "example-pack", "1.2.3")) as root:
         with database.session() as session:
             manifest = run_manifest_admission(root, "example-pack", "1.2.3", session)
         doctor = run_doctor_static(root)
         probe = run_executable_probe(root, require_isolation=False)
-    security = run_fast_security(archive)
+    security = run_wheel_security(archive)
     assert not manifest.blocked
     assert not doctor.blocked
     assert not probe.blocked
@@ -575,7 +586,7 @@ def test_malformed_zip_rejects(database: Database, tmp_path: Path) -> None:
     service = _service(database, tmp_path)
     data = b"not a zip archive"
     candidate_id = service.submit(data, pack_name="broken-pack", version="1.0")
-    _assert_rejected(service, candidate_id, "integrity.invalid-archive")
+    _assert_rejected(service, candidate_id, "wheel.required")
 
 
 def test_path_traversal_entry_rejects(database: Database, tmp_path: Path) -> None:
@@ -592,31 +603,27 @@ def test_path_traversal_entry_rejects(database: Database, tmp_path: Path) -> Non
             archive.writestr(info, payload)
     service = _service(database, tmp_path)
     candidate_id = service.submit(output.getvalue(), pack_name="unsafe-pack", version="1.0")
-    _assert_rejected(service, candidate_id, "integrity.invalid-archive")
+    _assert_rejected(service, candidate_id, "wheel.invalid")
 
 
 @pytest.mark.parametrize(
-    ("submitted_name", "submitted_version", "accepted"),
-    (("other-pack", "1.2.3", False), ("example-pack", "1.2.4", True)),
+    ("submitted_name", "submitted_version", "code"),
+    (
+        ("other-pack", "1.2.3", "wheel.distribution-name"),
+        ("example-pack", "1.2.4", "wheel.invalid"),
+    ),
 )
-def test_manifest_name_matches_and_submission_owns_version(
+def test_wheel_name_and_version_match_submission(
     database: Database,
     tmp_path: Path,
     submitted_name: str,
     submitted_version: str,
-    accepted: bool,
+    code: str,
 ) -> None:
     service = _service(database, tmp_path)
     archive = _archive(tmp_path)
     candidate_id = service.submit(archive, pack_name=submitted_name, version=submitted_version)
-    if accepted:
-        assert service.run_once()
-        assert service.status(candidate_id).status == "accepted"
-        with database.session() as session:
-            release = session.scalar(select(ReleaseRecord))
-            assert release is not None and release.version == submitted_version
-    else:
-        _assert_rejected(service, candidate_id, "manifest.invalid")
+    _assert_rejected(service, candidate_id, code)
 
 
 @pytest.mark.parametrize("submitted_version", ("1.2.3", "1.2.4"))
@@ -635,7 +642,7 @@ def test_declared_pack_version_matches_submission_and_retains_engine_range(
         version=submitted_version,
     )
     if submitted_version != "1.2.3":
-        _assert_rejected(service, candidate_id, "manifest.invalid")
+        _assert_rejected(service, candidate_id, "wheel.invalid")
         return
     assert service.run_once()
     assert service.status(candidate_id).status == "accepted"
@@ -655,7 +662,9 @@ def test_official_claims_require_registry_publisher_and_keep_exact_ids(
     source = _fixture_source(tmp_path, "official-pack")
     manifest = source / "dinkster-pack.toml"
     manifest.write_text(
-        manifest.read_text().replace(
+        manifest.read_text()
+        .replace("[pack]\n", '[pack]\npublisher = "dinkster"\n')
+        .replace(
             'namespaces = ["official-pack"]',
             'namespaces = ["std", "ExampleResize", "ExampleSave"]',
         )
@@ -670,7 +679,7 @@ def test_official_claims_require_registry_publisher_and_keep_exact_ids(
     candidate_id = service.submit(
         build_registry_fixture_archive(source),
         pack_name="official-pack",
-        version="2.0",
+        version="1.2.3",
         publisher=publisher,
     )
     if publisher is None:
@@ -688,7 +697,7 @@ def test_official_claims_require_registry_publisher_and_keep_exact_ids(
 
 
 @pytest.mark.parametrize("publisher", ("example-org", "other-org", None))
-@pytest.mark.parametrize("claim", ("shared", "shared.child"))
+@pytest.mark.parametrize("claim", ("shared-child", "shared-child-grandchild"))
 def test_namespace_overlap_is_exclusive_to_a_publisher(
     database: Database, tmp_path: Path, publisher: str | None, claim: str
 ) -> None:
@@ -697,26 +706,20 @@ def test_namespace_overlap_is_exclusive_to_a_publisher(
     for name in ("example-org", "other-org"):
         principals.register_publisher(name, "operator", datetime.now(UTC).isoformat())
     service = _service(database, tmp_path)
-    for name, owner, namespace in (
-        ("first-pack", "example-org", "shared"),
-        ("second-pack", publisher, claim),
+    for name, owner in (
+        ("shared", "example-org"),
+        (claim, publisher),
     ):
         source = _fixture_source(tmp_path, name)
-        manifest = source / "dinkster-pack.toml"
-        manifest.write_text(
-            manifest.read_text().replace(
-                f'namespaces = ["{name}"]', f'namespaces = ["{name}", "{namespace}"]'
-            )
-        )
         candidate = service.submit(
             build_registry_fixture_archive(source),
             pack_name=name,
-            version="1.0",
+            version="1.2.3",
             publisher=owner,
         )
         assert service.run_once()
         status = service.status(candidate)
-        if name == "first-pack" or publisher == "example-org":
+        if name == "shared" or publisher == "example-org":
             assert status.status == "accepted", status
         else:
             assert status.status == "rejected"
@@ -726,7 +729,11 @@ def test_namespace_overlap_is_exclusive_to_a_publisher(
 @pytest.mark.parametrize("publisher", ("example-org", "other-org", None))
 @pytest.mark.parametrize(
     ("first_claim", "second_claim"),
-    (("shared", "shared"), ("shared", "shared.child"), ("shared.child", "shared")),
+    (
+        ("shared", "shared-child"),
+        ("shared", "shared-child-grandchild"),
+        ("shared-child", "shared"),
+    ),
 )
 def test_promotion_rechecks_namespace_grants_after_both_candidates_scan(
     database: Database,
@@ -741,22 +748,16 @@ def test_promotion_rechecks_namespace_grants_after_both_candidates_scan(
         principals.register_publisher(name, "operator", datetime.now(UTC).isoformat())
     service = _service(database, tmp_path)
     candidates = []
-    for name, owner, namespace in (
-        ("first-pack", "example-org", first_claim),
-        ("second-pack", publisher, second_claim),
+    for name, owner in (
+        (first_claim, "example-org"),
+        (second_claim, publisher),
     ):
         source = _fixture_source(tmp_path, name)
-        manifest = source / "dinkster-pack.toml"
-        manifest.write_text(
-            manifest.read_text().replace(
-                f'namespaces = ["{name}"]', f'namespaces = ["{name}", "{namespace}"]'
-            )
-        )
         (source / "extension.so").write_bytes(b"synthetic native inventory fixture")
         candidate = service.submit(
             build_registry_fixture_archive(source),
             pack_name=name,
-            version="1.0",
+            version="1.2.3",
             publisher=owner,
         )
         assert service.run_once()
@@ -797,25 +798,64 @@ def test_duplicate_semantic_version_rejects(database: Database, tmp_path: Path) 
     store = LocalFilesystemObjectStore(tmp_path / "objects")
     seed_fixtures(database, store)
     service = AdmissionService(database, store, require_isolation=False)
-    archive = _archive(tmp_path)
+    archive = _archive(tmp_path, version="1.2.3.0")
     candidate_id = service.submit(archive, pack_name="example-pack", version="1.2.3.0")
     _assert_rejected(service, candidate_id, "manifest.invalid")
     with database.session() as session:
         assert session.scalar(select(func.count()).select_from(ReleaseRecord)) == 2
 
 
-def test_active_dependency_is_validated_and_recorded(database: Database, tmp_path: Path) -> None:
+def test_active_dependency_is_validated_and_recorded(
+    database: Database, tmp_path: Path, probe_package_index: tuple[str, list[str]]
+) -> None:
     store = LocalFilesystemObjectStore(tmp_path / "objects")
-    seed_fixtures(database, store)
-    source = _fixture_source(tmp_path, "dependent-pack")
-    manifest = source / "dinkster-pack.toml"
-    manifest.write_text(manifest.read_text() + '\n[pack.dependencies]\nexample-pack = ">=1,<2"\n')
-    service = AdmissionService(database, store, require_isolation=False)
-    candidate_id = service.submit(
-        build_registry_fixture_archive(source), pack_name="dependent-pack", version="1.2.3"
+    service = AdmissionService(
+        database,
+        store,
+        require_isolation=False,
+        settings=ServerSettings(probe_package_index_url=probe_package_index[0]),
+    )
+    helper = _fixture_source(tmp_path)
+    helper_manifest = helper / "dinkster-pack.toml"
+    helper_manifest.write_text(
+        helper_manifest.read_text() + '\n[pack.extra-requires]\ncpu = ["probe-dependency==1.0"]\n'
+    )
+    (helper / "helpers.py").write_text("from probe_dependency import VALUE\n")
+    helper_id = service.submit(
+        build_registry_fixture_archive(helper), pack_name="example-pack", version="1.2.3"
     )
     assert service.run_once()
-    assert service.status(candidate_id).status == "accepted"
+    assert service.status(helper_id).status == "accepted"
+    bridge = _fixture_source(tmp_path, "bridge-pack")
+    bridge_manifest = bridge / "dinkster-pack.toml"
+    bridge_manifest.write_text(
+        bridge_manifest.read_text() + '\n[pack.dependencies]\nexample-pack = ">=1,<2"\n'
+    )
+    (bridge / "helpers.py").write_text("from example_pack.helpers import VALUE\n")
+    bridge_id = service.submit(
+        build_registry_fixture_archive(bridge), pack_name="bridge-pack", version="1.2.3"
+    )
+    assert service.run_once()
+    assert service.status(bridge_id).status == "accepted", service.status(bridge_id)
+    source = _fixture_source(tmp_path, "dependent-pack")
+    manifest = source / "dinkster-pack.toml"
+    manifest.write_text(manifest.read_text() + '\n[pack.dependencies]\nbridge-pack = ">=1,<2"\n')
+    nodes = source / "nodes.py"
+    nodes.write_text(
+        "from bridge_pack.helpers import VALUE\n"
+        + nodes.read_text().replace("version=2,", "version=VALUE,")
+    )
+    data = build_registry_fixture_archive(source)
+    candidate_id = service.submit(data, pack_name="dependent-pack", version="1.2.3")
+    assert service.run_once()
+    assert service.status(candidate_id).status == "accepted", service.status(candidate_id)
+    schemas = json.loads(store.read("static/packs/dependent-pack/1.2.3/schemas.json"))["schemas"]
+    assert (
+        next(item for item in schemas if item["nodeType"] == "dependent-pack.resize")["schema"][
+            "version"
+        ]
+        == 83
+    )
     with database.session() as session:
         release = session.scalar(
             select(ReleaseRecord)
@@ -827,7 +867,32 @@ def test_active_dependency_is_validated_and_recorded(database: Database, tmp_pat
             select(ReleaseDependencyRecord).where(ReleaseDependencyRecord.release_id == release.id)
         )
         assert dependency is not None
-        assert (dependency.pack_name, dependency.version_range) == ("example-pack", "<2,>=1")
+        assert (dependency.pack_name, dependency.version_range) == ("bridge-pack", "<2,>=1")
+        assert release.manifest["pythonRequirements"] == []
+    entry = next(
+        item
+        for item in json.loads(store.read("static/packs/index.json"))["items"]
+        if item["name"] == "dependent-pack"
+    )
+    assert store.read("static/" + entry["wheels"][0]["url"]) == data
+    for name, statement, code in (
+        ("undeclared-pack", "from example_pack.helpers import VALUE", "entry.unresolvable"),
+        (
+            "private-pack",
+            "from dinkster_nodes_provider._helpers import VALUE",
+            "imports.private-module",
+        ),
+    ):
+        refused = _fixture_source(tmp_path, name)
+        nodes = refused / "nodes.py"
+        nodes.write_text(statement + "\n" + nodes.read_text())
+        candidate = service.submit(
+            build_registry_fixture_archive(refused), pack_name=name, version="1.2.3"
+        )
+        assert service.run_once()
+        status = service.status(candidate)
+        assert status.status == "rejected", status
+        assert any(finding.code == code for finding in status.findings), status
 
 
 @pytest.mark.parametrize("version", ("1.3.dev42", "2.1.dev42"))
@@ -835,14 +900,16 @@ def test_active_development_dependency_must_satisfy_version_bounds(
     database: Database, tmp_path: Path, version: str
 ) -> None:
     service = _service(database, tmp_path)
-    dependency = service.submit(_archive(tmp_path), pack_name="example-pack", version=version)
+    dependency = service.submit(
+        _archive(tmp_path, version=version), pack_name="example-pack", version=version
+    )
     assert service.run_once()
     assert service.status(dependency).status == "accepted"
     source = _fixture_source(tmp_path, "dependent-pack")
     manifest = source / "dinkster-pack.toml"
     manifest.write_text(manifest.read_text() + '\n[pack.dependencies]\nexample-pack = ">=1,<2"\n')
     candidate = service.submit(
-        build_registry_fixture_archive(source), pack_name="dependent-pack", version="1.0"
+        build_registry_fixture_archive(source), pack_name="dependent-pack", version="1.2.3"
     )
     assert service.run_once()
     status = service.status(candidate)
@@ -934,10 +1001,12 @@ def test_unexpected_scanner_exception_becomes_block_finding(
     service = _service(database, tmp_path)
     candidate_id = service.submit(_archive(tmp_path), pack_name="example-pack", version="1.2.3")
 
-    def fail_integrity(data: bytes, declared_size: int, declared_digest: str) -> None:
+    def fail_integrity(
+        data: bytes, declared_size: int, declared_digest: str, name: str, version: str
+    ) -> None:
         raise RuntimeError("pack-controlled detail")
 
-    monkeypatch.setattr(admission_module, "run_ingest_integrity", fail_integrity)
+    monkeypatch.setattr(admission_module, "run_wheel_integrity", fail_integrity)
     assert service.run_once()
     status = service.status(candidate_id)
     assert (status.status, status.reason) == ("rejected", "scanner.unexpected-error")
@@ -1237,7 +1306,7 @@ def _assert_reviewed_rescan_decision(
         if not accepted:
             assert service.run_once()
         for key in ("packs/index.json", "locales/index.json"):
-            index = client.get(f"/{key}")
+            index = client.get(f"/static/{key}")
             assert index.status_code == 200
             assert [item["name"] for item in index.json()["items"]] == (
                 ["reviewed-rescan-pack"] if accepted else []

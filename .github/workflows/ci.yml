@@ -179,13 +179,13 @@ jobs:
           test "$(docker inspect --format '{{.State.Running}}' "$name")" = true
           docker exec "$name" python conformance/run.py "$DINKSTER_PUBLIC_BASE_URL"
           SH
-      - name: Admit every published official pack and verify release-lock digests
+      - name: Admit pinned first-party wheel and verify static bytes
         run: |
           bash scripts/with-test-postgres.sh bash -e <<'SH'
           docker run --rm --privileged --network host \
             --env DINKSTER_DATABASE_URL \
             dinkster-registry:test \
-            bash -ec 'alembic upgrade head; python scripts/check-release-packs.py /tmp/official-packs --download-only; python scripts/check-release-packs.py /tmp/official-packs'
+            bash -ec 'alembic upgrade head; python scripts/check-release-packs.py'
           SH
       - name: Report AppArmor denials
         if: failure()

@@ -86,8 +86,8 @@ class ReleaseSummary(ResponseModel):
     published_at: datetime
     artifact_digest: str
     artifact_size: int
-    dinkster: str
-    license: str
+    dinkster: str | None
+    license: str | None
     platforms: list[str]
     node_types: list[str]
     trust_summary: TrustSummary
@@ -136,6 +136,11 @@ class ReleaseManifest(ResponseModel):
     python_requirements: list[str]
     dependencies: list[ReleaseDependency]
     node_source: Literal["remote-gateway-catalog"] | None = None
+
+
+class LibraryManifest(ResponseModel):
+    kind: Literal["library"]
+    python_requirements: list[str]
 
 
 class ReleaseNode(ResponseModel):
@@ -230,7 +235,7 @@ class ReleaseDetail(ResponseModel):
     published_by: Publisher
     artifact: ArtifactMetadata
     install_locks: dict[str, InstallationLock] = Field(default_factory=dict)
-    manifest: ReleaseManifest
+    manifest: ReleaseManifest | LibraryManifest
     nodes: list[ReleaseNode]
     trust_signals: TrustSignals
     cloud: CloudEligibility

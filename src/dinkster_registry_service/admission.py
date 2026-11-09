@@ -2,30 +2,39 @@ from __future__ import annotations
 
 import io
 import time
+import tomllib
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
+import tomli_w
 from dinkster_registry.archive_admission import (
     SCAN_POLICY_VERSION,
     AdmissionFinding,
     StageResult,
-    extracted_archive,
     run_doctor_static,
     run_executable_probe,
-    run_fast_security,
-    run_ingest_integrity,
 )
-from dinkster_schema import canonical_claim, canonical_name, claims_conflict
+from dinkster_schema import (
+    canonical_claim,
+    canonical_name,
+    claims_conflict,
+    comfy_alias_registry_problems,
+    comfy_group_registry_problems,
+    reserved_root,
+    schema_from_wire,
+)
+from dinkster_workers.manifest import load_manifest
+from packaging.requirements import Requirement
 from packaging.version import Version
 from sqlalchemy import and_, or_, select, text
 from sqlalchemy.orm import Session
 
-from .admission_checks import run_manifest_admission
-from .artifacts import MANIFEST_NAME
+from .admission_checks import check_wheel_catalog, run_manifest_admission
 from .database import (
     ArtifactRecord,
     AuditEventRecord,
@@ -51,6 +60,13 @@ from .pack_locks import lock_object_key, parse_pack_locks, quarantine_lock_key
 from .seed import MEDIA_TYPE
 from .settings import ServerSettings
 from .versioning import public_version_key, require_public_version
+from .wheels import (
+    WheelError,
+    extracted_wheel,
+    inspect_wheel,
+    run_wheel_integrity,
+    run_wheel_security,
+)
 
 DEFAULT_LEASE_SECONDS = 60
 RESCAN_INTERVAL = timedelta(days=30)
@@ -585,7 +601,10 @@ class AdmissionService:
 
     def _prepare_promotion(self, claim: CandidateClaim, data: bytes) -> None:
         try:
+            wheel = inspect_wheel(data, claim.pack_name, claim.version)
             with self.database.session() as session, session.begin():
+                if not self.database.is_postgresql:
+                    session.connection().exec_driver_sql("BEGIN IMMEDIATE")
                 candidate = self._leased_candidate(session, claim)
                 if self.database.is_postgresql:
                     session.execute(
@@ -593,6 +612,7 @@ class AdmissionService:
                         {"pack_name": candidate.pack_name},
                     )
                     session.execute(text("LOCK TABLE namespace_grants IN SHARE ROW EXCLUSIVE MODE"))
+                check_wheel_catalog(wheel, session)
                 pack = session.scalar(
                     select(PackRecord)
                     .where(PackRecord.name == candidate.pack_name)
@@ -658,6 +678,8 @@ class AdmissionService:
                         for value in cast("list[str]", manifest["namespaces"])
                     ),
                 }
+                if wheel.library:
+                    claims = set()
                 grants = list(session.scalars(select(NamespaceGrantRecord)))
                 for claim_name in sorted(claims):
                     for held_grant in grants:
@@ -682,7 +704,9 @@ class AdmissionService:
 
                 final_key = artifact_object_key(candidate.declared_digest)
                 with zipfile.ZipFile(io.BytesIO(data)) as archive:
-                    manifest_digest = artifact_digest(archive.read(MANIFEST_NAME))
+                    manifest_digest = artifact_digest(
+                        archive.read(wheel.manifest_path) if wheel.manifest_path else b""
+                    )
                 artifact = session.get(ArtifactRecord, candidate.declared_digest)
                 if artifact is None:
                     session.add(
@@ -827,6 +851,13 @@ class AdmissionService:
                 )
                 candidate.status = "promoting"
                 candidate.status_reason = None
+        except WheelError as exc:
+            self._record_stage(
+                claim,
+                "commit",
+                StageResult((AdmissionFinding(exc.code, "error", "block", str(exc)),)),
+            )
+            return
         except PromotionConflict as exc:
             self._record_promotion_conflict(claim, str(exc))
             return
@@ -861,8 +892,12 @@ class AdmissionService:
             try:
                 if self.object_store.exists(source_key):
                     data = self.object_store.read(source_key, max_size=MAX_ARTIFACT_SIZE)
-                    integrity = run_ingest_integrity(
-                        data, candidate.declared_size, candidate.declared_digest
+                    integrity = run_wheel_integrity(
+                        data,
+                        candidate.declared_size,
+                        candidate.declared_digest,
+                        candidate.pack_name,
+                        candidate.version,
                     )
                     if integrity.blocked:
                         raise AdmissionError("quarantine object changed before promotion")
@@ -992,6 +1027,82 @@ class AdmissionService:
                 )
             )
 
+    def _probe_with_dependencies(self, root: Path) -> StageResult:
+        manifest_path = root / "dinkster-pack.toml"
+        original = manifest_path.read_bytes()
+        manifest = load_manifest(manifest_path)
+        pending = list(manifest.dependencies)
+        selected: dict[str, str] = {}
+        requirements = set(manifest.requires_for("cpu"))
+        try:
+            with self.database.session() as session:
+                while pending:
+                    dependency = pending.pop(0)
+                    if dependency.pack in selected:
+                        if not dependency.accepts(selected[dependency.pack]):
+                            raise ValueError(f"Conflicting helper dependency {dependency.pack!r}.")
+                        continue
+                    releases = session.scalars(
+                        select(ReleaseRecord)
+                        .join(PackRecord, PackRecord.id == ReleaseRecord.pack_id)
+                        .where(
+                            PackRecord.name == dependency.pack,
+                            PackRecord.visibility == "public",
+                            ReleaseRecord.state == "active",
+                        )
+                    )
+                    release = max(
+                        (item for item in releases if dependency.accepts(item.version)),
+                        key=lambda item: Version(item.version),
+                        default=None,
+                    )
+                    if release is None:
+                        raise ValueError(f"No active helper dependency {dependency.pack!r}.")
+                    selected[dependency.pack] = release.version
+                    artifact = session.get(ArtifactRecord, release.artifact_digest)
+                    assert artifact is not None
+                    data = self.object_store.read(artifact.object_key, max_size=MAX_ARTIFACT_SIZE)
+                    if artifact_digest(data) != artifact.digest or len(data) != artifact.size:
+                        raise ValueError(f"Helper artifact changed for {dependency.pack!r}.")
+                    wheel = inspect_wheel(data, dependency.pack, release.version)
+                    if wheel.library:
+                        raise ValueError("Pack dependencies must name packs, not libraries.")
+                    with extracted_wheel(data, wheel) as dependency_root:
+                        helper = load_manifest(dependency_root / "dinkster-pack.toml")
+                        pending.extend(helper.dependencies)
+                        requirements.update(helper.requires_for("cpu"))
+                    # Stage only the installed wheel layout, not the dependency's
+                    # relocated probe assets. The submitted pack keeps its root assets.
+                    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                        for member in archive.infolist():
+                            if member.is_dir():
+                                continue
+                            destination = root / member.filename
+                            if destination.exists():
+                                raise ValueError("Helper wheel overlaps the submitted pack.")
+                            destination.parent.mkdir(parents=True, exist_ok=True)
+                            destination.write_bytes(archive.read(member))
+            if selected:
+                # Only the disposable probe view receives the combined CPU
+                # requirements. Published metadata and the wheel remain unchanged.
+                document = tomllib.loads(original.decode())
+                document["pack"]["requires"] = sorted(requirements)
+                document["pack"].pop("extra-requires", None)
+                manifest_path.write_text(tomli_w.dumps(document))
+            return run_executable_probe(
+                root, settings=self.settings, require_isolation=self.require_isolation
+            )
+        except (ValueError, ObjectStoreError, FileNotFoundError) as exc:
+            return StageResult(
+                (
+                    AdmissionFinding(
+                        "probe.pack-dependencies-unavailable", "error", "block", str(exc)
+                    ),
+                )
+            )
+        finally:
+            manifest_path.write_bytes(original)
+
     def _process(self, claim: CandidateClaim) -> None:
         try:
             data = self.object_store.read(claim.object_key, max_size=MAX_ARTIFACT_SIZE)
@@ -1005,7 +1116,9 @@ class AdmissionService:
             )
             return
         review = False
-        integrity = run_ingest_integrity(data, claim.declared_size, claim.declared_digest)
+        integrity = run_wheel_integrity(
+            data, claim.declared_size, claim.declared_digest, claim.pack_name, claim.version
+        )
         if claim.kind == "upload":
             if not self._record_stage(claim, "ingest_integrity", integrity):
                 return
@@ -1013,32 +1126,105 @@ class AdmissionService:
         elif integrity.blocked:
             self._record_stage(claim, "ingest_integrity", integrity)
             return
-        with extracted_archive(data) as root:
+        wheel = inspect_wheel(data, claim.pack_name, claim.version)
+        try:
+            with self.database.session() as session:
+                check_wheel_catalog(wheel, session)
+        except WheelError as exc:
+            self._record_stage(
+                claim,
+                "wheel",
+                StageResult((AdmissionFinding(exc.code, "error", "block", str(exc)),)),
+            )
+            return
+        with extracted_wheel(data, wheel) as root:
             if claim.kind == "upload":
                 with self.database.session() as session:
                     candidate = self._leased_candidate(session, claim)
-                    manifest = run_manifest_admission(
-                        root,
-                        claim.pack_name,
-                        claim.version,
-                        session,
-                        publisher=candidate.publisher_id,
+                    manifest = (
+                        StageResult(
+                            data={
+                                "kind": "library",
+                                "namespaces": [],
+                                "dependencies": [],
+                                "platforms": [],
+                                "pythonRequirements": list(wheel.requirements),
+                                "localeCatalogs": [],
+                                "templates": [],
+                            }
+                        )
+                        if wheel.library
+                        else run_manifest_admission(
+                            root,
+                            claim.pack_name,
+                            claim.version,
+                            session,
+                            publisher=candidate.publisher_id,
+                        )
                     )
+                    if (
+                        wheel.library
+                        and reserved_root(claim.pack_name) is not None
+                        and candidate.publisher_id != "dinkster"
+                    ):
+                        manifest = StageResult(
+                            (
+                                AdmissionFinding(
+                                    "wheel.reserved-name",
+                                    "error",
+                                    "block",
+                                    "This distribution name requires the Dinkster publisher.",
+                                ),
+                            )
+                        )
+                if not manifest.blocked and manifest.data is not None:
+                    metadata = manifest.data
+                    if {Requirement(value) for value in metadata["pythonRequirements"]} != {
+                        Requirement(value) for value in wheel.requirements
+                    }:
+                        manifest = StageResult(
+                            (
+                                AdmissionFinding(
+                                    "wheel.invalid",
+                                    "error",
+                                    "block",
+                                    "Manifest requires and METADATA Requires-Dist differ.",
+                                ),
+                            )
+                        )
+                    else:
+                        metadata["wheel"] = {
+                            "filename": wheel.filename,
+                            "sha256": wheel.sha256,
+                            "imports": list(wheel.imports),
+                            "library": wheel.library,
+                            "tags": sorted(str(tag) for tag in wheel.tags),
+                            "manifestPath": wheel.manifest_path,
+                        }
                 if not self._record_stage(claim, "manifest", manifest):
                     return
                 review |= manifest.review
-            doctor = run_doctor_static(root)
+            doctor = (
+                StageResult(
+                    data={
+                        "status": "passed",
+                        "doctorVersion": "0.0.1",
+                        "reportVersion": 1,
+                        "errorCount": 0,
+                        "warningCount": 0,
+                    }
+                )
+                if wheel.library
+                else run_doctor_static(root)
+            )
             if not self._record_stage(claim, "doctor_static", doctor):
                 return
             review |= doctor.review
-            if claim.kind == "upload":
+            if claim.kind == "upload" and wheel.library:
+                self._record_stage(claim, "executable_probe", StageResult(data={"schemas": []}))
+            if claim.kind == "upload" and not wheel.library:
                 with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(
-                        run_executable_probe,
-                        root,
-                        settings=self.settings,
-                        require_isolation=self.require_isolation,
-                    )
+                    future = executor.submit(self._probe_with_dependencies, root)
                     while not wait((future,), timeout=self.lease_seconds / 3).done:
                         with self.database.session() as session, session.begin():
                             candidate = self._leased_candidate(session, claim)
@@ -1049,7 +1235,29 @@ class AdmissionService:
                 if not self._record_stage(claim, "executable_probe", probe):
                     return
                 review |= probe.review
-            security = run_fast_security(data)
+                assert probe.data is not None
+                parsed = load_manifest(root / "dinkster-pack.toml")
+                schemas = {
+                    item["nodeType"]: schema_from_wire(item["schema"])
+                    for item in probe.data["schemas"]
+                }
+                problems: list[str] = []
+                if parsed.comfy_aliases is not None:
+                    problems.extend(comfy_alias_registry_problems(parsed.comfy_aliases, schemas))
+                if parsed.comfy_groups is not None:
+                    problems.extend(comfy_group_registry_problems(parsed.comfy_groups, schemas))
+                if problems and not self._record_stage(
+                    claim,
+                    "translations",
+                    StageResult(
+                        tuple(
+                            AdmissionFinding("translations.invalid", "error", "block", problem)
+                            for problem in problems
+                        )
+                    ),
+                ):
+                    return
+            security = run_wheel_security(data)
             if not self._record_stage(claim, "fast_security", security):
                 return
             review |= security.review

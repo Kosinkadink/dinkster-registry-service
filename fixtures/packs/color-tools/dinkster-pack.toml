@@ -1,5 +1,6 @@
 [pack]
 name = "color-tools"
+version = "0.4.0"
 publisher = "dinkster"
 namespaces = ["color"]
 platforms = ["darwin", "linux", "win32"]

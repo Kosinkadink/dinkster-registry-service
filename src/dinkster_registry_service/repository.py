@@ -173,6 +173,7 @@ class CatalogRepository:
     def _release_summary(cls, session: Session, release: ReleaseRecord) -> dict[str, object]:
         artifact = cls._artifact(session, release.artifact_digest)
         manifest = release.manifest
+        library = manifest.get("kind") == "library"
         try:
             return {
                 "version": release.version,
@@ -181,8 +182,8 @@ class CatalogRepository:
                 "publishedAt": release.published_at,
                 "artifactDigest": artifact.digest,
                 "artifactSize": artifact.size,
-                "dinkster": manifest["dinkster"],
-                "license": manifest["license"],
+                "dinkster": None if library else manifest["dinkster"],
+                "license": None if library else manifest["license"],
                 "platforms": manifest["platforms"],
                 "nodeTypes": [node.node_type for node in cls._nodes(session, release.id)],
                 "trustSummary": cls._trust_summary(session, release),
