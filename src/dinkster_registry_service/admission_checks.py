@@ -6,7 +6,6 @@ from dinkster_registry.archive_admission import AdmissionFinding, StageResult
 from dinkster_registry.archive_admission import run_manifest_admission as check_archive_manifest
 from dinkster_schema import (
     claims_conflict,
-    comfy_alias_registry_to_wire,
     comfy_group_registry_to_wire,
 )
 from dinkster_workers.manifest import load_manifest
@@ -92,7 +91,7 @@ def run_manifest_admission(
                     ),
                 )
             )
-        if manifest.comfy_aliases is not None or manifest.comfy_groups is not None:
+        if manifest.comfy_groups is not None:
             if publisher != "dinkster":
                 raise ValueError("translation records require the Dinkster publisher")
             metadata["translations"] = [
@@ -100,11 +99,6 @@ def run_manifest_admission(
                     "name": pack_name,
                     "version": release_version,
                     "publisher": publisher,
-                    "aliases": (
-                        comfy_alias_registry_to_wire(manifest.comfy_aliases)
-                        if manifest.comfy_aliases is not None
-                        else None
-                    ),
                     "groups": (
                         comfy_group_registry_to_wire(manifest.comfy_groups)
                         if manifest.comfy_groups is not None

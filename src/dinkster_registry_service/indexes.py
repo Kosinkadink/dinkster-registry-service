@@ -111,17 +111,12 @@ class StaticIndexes:
                         for rule in item["schema"].get("replacements", [])
                     ]
                     for translation in release.manifest.get("translations", []):
-                        for kind in ("aliases", "groups"):
-                            registry = translation.get(kind)
-                            if registry is None:
-                                continue
-                            for record in registry["records"]:
-                                rule = record["replacement"]
-                                rules.append((rule["from"], record["carrier"], rule))
-                                if kind == "aliases":
-                                    source = record["source"]["nodeClass"]
-                                    if source != rule["from"]:
-                                        rules.append((source, record["carrier"], rule))
+                        registry = translation.get("groups")
+                        if registry is None:
+                            continue
+                        for record in registry["records"]:
+                            rule = record["replacement"]
+                            rules.append((rule["from"], record["carrier"], rule))
                     replacements_by_pack[pack.name] = [
                         {
                             "from": source,

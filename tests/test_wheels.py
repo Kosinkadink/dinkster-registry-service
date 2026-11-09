@@ -16,18 +16,6 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
-from dinkster_schema import (
-    SCHEMA_WIRE_VERSION,
-    ComfyAliasConfidence,
-    ComfyAliasRecord,
-    ComfyAliasRegistry,
-    ComfyAliasSource,
-    ComfyAliasSourceSchema,
-    NodeSchema,
-    ReplacementCase,
-    ReplacementRule,
-    comfy_alias_registry_to_wire,
-)
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
@@ -288,17 +276,16 @@ def test_library_reserved_name_requires_authenticated_publisher(
 
 
 @pytest.mark.parametrize(
-    "publisher,carrier,declared_publisher",
+    "publisher,declared_publisher",
     [
-        ("dinkster", "example.resize", "dinkster"),
-        (None, "example.resize", ""),
-        (None, "example.resize", "dinkster"),
-        ("dinkster", "example.resize", "someone-else"),
-        ("dinkster", "example.missing", "dinkster"),
+        ("dinkster", "dinkster"),
+        (None, ""),
+        (None, "dinkster"),
+        ("dinkster", "someone-else"),
     ],
 )
-def test_translation_records_require_publisher_and_valid_carrier(
-    tmp_path: Path, publisher: str | None, carrier: str, declared_publisher: str
+def test_manifest_publisher_matches_authenticated_publisher(
+    tmp_path: Path, publisher: str | None, declared_publisher: str
 ) -> None:
     database = Database(f"sqlite:///{tmp_path / 'catalog.db'}")
     store = LocalFilesystemObjectStore(tmp_path / "objects")
@@ -311,26 +298,6 @@ def test_translation_records_require_publisher_and_valid_carrier(
             'publisher = "dinkster"', f'publisher = "{declared_publisher}"'
         )
     )
-    alias = comfy_alias_registry_to_wire(
-        ComfyAliasRegistry(
-            source_schemas=(
-                ComfyAliasSourceSchema(NodeSchema(node_type="legacy.resize"), SCHEMA_WIRE_VERSION),
-            ),
-            records=(
-                ComfyAliasRecord(
-                    id="comfy_alias:legacy-pack/Resize",
-                    mapping_kind="op",
-                    carrier=carrier,
-                    source=ComfyAliasSource(
-                        "legacy-pack", "Resize", "legacy.resize", "fixture-revision"
-                    ),
-                    replacement=ReplacementRule("legacy.resize", (ReplacementCase(to=carrier),)),
-                    confidence=ComfyAliasConfidence("exact", ("fixture-evidence",)),
-                ),
-            ),
-        )
-    )
-    (source / "comfy-aliases.json").write_text(json.dumps(alias))
     try:
         if publisher is not None:
             principals = PrincipalRepository(database)
@@ -346,57 +313,8 @@ def test_translation_records_require_publisher_and_valid_carrier(
         status = service.status(candidate)
         if declared_publisher and declared_publisher != publisher:
             assert status.reason == "manifest.publisher-mismatch"
-        elif publisher is None:
-            assert status.reason == "manifest.invalid"
-        elif carrier == "example.missing":
-            assert status.reason == "translations.invalid"
         else:
             assert status.status == "accepted", status
-            index = json.loads(store.read("static/translations/index.json"))
-            assert index == {
-                "schemaVersion": 1,
-                "items": [
-                    {
-                        "name": "example-pack",
-                        "version": "1.2.3",
-                        "publisher": "dinkster",
-                        "aliases": alias,
-                        "groups": None,
-                    }
-                ],
-            }
-            expected_rule = {"from": "legacy.resize", "cases": [{"to": "example.resize"}]}
-            app = create_app(
-                ServerSettings(
-                    database_url=f"sqlite:///{tmp_path / 'catalog.db'}",
-                    object_store_root=store.root,
-                )
-            )
-            with TestClient(app) as client:
-                assert client.get("/static/replacements/index.json").json() == {
-                    "schemaVersion": 1,
-                    "items": [
-                        {
-                            "from": source_type,
-                            "candidates": [
-                                {
-                                    "pack": "example-pack",
-                                    "version": "1.2.3",
-                                    "target": "example.resize",
-                                    "rule": expected_rule,
-                                }
-                            ],
-                        }
-                        for source_type in ("Resize", "legacy.resize")
-                    ],
-                }
-            with database.session() as session, session.begin():
-                release = session.scalar(select(ReleaseRecord))
-                assert release is not None
-                release.state = "yanked"
-            StaticIndexes(database, store, "http://testserver").rebuild()
-            assert json.loads(store.read("static/translations/index.json"))["items"] == []
-            assert json.loads(store.read("static/replacements/index.json"))["items"] == []
     finally:
         database.dispose()
 

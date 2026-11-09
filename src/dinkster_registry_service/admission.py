@@ -24,7 +24,6 @@ from dinkster_schema import (
     canonical_claim,
     canonical_name,
     claims_conflict,
-    comfy_alias_registry_problems,
     comfy_group_registry_problems,
     reserved_root,
     schema_from_wire,
@@ -1263,8 +1262,6 @@ class AdmissionService:
                     for item in probe.data["schemas"]
                 }
                 problems: list[str] = []
-                if parsed.comfy_aliases is not None:
-                    problems.extend(comfy_alias_registry_problems(parsed.comfy_aliases, schemas))
                 if parsed.comfy_groups is not None:
                     problems.extend(comfy_group_registry_problems(parsed.comfy_groups, schemas))
                 if problems and not self._record_stage(

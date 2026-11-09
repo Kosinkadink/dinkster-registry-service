@@ -42,7 +42,7 @@ manifest and is a pack, even when it has zero nodes.
 Reserved library names require the authenticated `dinkster` publisher
 (`wheel.reserved-name`). A declared manifest publisher must match the authenticated
 publisher (`manifest.publisher-mismatch`); declaring a name never grants authority.
-Alias and group records require the `dinkster` publisher, and their carriers and
+Group records require the `dinkster` publisher, and their carriers and
 replacement references are checked against the probed schemas
 (`translations.invalid`). Libraries appear in the install index but not the schema,
 locale or translation catalogs.
