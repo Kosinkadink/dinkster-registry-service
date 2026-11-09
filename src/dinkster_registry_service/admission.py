@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import socket
 import time
 import tomllib
 import zipfile
@@ -480,6 +481,13 @@ class AdmissionService:
             )
             scan = _scan_payload(scan_status, now)
             run_id = uuid7()
+            operator_details = result.operator_details
+            if stage == "executable_probe":
+                operator_details = {
+                    **(operator_details or {}),
+                    "scannerHost": socket.gethostname(),
+                    "scannerWorker": self.worker_id,
+                }
             session.add(
                 ReleaseScanRunRecord(
                     id=run_id,
@@ -490,7 +498,7 @@ class AdmissionService:
                     stage=stage,
                     attempt=claim.attempt,
                     policy_version=SCAN_POLICY_VERSION,
-                    operator_details=result.operator_details,
+                    operator_details=operator_details,
                     doctor=doctor,
                     scan=scan,
                     provenance=_provenance(candidate.submitted_by),

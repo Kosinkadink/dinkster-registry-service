@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -223,18 +224,45 @@ def test_probe_refuses_degraded_bubblewrap_jail(
     assert result.operator_details == {"jail": "degraded"}
 
 
-def test_configured_probe_timeout_is_honored(tmp_path: Path) -> None:
+@pytest.mark.parametrize("times_out", [False, True])
+def test_probe_timing_and_scanner_are_persisted(
+    database: Database, tmp_path: Path, times_out: bool
+) -> None:
     source = _fixture_source(tmp_path)
-    nodes = source / "nodes.py"
-    nodes.write_text("import time\ntime.sleep(2)\n" + nodes.read_text())
-    result = run_executable_probe(
-        source,
-        settings=ServerSettings(probe_timeout_seconds=1),
+    if times_out:
+        (source / "nodes.py").write_text("import threading\nthreading.Event().wait()\n")
+    service = AdmissionService(
+        database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        settings=ServerSettings(probe_timeout_seconds=1 if times_out else 30),
+        worker_id="timing-test-worker",
         require_isolation=False,
     )
-    assert result.blocked
-    assert result.findings[0].code == "probe.timeout"
-    assert result.findings[0].message == "Executable probe exceeded 1s."
+    candidate_id = service.submit(
+        build_registry_fixture_archive(source), pack_name="example-pack", version="1.2.3"
+    )
+    started = time.monotonic()
+    assert service.run_once()
+    total = time.monotonic() - started
+    status = service.status(candidate_id)
+    assert status.status == ("rejected" if times_out else "accepted")
+    with database.session() as session:
+        run = session.scalar(
+            select(ReleaseScanRunRecord).where(
+                ReleaseScanRunRecord.candidate_id == candidate_id,
+                ReleaseScanRunRecord.stage == "executable_probe",
+            )
+        )
+        assert run is not None and run.operator_details is not None
+        assert run.attempt == 1
+        assert run.operator_details["scannerHost"] == socket.gethostname()
+        assert run.operator_details["scannerWorker"] == "timing-test-worker"
+        elapsed = run.operator_details["elapsedSeconds"]
+        assert isinstance(elapsed, float) and 0 < elapsed <= total
+        if times_out:
+            assert elapsed >= 1
+            finding = next(f for f in status.findings if f.code == "probe.timeout")
+            assert finding.message == f"Executable probe exceeded 1s (elapsed {elapsed:.6f}s)."
 
 
 @pytest.fixture
