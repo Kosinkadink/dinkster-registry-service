@@ -47,6 +47,14 @@ replacement references are checked against the probed schemas
 (`translations.invalid`). Libraries appear in the install index but not the schema,
 locale or translation catalogs.
 
+`[pack.dependencies]` remains distinct from Python `requires`: it permits
+imports of a declared pack's public helpers. Admission stages hash-verified,
+active dependency wheels and their transitive pack dependencies inside the
+disposable probe root. Their CPU Python requirements are provisioned together;
+the submitted wheel and published manifest remain unchanged. Missing, conflicting
+or corrupt helper dependencies fail with `probe.pack-dependencies-unavailable`.
+Doctor still rejects private imports, and unrelated packs are not staged.
+
 ## Static public indexes
 
 All installer reads use `/static/`. The registry writes PEP 503 pages at

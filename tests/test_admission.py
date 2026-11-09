@@ -788,18 +788,57 @@ def test_duplicate_semantic_version_rejects(database: Database, tmp_path: Path) 
         assert session.scalar(select(func.count()).select_from(ReleaseRecord)) == 2
 
 
-def test_active_dependency_is_validated_and_recorded(database: Database, tmp_path: Path) -> None:
+def test_active_dependency_is_validated_and_recorded(
+    database: Database, tmp_path: Path, probe_package_index: tuple[str, list[str]]
+) -> None:
     store = LocalFilesystemObjectStore(tmp_path / "objects")
-    seed_fixtures(database, store)
-    source = _fixture_source(tmp_path, "dependent-pack")
-    manifest = source / "dinkster-pack.toml"
-    manifest.write_text(manifest.read_text() + '\n[pack.dependencies]\nexample-pack = ">=1,<2"\n')
-    service = AdmissionService(database, store, require_isolation=False)
-    candidate_id = service.submit(
-        build_registry_fixture_archive(source), pack_name="dependent-pack", version="1.2.3"
+    service = AdmissionService(
+        database,
+        store,
+        require_isolation=False,
+        settings=ServerSettings(probe_package_index_url=probe_package_index[0]),
+    )
+    helper = _fixture_source(tmp_path)
+    helper_manifest = helper / "dinkster-pack.toml"
+    helper_manifest.write_text(
+        helper_manifest.read_text() + '\n[pack.extra-requires]\ncpu = ["probe-dependency==1.0"]\n'
+    )
+    (helper / "helpers.py").write_text("from probe_dependency import VALUE\n")
+    helper_id = service.submit(
+        build_registry_fixture_archive(helper), pack_name="example-pack", version="1.2.3"
     )
     assert service.run_once()
-    assert service.status(candidate_id).status == "accepted"
+    assert service.status(helper_id).status == "accepted"
+    bridge = _fixture_source(tmp_path, "bridge-pack")
+    bridge_manifest = bridge / "dinkster-pack.toml"
+    bridge_manifest.write_text(
+        bridge_manifest.read_text() + '\n[pack.dependencies]\nexample-pack = ">=1,<2"\n'
+    )
+    (bridge / "helpers.py").write_text("from example_pack.helpers import VALUE\n")
+    bridge_id = service.submit(
+        build_registry_fixture_archive(bridge), pack_name="bridge-pack", version="1.2.3"
+    )
+    assert service.run_once()
+    assert service.status(bridge_id).status == "accepted", service.status(bridge_id)
+    source = _fixture_source(tmp_path, "dependent-pack")
+    manifest = source / "dinkster-pack.toml"
+    manifest.write_text(manifest.read_text() + '\n[pack.dependencies]\nbridge-pack = ">=1,<2"\n')
+    nodes = source / "nodes.py"
+    nodes.write_text(
+        "from bridge_pack.helpers import VALUE\n"
+        + nodes.read_text().replace("version=2,", "version=VALUE,")
+    )
+    data = build_registry_fixture_archive(source)
+    candidate_id = service.submit(data, pack_name="dependent-pack", version="1.2.3")
+    assert service.run_once()
+    assert service.status(candidate_id).status == "accepted", service.status(candidate_id)
+    schemas = json.loads(store.read("static/packs/dependent-pack/1.2.3/schemas.json"))["schemas"]
+    assert (
+        next(item for item in schemas if item["nodeType"] == "dependent-pack.resize")["schema"][
+            "version"
+        ]
+        == 83
+    )
     with database.session() as session:
         release = session.scalar(
             select(ReleaseRecord)
@@ -811,7 +850,32 @@ def test_active_dependency_is_validated_and_recorded(database: Database, tmp_pat
             select(ReleaseDependencyRecord).where(ReleaseDependencyRecord.release_id == release.id)
         )
         assert dependency is not None
-        assert (dependency.pack_name, dependency.version_range) == ("example-pack", "<2,>=1")
+        assert (dependency.pack_name, dependency.version_range) == ("bridge-pack", "<2,>=1")
+        assert release.manifest["pythonRequirements"] == []
+    entry = next(
+        item
+        for item in json.loads(store.read("static/packs/index.json"))["items"]
+        if item["name"] == "dependent-pack"
+    )
+    assert store.read("static/" + entry["wheels"][0]["url"]) == data
+    for name, statement, code in (
+        ("undeclared-pack", "from example_pack.helpers import VALUE", "entry.unresolvable"),
+        (
+            "private-pack",
+            "from dinkster_nodes_provider._helpers import VALUE",
+            "imports.private-module",
+        ),
+    ):
+        refused = _fixture_source(tmp_path, name)
+        nodes = refused / "nodes.py"
+        nodes.write_text(statement + "\n" + nodes.read_text())
+        candidate = service.submit(
+            build_registry_fixture_archive(refused), pack_name=name, version="1.2.3"
+        )
+        assert service.run_once()
+        status = service.status(candidate)
+        assert status.status == "rejected", status
+        assert any(finding.code == code for finding in status.findings), status
 
 
 @pytest.mark.parametrize("version", ("1.3.dev42", "2.1.dev42"))

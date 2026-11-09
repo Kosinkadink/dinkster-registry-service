@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import io
 import time
+import tomllib
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
+import tomli_w
 from dinkster_registry.archive_admission import (
     SCAN_POLICY_VERSION,
     AdmissionFinding,
@@ -1024,6 +1027,82 @@ class AdmissionService:
                 )
             )
 
+    def _probe_with_dependencies(self, root: Path) -> StageResult:
+        manifest_path = root / "dinkster-pack.toml"
+        original = manifest_path.read_bytes()
+        manifest = load_manifest(manifest_path)
+        pending = list(manifest.dependencies)
+        selected: dict[str, str] = {}
+        requirements = set(manifest.requires_for("cpu"))
+        try:
+            with self.database.session() as session:
+                while pending:
+                    dependency = pending.pop(0)
+                    if dependency.pack in selected:
+                        if not dependency.accepts(selected[dependency.pack]):
+                            raise ValueError(f"Conflicting helper dependency {dependency.pack!r}.")
+                        continue
+                    releases = session.scalars(
+                        select(ReleaseRecord)
+                        .join(PackRecord, PackRecord.id == ReleaseRecord.pack_id)
+                        .where(
+                            PackRecord.name == dependency.pack,
+                            PackRecord.visibility == "public",
+                            ReleaseRecord.state == "active",
+                        )
+                    )
+                    release = max(
+                        (item for item in releases if dependency.accepts(item.version)),
+                        key=lambda item: Version(item.version),
+                        default=None,
+                    )
+                    if release is None:
+                        raise ValueError(f"No active helper dependency {dependency.pack!r}.")
+                    selected[dependency.pack] = release.version
+                    artifact = session.get(ArtifactRecord, release.artifact_digest)
+                    assert artifact is not None
+                    data = self.object_store.read(artifact.object_key, max_size=MAX_ARTIFACT_SIZE)
+                    if artifact_digest(data) != artifact.digest or len(data) != artifact.size:
+                        raise ValueError(f"Helper artifact changed for {dependency.pack!r}.")
+                    wheel = inspect_wheel(data, dependency.pack, release.version)
+                    if wheel.library:
+                        raise ValueError("Pack dependencies must name packs, not libraries.")
+                    with extracted_wheel(data, wheel) as dependency_root:
+                        helper = load_manifest(dependency_root / "dinkster-pack.toml")
+                        pending.extend(helper.dependencies)
+                        requirements.update(helper.requires_for("cpu"))
+                    # Stage only the installed wheel layout, not the dependency's
+                    # relocated probe assets. The submitted pack keeps its root assets.
+                    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                        for member in archive.infolist():
+                            if member.is_dir():
+                                continue
+                            destination = root / member.filename
+                            if destination.exists():
+                                raise ValueError("Helper wheel overlaps the submitted pack.")
+                            destination.parent.mkdir(parents=True, exist_ok=True)
+                            destination.write_bytes(archive.read(member))
+            if selected:
+                # Only the disposable probe view receives the combined CPU
+                # requirements. Published metadata and the wheel remain unchanged.
+                document = tomllib.loads(original.decode())
+                document["pack"]["requires"] = sorted(requirements)
+                document["pack"].pop("extra-requires", None)
+                manifest_path.write_text(tomli_w.dumps(document))
+            return run_executable_probe(
+                root, settings=self.settings, require_isolation=self.require_isolation
+            )
+        except (ValueError, ObjectStoreError, FileNotFoundError) as exc:
+            return StageResult(
+                (
+                    AdmissionFinding(
+                        "probe.pack-dependencies-unavailable", "error", "block", str(exc)
+                    ),
+                )
+            )
+        finally:
+            manifest_path.write_bytes(original)
+
     def _process(self, claim: CandidateClaim) -> None:
         try:
             data = self.object_store.read(claim.object_key, max_size=MAX_ARTIFACT_SIZE)
@@ -1145,12 +1224,7 @@ class AdmissionService:
                 self._record_stage(claim, "executable_probe", StageResult(data={"schemas": []}))
             if claim.kind == "upload" and not wheel.library:
                 with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(
-                        run_executable_probe,
-                        root,
-                        settings=self.settings,
-                        require_isolation=self.require_isolation,
-                    )
+                    future = executor.submit(self._probe_with_dependencies, root)
                     while not wait((future,), timeout=self.lease_seconds / 3).done:
                         with self.database.session() as session, session.begin():
                             candidate = self._leased_candidate(session, claim)

@@ -19,6 +19,7 @@ dependencies = [
   "pydantic>=2.11,<3",
   "python-multipart>=0.0.22,<1",
   "sqlalchemy>=2.0,<3",
+  "tomli-w>=1.2,<2",
   "uvicorn>=0.35,<1",
 ]
 
