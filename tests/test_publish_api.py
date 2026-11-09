@@ -17,7 +17,13 @@ from dinkster_registry_service.admission import AdmissionService
 from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
 from dinkster_registry_service.cli import main
-from dinkster_registry_service.database import NamespaceGrantRecord, OutboxRecord, PackRecord
+from dinkster_registry_service.database import (
+    AuditEventRecord,
+    Database,
+    NamespaceGrantRecord,
+    OutboxRecord,
+    PackRecord,
+)
 from dinkster_registry_service.digests import artifact_digest
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore, ObjectStoreError
 from dinkster_registry_service.principals import PrincipalRepository
@@ -42,10 +48,10 @@ def _archive(tmp_path: Path, name: str, *, native: bool = False) -> bytes:
     return build_registry_fixture_archive(source)
 
 
-def _client(tmp_path: Path) -> tuple[TestClient, FastAPI, str]:
+def _client(tmp_path: Path, database_url: str | None = None) -> tuple[TestClient, FastAPI, str]:
     app = create_app(
         ServerSettings(
-            database_url=f"sqlite:///{tmp_path / 'registry.db'}",
+            database_url=database_url or f"sqlite:///{tmp_path / 'registry.db'}",
             object_store_root=tmp_path / "objects",
             public_base_url="http://testserver",
             cursor_secret=b"publish-api-test-cursor-secret",
@@ -104,6 +110,79 @@ def _locks(archive: bytes) -> dict[str, object]:
         }
         for variant, digit in (("linux-cpu", "1"), ("win-cpu", "2"))
     }
+
+
+def test_locked_publication_recovers_rejected_dependency_without_reset(
+    tmp_path: Path, database: Database, database_url: str
+) -> None:
+    client, app, token = _client(tmp_path, database_url)
+    _archive(tmp_path, "locked-pack")
+    manifest = tmp_path / "locked-pack" / "dinkster-pack.toml"
+    manifest.write_text(manifest.read_text() + '\n[pack.dependencies]\nhelper-pack = ">=1,<2"\n')
+    archive = build_registry_fixture_archive(manifest.parent)
+    locks = _locks(archive)
+    headers = {"Authorization": f"Bearer {token}"}
+    endpoint = "/v1/publish/locked-pack/versions/1.2.3"
+
+    def publish(payload: dict[str, object], data: bytes = archive) -> Response:
+        return client.post(
+            endpoint,
+            headers=headers,
+            files={"archive": ("pack.whl", data, "application/zip")},
+            data={"locks": json.dumps(payload)},
+        )
+
+    admission = AdmissionService(
+        app.state.database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        require_isolation=False,
+    )
+    first = publish(locks)
+    assert first.status_code == 202
+    old_id = first.json()["candidateId"]
+    assert publish(locks).json() == {"candidateId": old_id, "status": "queued"}
+    assert admission.run_once()
+    old_url = f"/v1/publish/{old_id}"
+    old_status = client.get(old_url, headers=headers).json()
+    assert old_status["status"] == "rejected"
+    assert any(f["code"] == "manifest.invalid" for f in old_status["findings"])
+
+    changed_locks = json.loads(json.dumps(locks))
+    changed_locks["linux-cpu"]["baseId"] = "sha256:" + "3" * 64
+    assert publish(changed_locks).status_code == 409
+    changed_archive = archive + b"changed"
+    assert publish(_locks(changed_archive), changed_archive).status_code == 409
+
+    helper = _archive(tmp_path, "helper-pack")
+    helper_submit = client.post(
+        "/v1/publish/helper-pack/versions/1.2.3", content=helper, headers=headers
+    )
+    assert helper_submit.status_code == 202
+    assert admission.run_once()
+    assert admission.status(UUID(helper_submit.json()["candidateId"])).status == "accepted"
+
+    retry = publish(locks)
+    assert retry.status_code == 202
+    new_id = retry.json()["candidateId"]
+    assert new_id != old_id
+    assert retry.json()["status"] == "queued"
+    assert publish(locks).json() == retry.json()
+    claim = admission.claim()
+    assert claim is not None and str(claim.id) == new_id
+    assert publish(locks).json() == {"candidateId": new_id, "status": "scanning"}
+    admission.process(claim)
+    assert admission.status(UUID(new_id)).status == "accepted"
+    assert publish(locks).json() == {"candidateId": new_id, "status": "accepted"}
+    assert client.get(old_url, headers=headers).json() == old_status
+    assert client.get("/v1/packs/locked-pack/versions/1.2.3").json()["state"] == "active"
+    with database.session() as session:
+        event = session.scalar(
+            select(AuditEventRecord).where(
+                AuditEventRecord.subject_id == new_id,
+                AuditEventRecord.event_type == "release_candidate.submitted",
+            )
+        )
+        assert event is not None and event.data["supersedesCandidateId"] == old_id
 
 
 def test_published_locks_bind_archive_base_and_visibility(
