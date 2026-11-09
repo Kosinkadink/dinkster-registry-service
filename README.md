@@ -91,8 +91,7 @@ one item per migrated `from` type: `{"from":"old.type","candidates":[...]}`.
 Each candidate has `pack`, `version`, `target` (carrier node id), and `rule`
 (the unchanged canonical replacement rule, including its conditions and cases).
 Only the latest active public release of each first-party pack contributes.
-Native schema replacements, alias records and group records contribute; aliases
-are searchable by their source node type and ComfyUI class name. Multiple packs
+Candidates come only from schema-declared replacement rules. Multiple packs
 may migrate the same source, so candidates are retained rather than silently
 choosing a winner. Targets and their interfaces come from the corresponding
 per-pack schema file. Yank and quarantine rebuild the index without those releases.
