@@ -166,6 +166,36 @@ def test_old_zip_is_not_a_wheel() -> None:
     assert error.value.code == "wheel.required"
 
 
+@pytest.mark.parametrize(
+    ("path", "payload", "status", "code"),
+    [
+        (
+            "config.txt",
+            b"AK" + b"IA" + b"1234567890ABCDEF",
+            "rejected",
+            "security.confirmed-secret",
+        ),
+        ("extension.so", b"native inventory", "review", "security.native-binary"),
+    ],
+)
+def test_library_payloads_receive_security_checks(
+    tmp_path: Path, path: str, payload: bytes, status: str, code: str
+) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'catalog.db'}")
+    try:
+        service = AdmissionService(
+            database, LocalFilesystemObjectStore(tmp_path / "objects"), require_isolation=False
+        )
+        data = wheel_bytes(library=True, extra={f"demo_nodes/{path}": payload})
+        candidate = service.submit(data, pack_name="demo-nodes", version="1.2.3")
+        assert service.run_once()
+        result = service.status(candidate)
+        assert result.status == status, result
+        assert any(finding.code == code for finding in result.findings), result
+    finally:
+        database.dispose()
+
+
 def test_library_admission_static_download_collision_and_yank(tmp_path: Path) -> None:
     url = f"sqlite:///{tmp_path / 'catalog.db'}"
     database = Database(url)

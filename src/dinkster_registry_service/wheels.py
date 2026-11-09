@@ -154,12 +154,29 @@ def run_wheel_integrity(
 
 
 def run_wheel_security(data: bytes) -> StageResult:
-    # Reuse the content scanner's signatures without its root-manifest layout
-    # restriction. Every original byte is scanned; this view is never published.
+    # The shared scanner accepts packs only, while this service also admits
+    # libraries. Wrap every original payload in a private valid pack wheel;
+    # preserve suffixes used by security rules without introducing manifests.
     output = io.BytesIO()
-    with zipfile.ZipFile(io.BytesIO(data)) as source, zipfile.ZipFile(output, "w") as target:
-        files = _members(source)
-        files["dinkster-pack.toml"] = b"[pack]\n"
+    package = "security_scan"
+    dist = "security_scan-1.0.dist-info"
+    with zipfile.ZipFile(io.BytesIO(data)) as source:
+        files = {}
+        for index, (name, payload) in enumerate(_members(source).items()):
+            basename = PurePosixPath(name).name
+            files[f"{package}/{index}-{basename}"] = payload
+    files[f"{package}/__init__.py"] = b""
+    files[f"{package}/dinkster-pack.toml"] = b'[pack]\nname = "security-scan"\nversion = "1.0"\n'
+    files[f"{dist}/METADATA"] = b"Metadata-Version: 2.4\nName: security-scan\nVersion: 1.0\n"
+    files[f"{dist}/WHEEL"] = b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+    record = io.StringIO()
+    writer = csv.writer(record, lineterminator="\n")
+    for name, payload in files.items():
+        digest = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode()
+        writer.writerow((name, f"sha256={digest}", len(payload)))
+    writer.writerow((f"{dist}/RECORD", "", ""))
+    files[f"{dist}/RECORD"] = record.getvalue().encode()
+    with zipfile.ZipFile(output, "w") as target:
         for name, payload in files.items():
             info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
             info.create_system = 3
