@@ -64,7 +64,6 @@ class StaticIndexes:
         ).all()
         packs = []
         locales = []
-        translations = []
         schemas: dict[str, dict[str, object]] = {}
         replacements_by_pack: dict[str, list[dict[str, object]]] = {}
         variants = {
@@ -110,18 +109,6 @@ class StaticIndexes:
                         for item in json.loads(body)["schemas"]
                         for rule in item["schema"].get("replacements", [])
                     ]
-                    for translation in release.manifest.get("translations", []):
-                        for kind in ("aliases", "groups"):
-                            registry = translation.get(kind)
-                            if registry is None:
-                                continue
-                            for record in registry["records"]:
-                                rule = record["replacement"]
-                                rules.append((rule["from"], record["carrier"], rule))
-                                if kind == "aliases":
-                                    source = record["source"]["nodeClass"]
-                                    if source != rule["from"]:
-                                        rules.append((source, record["carrier"], rule))
                     replacements_by_pack[pack.name] = [
                         {
                             "from": source,
@@ -177,8 +164,6 @@ class StaticIndexes:
             packs.append(entry)
             if not library:
                 locales.append({**entry, "catalogs": release.manifest.get("localeCatalogs", [])})
-            if pack.publisher_id == "dinkster" and not library:
-                translations.extend(release.manifest.get("translations", []))
         for variant in sorted(variants):
             root_links = []
             for name, links in sorted(projects[variant].items()):
@@ -206,7 +191,6 @@ class StaticIndexes:
             ("packs/index.json", packs),
             ("locales/index.json", locales),
             ("schemas/index.json", list(schemas.values())),
-            ("translations/index.json", translations),
             (
                 "replacements/index.json",
                 [

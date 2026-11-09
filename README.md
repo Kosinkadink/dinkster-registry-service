@@ -42,10 +42,7 @@ manifest and is a pack, even when it has zero nodes.
 Reserved library names require the authenticated `dinkster` publisher
 (`wheel.reserved-name`). A declared manifest publisher must match the authenticated
 publisher (`manifest.publisher-mismatch`); declaring a name never grants authority.
-Alias and group records require the `dinkster` publisher, and their carriers and
-replacement references are checked against the probed schemas
-(`translations.invalid`). Libraries appear in the install index but not the schema,
-locale or translation catalogs.
+Libraries appear in the install index but not the schema or locale catalogs.
 
 `[pack.dependencies]` remains distinct from Python `requires`: it permits
 imports of a declared pack's public helpers. Admission stages hash-verified,
@@ -69,9 +66,9 @@ index: the static prefix supports only GET, HEAD and OPTIONS.
 
 `/static/packs/index.json` carries exact wheel filenames, hashes and prefix-relative
 URLs, plus admitted installation locks. `/static/locks/` holds those immutable
-lock bytes. Schemas, locale catalogs and translation records are indexed at
-`/static/schemas/index.json`, `/static/locales/index.json` and
-`/static/translations/index.json`. Relative JSON URLs resolve against `/static/`,
+lock bytes. Schemas and locale catalogs are indexed at
+`/static/schemas/index.json` and `/static/locales/index.json`.
+Relative JSON URLs resolve against `/static/`,
 not against the directory containing the JSON index. An installer uses the
 recorded pins, never unrestricted dependency resolution against the simple index.
 
@@ -94,8 +91,7 @@ one item per migrated `from` type: `{"from":"old.type","candidates":[...]}`.
 Each candidate has `pack`, `version`, `target` (carrier node id), and `rule`
 (the unchanged canonical replacement rule, including its conditions and cases).
 Only the latest active public release of each first-party pack contributes.
-Native schema replacements, alias records and group records contribute; aliases
-are searchable by their source node type and ComfyUI class name. Multiple packs
+Candidates come only from schema-declared replacement rules. Multiple packs
 may migrate the same source, so candidates are retained rather than silently
 choosing a winner. Targets and their interfaces come from the corresponding
 per-pack schema file. Yank and quarantine rebuild the index without those releases.

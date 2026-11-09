@@ -24,10 +24,7 @@ from dinkster_schema import (
     canonical_claim,
     canonical_name,
     claims_conflict,
-    comfy_alias_registry_problems,
-    comfy_group_registry_problems,
     reserved_root,
-    schema_from_wire,
 )
 from dinkster_workers.manifest import load_manifest
 from packaging.requirements import Requirement
@@ -1256,28 +1253,6 @@ class AdmissionService:
                 if not self._record_stage(claim, "executable_probe", probe):
                     return
                 review |= probe.review
-                assert probe.data is not None
-                parsed = load_manifest(root / "dinkster-pack.toml")
-                schemas = {
-                    item["nodeType"]: schema_from_wire(item["schema"])
-                    for item in probe.data["schemas"]
-                }
-                problems: list[str] = []
-                if parsed.comfy_aliases is not None:
-                    problems.extend(comfy_alias_registry_problems(parsed.comfy_aliases, schemas))
-                if parsed.comfy_groups is not None:
-                    problems.extend(comfy_group_registry_problems(parsed.comfy_groups, schemas))
-                if problems and not self._record_stage(
-                    claim,
-                    "translations",
-                    StageResult(
-                        tuple(
-                            AdmissionFinding("translations.invalid", "error", "block", problem)
-                            for problem in problems
-                        )
-                    ),
-                ):
-                    return
             security = run_wheel_security(data)
             if not self._record_stage(claim, "fast_security", security):
                 return
