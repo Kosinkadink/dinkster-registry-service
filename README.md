@@ -243,8 +243,8 @@ contract; no private source checkout or repository token is needed by engine CI.
 
 The scanner runs these mandatory checks in order:
 
-1. `ingest_integrity`: verifies size, BLAKE3, ZIP structure and CRCs, safe
-   paths, regular files, limits, stored compression, and deterministic bytes.
+1. `ingest_integrity`: verifies size, BLAKE3, wheel metadata and RECORD hashes,
+   ZIP structure and CRCs, safe paths, regular files, and size limits.
 2. `manifest`: invokes the pinned Dinkster manifest parser, validates release and
    catalog fields, checks namespace ownership, and rejects version collisions.
 3. `doctor_static`: invokes the pinned Dinkster doctor's static checks against the
@@ -510,7 +510,7 @@ accepted bytes atomically, reads them in bounded chunks, and verifies the
 declared size and BLAKE3 digest before returning them. Objects live at:
 
 ```text
-artifacts/blake3/<first-two-hex>/<64-hex>.dinksterpack.zip
+artifacts/blake3/<first-two-hex>/<64-hex>.whl
 ```
 
 Quarantined uploads live at `quarantine/uploads/<candidate-uuid>` and are not
@@ -589,7 +589,10 @@ runs the isolated probe under bubblewrap, and runs conformance against the image
 
 The container also admits the unchanged first-party wheel in `fixtures/wheels`,
 pinned by source commit, size and SHA-256 in `scripts/release-packs.lock`.
-It checks wheel identity before isolated admission, then verifies static artifact
-bytes and schema ids. The remote pack has an empty node catalog without a gateway;
+It checks wheel identity, submits through the authenticated HTTP publisher route,
+and runs the isolated scanner through promotion. It then retrieves the static
+index, verifies artifact bytes and schema ids over HTTP, and confirms that a
+queued legacy ZIP is rejected with `wheel.required`.
+The remote pack has an empty node catalog without a gateway;
 the separate isolated-probe fixture covers populated schemas. This replaces the
 withdrawn ZIP-release download check; CI does not depend on the live registry.
