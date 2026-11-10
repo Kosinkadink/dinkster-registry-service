@@ -13,6 +13,7 @@ dependencies = [
   "blake3>=1.0,<2",
   "boto3>=1.40,<2",
   "dinkster-api @ git+https://github.com/Kosinkadink/Dinkster.git@1c264806b52d8332b36838280a74b025754fbb03#subdirectory=packages/dinkster-api",
+  "dinkster-token-verifier @ https://github.com/Kosinkadink/dinkster-token-verifier/releases/download/v0.1.1/dinkster_token_verifier-0.1.1-py3-none-any.whl#sha256=b10f09c26c113016b1633701c73958d6dbe41f7dca318d5677e449ec04a643ae",
   "fastapi>=0.116,<1",
   "packaging>=25,<26",
   "psycopg[binary]>=3.2,<4",

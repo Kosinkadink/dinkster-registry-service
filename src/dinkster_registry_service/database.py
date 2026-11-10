@@ -100,6 +100,15 @@ class PublisherFreezeRecord(Base):
     reason: Mapped[str] = mapped_column(Text)
 
 
+class PublisherBindingRecord(Base):
+    __tablename__ = "publisher_bindings"
+
+    publisher_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("publishers.id", ondelete="RESTRICT"), primary_key=True
+    )
+    identity_subject: Mapped[str] = mapped_column(String(128), unique=True)
+
+
 class PrincipalAuditRecord(Base):
     __tablename__ = "principal_audit"
 
