@@ -543,9 +543,12 @@ def test_pack_index_interruption_never_advertises_an_absent_version(
                         state="active",
                     )
                 )
-            expected = {row.version for row in releases if row.state == "active"}
-            if change in {"addition", "mixed"}:
-                expected.add("3.0.0")
+        expected = {
+            "addition": {"1.2.3", "2.0.0", "3.0.0"},
+            "latest-yank": {"1.2.3"},
+            "withdrawal": set(),
+            "mixed": {"1.2.3", "3.0.0"},
+        }[change]
         store.remaining = interrupt
         with pytest.raises(ObjectStoreError, match="interrupted pack publication"):
             indexes.rebuild()

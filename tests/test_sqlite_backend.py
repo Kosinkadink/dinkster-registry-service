@@ -127,7 +127,7 @@ def test_release_conformance_cli_checks_the_supplied_lock_over_http(
         if fault == "lock-digest":
             lock["packs"][0]["artifactDigest"] = "blake3:" + "0" * 64
         elif fault == "locale-index":
-            store.replace_index("static/locales/index.json", b'{"schemaVersion":1,"items":[]}')
+            store.replace_index("static/locales/index.json", b'{"schemaVersion":2,"items":[]}')
         elif fault == "artifact":
             (store.root / artifact_object_key(lock["packs"][0]["artifactDigest"])).write_bytes(
                 b"corrupted archive"
@@ -159,12 +159,12 @@ def test_release_conformance_cli_checks_the_supplied_lock_over_http(
             )
             assert (result.returncode == 0) == (not fault), result.stdout + result.stderr
             if fault in {"lock-digest", "locale-index"}:
-                key = (
-                    "/static/packs/index.json"
+                reason = (
+                    "per-pack indexes lack a locked release and digest"
                     if fault == "lock-digest"
-                    else "/static/locales/index.json"
+                    else "locale index lacks a locked release"
                 )
-                assert f"{key} does not contain every locked release and digest" in result.stderr
+                assert reason in result.stderr
             elif fault == "artifact":
                 assert "downloaded bytes differ from locked release" in result.stderr
             else:

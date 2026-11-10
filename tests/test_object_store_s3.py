@@ -227,15 +227,16 @@ def test_accepted_publish_updates_both_s3_indexes_with_conditional_get(
                 }
             ]
         etags = {}
-        for key in ("packs/index.json", "locales/index.json"):
+        for key in ("packs/index.json", "packs/example-pack/index.json", "locales/index.json"):
             response = client.get(f"/static/{key}")
             assert response.status_code == 200
             assert response.content == s3_store.read(f"static/{key}")
-            assert response.json()["schemaVersion"] == 1
+            assert response.json()["schemaVersion"] == 2
             items = response.json()["items"]
             assert len(items) == 1
-            wheel = items[0]["wheels"][0]
-            assert (items[0]["name"], items[0]["version"], wheel["digest"]) == (
+            release = client.get("/static/packs/example-pack/index.json").json()["items"][0]
+            wheel = release["wheels"][0]
+            assert (release["name"], release["version"], wheel["digest"]) == (
                 "example-pack",
                 "1.2.3",
                 artifact_digest(archive),
@@ -271,7 +272,10 @@ def test_accepted_publish_updates_both_s3_indexes_with_conditional_get(
         for key, etag in etags.items():
             response = client.get(f"/static/{key}", headers={"If-None-Match": etag})
             assert response.status_code == 200
-            assert [item["version"] for item in response.json()["items"]] == ["1.2.3", "1.2.4"]
+            if key == "packs/index.json":
+                assert [item["latestVersion"] for item in response.json()["items"]] == ["1.2.4"]
+            else:
+                assert [item["version"] for item in response.json()["items"]] == ["1.2.3", "1.2.4"]
         refreshed = client.get(
             "/static/schemas/index.json", headers={"If-None-Match": discovery.headers["etag"]}
         )
