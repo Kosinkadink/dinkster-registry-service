@@ -478,7 +478,17 @@ def test_static_only_pinned_install_imports_library_and_refuses_pack_requirement
 
 @pytest.mark.parametrize(
     "state",
-    ["active", "extras", "cycle", "conflict", "yanked", "quarantined", "out-of-range", "url"],
+    [
+        "active",
+        "extras",
+        "inactive-marker",
+        "cycle",
+        "conflict",
+        "yanked",
+        "quarantined",
+        "out-of-range",
+        "url",
+    ],
 )
 def test_probe_resolves_registry_libraries_with_operator_requirements(
     tmp_path: Path, state: str
@@ -560,25 +570,30 @@ def test_probe_resolves_registry_libraries_with_operator_requirements(
             )
             assert service.run_once()
             assert service.status(candidate).status == "accepted"
-        if state in {"yanked", "quarantined"}:
+        if state in {"yanked", "quarantined", "inactive-marker"}:
             with database.session() as session, session.begin():
                 for release in session.scalars(select(ReleaseRecord)):
-                    release.state = state
+                    release.state = "yanked" if state == "inactive-marker" else state
         source = tmp_path / "pack"
         shutil.copytree(FIXTURE_ROOT / "example-pack", source)
         manifest = source / "dinkster-pack.toml"
         version_range = ">=2" if state == "out-of-range" else ">=1,<10"
         extras = "[leaf]" if state == "extras" else ""
         conflict = ', "demo-leaf>=2"' if state == "conflict" else ""
+        marker = "; python_version < '0'" if state == "inactive-marker" else ""
         manifest.write_text(
             manifest.read_text().replace(
                 "[pack]\n",
-                f'[pack]\nrequires = ["demo-core{extras}{version_range}", '
+                f'[pack]\nrequires = ["demo-core{extras}{version_range}{marker}", '
                 f'"operator-only==1.2.3"{conflict}]\n',
             )
         )
         nodes = source / "nodes.py"
-        nodes.write_text("from demo_core import ANSWER\nassert ANSWER == 42\n" + nodes.read_text())
+        imported = "operator_only" if state == "inactive-marker" else "demo_core"
+        expected = 7 if state == "inactive-marker" else 42
+        nodes.write_text(
+            f"from {imported} import ANSWER\nassert ANSWER == {expected}\n" + nodes.read_text()
+        )
         candidate = service.submit(
             build_registry_fixture_archive(source),
             pack_name="example-pack",
@@ -587,7 +602,7 @@ def test_probe_resolves_registry_libraries_with_operator_requirements(
         )
         assert service.run_once()
         result = service.status(candidate)
-        if state in {"active", "extras", "cycle"}:
+        if state in {"active", "extras", "cycle", "inactive-marker"}:
             assert result.status == "accepted", result
         else:
             assert result.status == "rejected", result
