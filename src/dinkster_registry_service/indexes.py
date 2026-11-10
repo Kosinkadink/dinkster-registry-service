@@ -45,14 +45,24 @@ class StaticIndexes:
         self.public_base_url = public_base_url.rstrip("/")
 
     @contextmanager
-    def _locked_session(self) -> Iterator[Session]:
+    def _locked_session(self, *, blocking: bool = True) -> Iterator[Session | None]:
         with self.database.session() as session, session.begin():
             # Lock before reading the catalog, not just while writing objects:
             # a slower replica must never replace a newer snapshot with an older one.
             if self.database.is_postgresql:
-                session.execute(
-                    text("SELECT pg_advisory_xact_lock(hashtext('dinkster-registry-indexes'), 0)")
-                )
+                if blocking:
+                    session.execute(
+                        text(
+                            "SELECT pg_advisory_xact_lock(hashtext('dinkster-registry-indexes'), 0)"
+                        )
+                    )
+                elif not session.scalar(
+                    text(
+                        "SELECT pg_try_advisory_xact_lock(hashtext('dinkster-registry-indexes'), 0)"
+                    )
+                ):
+                    yield None
+                    return
             else:
                 session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             yield session
@@ -245,29 +255,36 @@ class StaticIndexes:
 
     def rebuild(self) -> int:
         with self._locked_session() as session:
+            assert session is not None
             return self._write(session)
 
     def deliver_one(self) -> bool:
-        with self._locked_session() as session:
-            event = session.scalar(
-                select(OutboxRecord)
-                .where(
-                    OutboxRecord.topic == "indexes.rebuild",
-                    OutboxRecord.state == "pending",
-                    OutboxRecord.available_at <= datetime.now(UTC),
-                )
-                .order_by(OutboxRecord.created_at, OutboxRecord.id)
-                .with_for_update()
-                .limit(1)
-            )
-            if event is None:
+        with self._locked_session(blocking=False) as session:
+            if session is None:
                 return False
-            event.attempts += 1
+            events = list(
+                session.scalars(
+                    select(OutboxRecord)
+                    .where(
+                        OutboxRecord.topic == "indexes.rebuild",
+                        OutboxRecord.state == "pending",
+                        OutboxRecord.available_at <= datetime.now(UTC),
+                    )
+                    .order_by(OutboxRecord.created_at, OutboxRecord.id)
+                    .with_for_update()
+                )
+            )
+            if not events:
+                return False
+            for event in events:
+                event.attempts += 1
             try:
                 self._write(session)
             except ObjectStoreError:
-                event.available_at = datetime.now(UTC) + timedelta(seconds=5)
+                for event in events:
+                    event.available_at = datetime.now(UTC) + timedelta(seconds=5)
             else:
-                event.state = "delivered"
-                event.delivered_at = datetime.now(UTC)
+                for event in events:
+                    event.state = "delivered"
+                    event.delivered_at = datetime.now(UTC)
             return True

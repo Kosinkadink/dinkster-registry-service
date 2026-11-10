@@ -429,3 +429,23 @@ def test_sqlite_rebuild_is_deterministic_and_excludes_quarantined_releases(
         assert [item["name"] for item in json.loads(before)["items"]] == ["example-pack"]
     finally:
         database.dispose()
+
+
+def test_pending_rebuilds_are_served_by_one_catalog_snapshot(
+    seeded_catalog: tuple[Database, LocalFilesystemObjectStore],
+) -> None:
+    database, store = seeded_catalog
+    with database.session() as session, session.begin():
+        for _ in range(3):
+            queue_index_rebuild(session)
+    indexes = StaticIndexes(database, store, "http://testserver")
+    assert indexes.deliver_one()
+    with database.session() as session:
+        events = list(session.scalars(select(OutboxRecord)))
+        assert len(events) == 3
+        assert {event.state for event in events} == {"delivered"}
+    assert not indexes.deliver_one()
+    assert {
+        (item["name"], item["version"])
+        for item in json.loads(store.read("static/packs/index.json"))["items"]
+    } == {("example-pack", "1.2.3"), ("color-tools", "0.4.0")}

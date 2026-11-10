@@ -1361,3 +1361,36 @@ def test_sqlite_reviewed_rescan_decision_controls_release_visibility(
         _assert_reviewed_rescan_decision(database, database_url, tmp_path, accepted=accepted)
     finally:
         database.dispose()
+
+
+def test_scanner_claims_queued_candidate_while_another_worker_rewrites_indexes(
+    database: Database, tmp_path: Path
+) -> None:
+    entered = threading.Event()
+    finish = threading.Event()
+
+    class BlockingStore(LocalFilesystemObjectStore):
+        def replace_index(self, key: str, data: bytes) -> None:
+            if key == "static/packs/index.json":
+                entered.set()
+                assert finish.wait(10)
+            super().replace_index(key, data)
+
+    service = _service(database, tmp_path)
+    candidate = service.submit(b"not a wheel", pack_name="invalid-pack", version="1.0.0")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        from dinkster_registry_service.indexes import StaticIndexes
+
+        rewrite = executor.submit(
+            StaticIndexes(
+                database, BlockingStore(tmp_path / "objects"), "http://testserver"
+            ).rebuild
+        )
+        try:
+            assert entered.wait(5)
+            scan = executor.submit(service.run_once)
+            assert scan.result(timeout=2)
+            assert service.status(candidate).status == "rejected"
+        finally:
+            finish.set()
+        assert rewrite.result(timeout=5) == 0
