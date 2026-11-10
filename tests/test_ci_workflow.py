@@ -29,6 +29,23 @@ def test_every_ci_job_uses_the_cpu_runner_contract_and_timeout() -> None:
     assert "python scripts/check-release-packs.py'" in source
 
 
+def test_pull_request_checks_need_no_secrets_and_deployment_keeps_validation() -> None:
+    source = WORKFLOW.read_text()
+    checks, deploy = source.split("\n  deploy:\n", 1)
+    assert "permissions:\n  contents: read\n" in source
+    assert "pull_request_target" not in source
+    assert "secrets" not in checks
+    assert checks.count("persist-credentials: false") == 3
+    assert "flyctl" not in checks
+    assert "github.event_name == 'push' && github.ref == 'refs/heads/main'" in deploy
+
+    deployment = WORKFLOW.with_name("deploy.yml").read_text()
+    assert "github.event_name == 'push' && github.ref == 'refs/heads/main'" in deployment
+    validation = "run: flyctl config validate --config fly.toml"
+    assert validation in deployment
+    assert deployment.index(validation) < deployment.index("flyctl auth docker")
+
+
 def test_postgres_uses_dynamic_loopback_ports_without_bridge_networks() -> None:
     source = WORKFLOW.read_text()
     postgres = (WORKFLOW.parents[2] / "scripts" / "with-test-postgres.sh").read_text()
