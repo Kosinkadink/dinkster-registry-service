@@ -187,6 +187,20 @@ jobs:
             dinkster-registry:test \
             bash -ec 'alembic upgrade head; python scripts/check-release-packs.py'
           SH
+      - name: Execute the pinned public submission guide
+        env:
+          GUIDE_REVISION: a990932e31714802e2fe01c71356df01302a96e0
+        run: |
+          guide=$(mktemp)
+          trap 'rm -f "$guide"' EXIT
+          curl --fail --silent --show-error \
+            "https://raw.githubusercontent.com/Kosinkadink/Dinkster/$GUIDE_REVISION/docs/registry-submission.md" \
+            --output "$guide"
+          chmod 644 "$guide"
+          docker run --rm --privileged --network host \
+            --mount "type=bind,src=$guide,dst=/tmp/registry-submission.md,readonly" \
+            dinkster-registry:test \
+            python scripts/check-submission-guide.py /tmp/registry-submission.md
       - name: Report AppArmor denials
         if: failure()
         run: sudo dmesg | grep 'apparmor="DENIED"' || true
