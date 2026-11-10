@@ -113,6 +113,13 @@ def _parser() -> argparse.ArgumentParser:
     revoke_token.add_argument("token")
     revoke_token.add_argument("--user", required=True)
     revoke_token.add_argument("--reason", required=True)
+
+    freeze_publisher = admin_commands.add_parser(
+        "freeze-publisher", help="freeze a disputed publisher and revoke its publishing tokens"
+    )
+    freeze_publisher.add_argument("publisher")
+    freeze_publisher.add_argument("--user", required=True)
+    freeze_publisher.add_argument("--reason", required=True)
     return parser
 
 
@@ -226,6 +233,9 @@ def main() -> None:
                     print(
                         f"{token.token_id}\t{token.minted_by}\t{scope}\t{token.expires_at}\t{state}"
                     )
+            elif args.admin_command == "freeze-publisher":
+                principals.freeze_publisher(args.publisher, args.user, now, args.reason)
+                print(f"froze publisher {args.publisher}; publishing tokens revoked")
             else:
                 principals.revoke_token(args.token, args.user, now, args.reason)
                 print(f"revoked token {args.token}")

@@ -11,12 +11,14 @@ from dinkster_registry import (
     Role,
     TokenRecord,
 )
+from dinkster_schema import canonical_name
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .database import (
     Database,
     PrincipalAuditRecord,
+    PublisherFreezeRecord,
     PublisherMembershipRecord,
     PublisherRecord,
     PublisherTokenRecord,
@@ -131,6 +133,12 @@ class PrincipalRepository:
         secret: str | None = None,
     ) -> tuple[str, TokenRecord]:
         with self.database.session() as session, session.begin():
+            if not self.database.is_postgresql:
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            canonical = canonical_name(publisher)
+            session.get(PublisherRecord, canonical, with_for_update=True)
+            if session.get(PublisherFreezeRecord, canonical) is not None:
+                raise RegistryError("publisher is frozen")
             directory, _ = self._load(session)
             audit_count = len(directory.audit())
             plaintext, token = directory.mint_token(
@@ -156,6 +164,37 @@ class PrincipalRepository:
             )
             self._append_audit(session, directory, audit_count)
             return plaintext, token
+
+    def freeze_publisher(self, publisher: str, actor: str, at: str, reason: str) -> None:
+        if not reason.strip():
+            raise RegistryError("freezing a publisher requires a reason")
+        with self.database.session() as session, session.begin():
+            if not self.database.is_postgresql:
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            canonical = canonical_name(publisher)
+            row = session.get(PublisherRecord, canonical, with_for_update=True)
+            directory, operators = self._load(session)
+            if actor not in operators:
+                raise RegistryError("freezing a publisher requires a registry operator")
+            if row is None:
+                raise RegistryError("unknown publisher")
+            if session.get(PublisherFreezeRecord, canonical) is not None:
+                return
+            audit_count = len(directory.audit())
+            directory.record(actor, "freeze-publisher", canonical, at, reason)
+            session.add(
+                PublisherFreezeRecord(publisher_id=canonical, actor=actor, at=at, reason=reason)
+            )
+            for token in session.scalars(
+                select(PublisherTokenRecord).where(
+                    PublisherTokenRecord.publisher_id == canonical,
+                    PublisherTokenRecord.revoked.is_(False),
+                )
+            ):
+                token.revoked = True
+                token.revoked_reason = reason
+                directory.record(actor, "revoke-token", canonical, at, f"token {token.token_id}")
+            self._append_audit(session, directory, audit_count)
 
     def revoke_token(self, token_id: str, actor: str, at: str, reason: str) -> None:
         with self.database.session() as session, session.begin():

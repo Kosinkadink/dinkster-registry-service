@@ -89,6 +89,17 @@ class PublisherTokenRecord(Base):
     revoked_reason: Mapped[str] = mapped_column(Text, default="")
 
 
+class PublisherFreezeRecord(Base):
+    __tablename__ = "publisher_freezes"
+
+    publisher_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("publishers.id", ondelete="RESTRICT"), primary_key=True
+    )
+    actor: Mapped[str] = mapped_column(String(128))
+    at: Mapped[str] = mapped_column(String(64))
+    reason: Mapped[str] = mapped_column(Text)
+
+
 class PrincipalAuditRecord(Base):
     __tablename__ = "principal_audit"
 
