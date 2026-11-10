@@ -12,6 +12,7 @@ dependencies = [
   "alembic>=1.16,<2",
   "blake3>=1.0,<2",
   "boto3>=1.40,<2",
+  "cryptography>=46,<51",
   "dinkster-api @ git+https://github.com/Kosinkadink/Dinkster.git@1c264806b52d8332b36838280a74b025754fbb03#subdirectory=packages/dinkster-api",
   "fastapi>=0.116,<1",
   "packaging>=25,<26",
