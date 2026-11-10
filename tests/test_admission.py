@@ -904,6 +904,7 @@ def test_active_dependency_is_validated_and_recorded(
         for item in json.loads(store.read("static/packs/index.json"))["items"]
         if item["name"] == "dependent-pack"
     )
+    (entry,) = json.loads(store.read("static/" + entry["url"]))["items"]
     assert store.read("static/" + entry["wheels"][0]["url"]) == data
     for name, statement, code in (
         ("undeclared-pack", "from example_pack.helpers import VALUE", "entry.unresolvable"),
@@ -1445,6 +1446,6 @@ def test_burst_admission_publishes_exactly_the_accepted_release_set(
         "rejected",
     ]
     payload = json.loads(service.object_store.read("static/packs/index.json"))
-    assert {(row["name"], row["version"]) for row in payload["items"]} == {
+    assert {(row["name"], row["latestVersion"]) for row in payload["items"]} == {
         (name, "1.2.3") for name in names
     }

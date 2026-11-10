@@ -70,9 +70,10 @@ def test_admin_yank_updates_indexes_and_preserves_downloads(
     original_bytes = client.get(artifact_url).content
     original_items = client.get("/static/packs/index.json").json()["items"]
     removed = next(
-        i for i in original_items if i["name"] == "example-pack" and i["version"] == "1.2.3"
+        i for i in original_items if i["name"] == "example-pack" and i["latestVersion"] == "1.2.3"
     )
-    filename = removed["wheels"][0]["filename"]
+    release = client.get("/static/" + removed["url"]).json()["items"][0]
+    filename = release["wheels"][0]["filename"]
     assert filename in client.get("/static/cpu/simple/example-pack/").text
 
     _run(

@@ -301,6 +301,7 @@ class S3ObjectStore:
 def _validate_index(key: str, data: bytes) -> None:
     if (
         key not in INDEX_KEYS
+        and re.fullmatch(r"static/packs/[a-z0-9]+(?:-[a-z0-9]+)*/index\.json", key) is None
         and re.fullmatch(
             r"static/[a-z0-9]+(?:-[a-z0-9]+)*/simple/(?:[a-z0-9]+(?:-[a-z0-9]+)*/)?index\.html",
             key,
