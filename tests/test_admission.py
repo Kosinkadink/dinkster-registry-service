@@ -902,6 +902,7 @@ def test_active_dependency_is_validated_and_recorded(
         for item in json.loads(store.read("static/packs/index.json"))["items"]
         if item["name"] == "dependent-pack"
     )
+    (entry,) = json.loads(store.read("static/" + entry["url"]))["items"]
     assert store.read("static/" + entry["wheels"][0]["url"]) == data
     for name, statement, code in (
         ("undeclared-pack", "from example_pack.helpers import VALUE", "entry.unresolvable"),

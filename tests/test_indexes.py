@@ -429,3 +429,130 @@ def test_sqlite_rebuild_is_deterministic_and_excludes_quarantined_releases(
         assert [item["name"] for item in json.loads(before)["items"]] == ["example-pack"]
     finally:
         database.dispose()
+
+
+def test_pack_catalog_size_is_independent_of_version_count(tmp_path: Path) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'catalog.db'}")
+    store = LocalFilesystemObjectStore(tmp_path / "objects")
+    try:
+        seed_fixtures(database, store)
+        indexes = StaticIndexes(database, store, "http://testserver")
+        indexes.rebuild()
+        before = store.read("static/packs/index.json")
+        with database.session() as session, session.begin():
+            for original in list(session.scalars(select(ReleaseRecord))):
+                for version in ("0.0.1", "0.0.2", "0.0.3", "0.0.4"):
+                    session.add(
+                        ReleaseRecord(
+                            **{
+                                column.name: getattr(original, column.name)
+                                for column in ReleaseRecord.__table__.columns
+                                if column.name not in {"id", "version", "version_key"}
+                            },
+                            id=uuid7(),
+                            version=version,
+                            version_key=version,
+                        )
+                    )
+        indexes.rebuild()
+        assert store.read("static/packs/index.json") == before
+        catalog = json.loads(before)
+        assert catalog["schemaVersion"] == 2
+        assert len(catalog["items"]) == 2
+        for entry in catalog["items"]:
+            assert set(entry) == {"name", "publisher", "latestVersion", "library", "url"}
+            document = json.loads(store.read("static/" + entry["url"]))
+            assert document["schemaVersion"] == 2 and document["name"] == entry["name"]
+            assert {row["name"] for row in document["items"]} == {entry["name"]}
+            assert len(document["items"]) == 5
+        locales = json.loads(store.read("static/locales/index.json"))
+        assert locales["schemaVersion"] == 2
+        assert all(
+            set(row) == {"name", "version", "publisher", "catalogs", "url"}
+            for row in locales["items"]
+        )
+    finally:
+        database.dispose()
+
+
+@pytest.mark.parametrize("change", ["addition", "latest-yank", "withdrawal", "mixed"])
+@pytest.mark.parametrize("interrupt", [1, 2, 3, 4])
+def test_pack_index_interruption_never_advertises_an_absent_version(
+    tmp_path: Path, change: str, interrupt: int
+) -> None:
+    class InterruptingStore(LocalFilesystemObjectStore):
+        remaining: int | None = None
+
+        def replace_index(self, key: str, data: bytes) -> None:
+            super().replace_index(key, data)
+            if not key.startswith("static/packs/") or not key.endswith("index.json"):
+                return
+            if self.exists("static/packs/index.json"):
+                for entry in json.loads(self.read("static/packs/index.json"))["items"]:
+                    document = json.loads(self.read("static/" + entry["url"]))
+                    assert entry["latestVersion"] in {row["version"] for row in document["items"]}
+            if self.remaining is not None:
+                self.remaining -= 1
+                if self.remaining == 0:
+                    raise ObjectStoreError("interrupted pack publication")
+
+    database = Database(f"sqlite:///{tmp_path / 'catalog.db'}")
+    store = InterruptingStore(tmp_path / "objects")
+    try:
+        seed_fixtures(database, store)
+        with database.session() as session, session.begin():
+            pack = session.scalar(select(PackRecord).where(PackRecord.name == "example-pack"))
+            assert pack is not None
+            original = session.scalar(select(ReleaseRecord).where(ReleaseRecord.pack_id == pack.id))
+            assert original is not None
+            session.add(
+                ReleaseRecord(
+                    **{
+                        column.name: getattr(original, column.name)
+                        for column in ReleaseRecord.__table__.columns
+                        if column.name not in {"id", "version", "version_key"}
+                    },
+                    id=uuid7(),
+                    version="2.0.0",
+                    version_key="2.0.0",
+                )
+            )
+        indexes = StaticIndexes(database, store, "http://testserver")
+        indexes.rebuild()
+        with database.session() as session, session.begin():
+            releases = list(
+                session.scalars(select(ReleaseRecord).where(ReleaseRecord.pack_id == pack.id))
+            )
+            if change in {"latest-yank", "mixed"}:
+                next(row for row in releases if row.version == "2.0.0").state = "yanked"
+            if change == "withdrawal":
+                for row in releases:
+                    row.state = "quarantined"
+            if change in {"addition", "mixed"}:
+                original = releases[0]
+                session.add(
+                    ReleaseRecord(
+                        **{
+                            column.name: getattr(original, column.name)
+                            for column in ReleaseRecord.__table__.columns
+                            if column.name not in {"id", "version", "version_key", "state"}
+                        },
+                        id=uuid7(),
+                        version="3.0.0",
+                        version_key="3.0.0",
+                        state="active",
+                    )
+                )
+            expected = {row.version for row in releases if row.state == "active"}
+            if change in {"addition", "mixed"}:
+                expected.add("3.0.0")
+        store.remaining = interrupt
+        with pytest.raises(ObjectStoreError, match="interrupted pack publication"):
+            indexes.rebuild()
+        store.remaining = None
+        indexes.rebuild()
+        document = json.loads(store.read("static/packs/example-pack/index.json"))
+        assert {row["version"] for row in document["items"]} == expected
+        assert all(row["name"] == "example-pack" for row in document["items"])
+    finally:
+        database.dispose()

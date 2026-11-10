@@ -203,7 +203,8 @@ def test_library_admission_static_download_collision_and_yank(tmp_path: Path) ->
         wheel = inspect_wheel(data, "demo-nodes", "1.2.3")
         assert f"#sha256={wheel.sha256}" in index.text
         assert index.text.count(f">{wheel.filename}</a>") == 1
-        entry = client.get("/static/packs/index.json").json()["items"][0]
+        catalog_entry = client.get("/static/packs/index.json").json()["items"][0]
+        entry = client.get("/static/" + catalog_entry["url"]).json()["items"][0]
         assert not {"filename", "sha256", "url", "size", "digest"}.intersection(entry)
         assert len(entry["wheels"]) == 1
         assert entry["wheels"][0]["sha256"] == wheel.sha256
@@ -411,6 +412,8 @@ def test_static_only_pinned_install_imports_library_and_refuses_pack_requirement
         with urllib.request.urlopen(f"{origin}/static/packs/index.json", timeout=10) as response:
             entries = json.load(response)["items"]
         entry = next(item for item in entries if item["name"] == "example-pack")
+        with urllib.request.urlopen(f"{origin}/static/{entry['url']}", timeout=10) as response:
+            entry = json.load(response)["items"][0]
         assert entry["engine"] == ">=0.9,<1"
         binding = entry["installLocks"]["cpu"]
         with urllib.request.urlopen(f"{origin}/static/{binding['url']}", timeout=10) as response:

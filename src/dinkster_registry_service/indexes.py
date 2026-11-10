@@ -42,6 +42,47 @@ class StaticIndexes:
         self.object_store = object_store
         self.public_base_url = public_base_url.rstrip("/")
 
+    def _replace_json(self, key: str, document: dict[str, object]) -> None:
+        data = json.dumps(
+            document, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("ascii")
+        self.object_store.replace_index(f"static/{key}", data)
+
+    def _write_pack_indexes(self, packs: list[dict[str, object]], names: set[str]) -> None:
+        versions: dict[str, list[dict[str, object]]] = {name: [] for name in names}
+        for entry in packs:
+            versions[str(entry["name"])].append(entry)
+        final = []
+        intermediate = []
+        for name, releases in sorted(versions.items()):
+            if not releases:
+                continue
+            latest = max(releases, key=lambda row: Version(str(row["version"])))
+            entry = {
+                "name": name,
+                "publisher": latest["publisher"],
+                "latestVersion": latest["version"],
+                "library": latest["library"],
+                "url": f"packs/{name}/index.json",
+            }
+            final.append(entry)
+            key = f"static/packs/{name}/index.json"
+            if self.object_store.exists(key):
+                old = json.loads(self.object_store.read(key))
+                old_versions = {row["version"] for row in old["items"]}
+                shared = [row for row in releases if row["version"] in old_versions]
+                if shared:
+                    safe = max(shared, key=lambda row: Version(str(row["version"])))
+                    intermediate.append({**entry, "latestVersion": safe["version"]})
+        # A disappearing latest must leave the catalog before its per-pack file.
+        self._replace_json("packs/index.json", {"schemaVersion": 2, "items": intermediate})
+        for name, releases in sorted(versions.items()):
+            self._replace_json(
+                f"packs/{name}/index.json",
+                {"schemaVersion": 2, "name": name, "items": releases},
+            )
+        self._replace_json("packs/index.json", {"schemaVersion": 2, "items": final})
+
     @contextmanager
     def _locked_session(self) -> Iterator[Session]:
         with self.database.session() as session, session.begin():
@@ -163,7 +204,15 @@ class StaticIndexes:
             }
             packs.append(entry)
             if not library:
-                locales.append({**entry, "catalogs": release.manifest.get("localeCatalogs", [])})
+                locales.append(
+                    {
+                        "name": pack.name,
+                        "version": release.version,
+                        "publisher": pack.publisher_id,
+                        "url": f"packs/{pack.name}/index.json",
+                        "catalogs": release.manifest.get("localeCatalogs", []),
+                    }
+                )
         for variant in sorted(variants):
             root_links = []
             for name, links in sorted(projects[variant].items()):
@@ -187,8 +236,8 @@ class StaticIndexes:
                 choices = replacements.setdefault(source, [])
                 if candidate not in choices:
                     choices.append(candidate)
+        self._write_pack_indexes(packs, {pack.name for pack, _, _ in rows})
         for key, items in (
-            ("packs/index.json", packs),
             ("locales/index.json", locales),
             ("schemas/index.json", list(schemas.values())),
             (
@@ -199,13 +248,9 @@ class StaticIndexes:
                 ],
             ),
         ):
-            data = json.dumps(
-                {"schemaVersion": 1, "items": items},
-                ensure_ascii=True,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("ascii")
-            self.object_store.replace_index(f"static/{key}", data)
+            self._replace_json(
+                key, {"schemaVersion": 2 if key == "locales/index.json" else 1, "items": items}
+            )
         return len(packs)
 
     def rebuild(self) -> int:

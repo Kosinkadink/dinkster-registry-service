@@ -64,8 +64,12 @@ Yanked releases are absent from the simple index. Universal wheel pages have
 identical bytes across variants. There is no publisher route for editing an
 index: the static prefix supports only GET, HEAD and OPTIONS.
 
-`/static/packs/index.json` carries exact wheel filenames, hashes and prefix-relative
-URLs, plus admitted installation locks. `/static/locks/` holds those immutable
+`/static/packs/index.json` is a schema 2 catalog with one short entry per pack:
+`name`, `publisher`, `latestVersion`, `library` and `url`. Each URL points to
+`packs/<name>/index.json`, a schema 2 document with `name` and `items` listing
+only that pack's active public versions. Those release rows carry exact wheel
+filenames, hashes and prefix-relative URLs, plus admitted installation locks.
+Catalog size depends on pack count, not version count. `/static/locks/` holds immutable
 lock bytes. Schemas and locale catalogs are indexed at
 `/static/schemas/index.json` and `/static/locales/index.json`.
 Relative JSON URLs resolve against `/static/`,
@@ -74,17 +78,28 @@ recorded pins, never unrestricted dependency resolution against the simple index
 
 Every accepted publish queues a durable rebuild of `packs/index.json` and
 `locales/index.json` in the configured object store and immediately
-attempts delivery. Both contain deterministic JSON with `schemaVersion: 1` and
-an `items` array of active public releases, ordered by pack name and version
-text. Each entry includes `name`, `version` and a `wheels` array. Each wheel has
+attempts delivery. Catalog, per-pack files and locales contain deterministic JSON
+with `schemaVersion: 2`. Per-pack `items` are ordered by version text; catalog
+latest versions use semantic version order. Each release includes `name`,
+`version` and a `wheels` array. Each wheel has
 `filename`, whole-file `sha256`, BLAKE3 `digest`, byte `size`, prefix-relative
 download `url` and `tags` (currently `["py3-none-any"]`). These artifact fields
 exist only in `wheels`, never on the release item. `publisher` is the authenticated publisher id
 (null for operator submissions without a publisher); `engine` is the manifest's
-engine compatibility range (null for libraries). Locale entries also contain `catalogs`, an
-array of locale, SHA-256 digest, and path within the same wheel. An empty array
+engine compatibility range (null for libraries). Locale entries contain only
+`name`, `version`, `publisher`, the per-pack `url`, and `catalogs`, an array
+of locale, SHA-256 digest, and path within the same wheel. An empty array
 means the release carries no locale catalog. Quarantine queues a rebuild to
 remove the release from both lists.
+
+After immutable objects are ready, publication first replaces the catalog with
+an intermediate catalog whose latest versions exist in both the old and desired
+per-pack files. Packs with no shared version are temporarily omitted. It then
+replaces per-pack files (empty for withdrawn packs), and finally publishes the
+desired catalog. Interruptions never leave the current catalog advertising a
+missing version; the durable outbox retries the pass. Readers with stale cached
+catalogs can still encounter a removed version and must refuse rather than
+substitute. This is not a multi-object transaction. No all-releases copy is written.
 
 `/static/replacements/index.json` contains `schemaVersion: 1` and `items`, with
 one item per migrated `from` type: `{"from":"old.type","candidates":[...]}`.

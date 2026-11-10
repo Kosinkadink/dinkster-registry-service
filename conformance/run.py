@@ -140,13 +140,30 @@ def run_release(base_url: str, lock: dict[str, Any]) -> None:
     for path in ("/static/packs/index.json", "/static/locales/index.json"):
         response = _request(origin + path)
         index = _json(response)
-        entries = {
-            (item["name"], item["version"], wheel["digest"])
-            for item in index["items"]
-            for wheel in item["wheels"]
-        }
-        if index.get("schemaVersion") != 1 or not expected <= entries:
-            raise ConformanceFailure(f"{path} does not contain every locked release and digest")
+        if index.get("schemaVersion") != 2:
+            raise ConformanceFailure(f"{path} has an unsupported schema")
+        if path == "/static/packs/index.json":
+            entries = set()
+            for item in index["items"]:
+                pack_path = "/static/" + item["url"]
+                pack_response = _request(origin + pack_path)
+                document = _json(pack_response)
+                if document.get("schemaVersion") != 2 or document.get("name") != item["name"]:
+                    raise ConformanceFailure(f"{pack_path} has an invalid pack identity")
+                if item["latestVersion"] not in {row["version"] for row in document["items"]}:
+                    raise ConformanceFailure(f"{pack_path} lacks the advertised latest version")
+                entries.update(
+                    (row["name"], row["version"], wheel["digest"])
+                    for row in document["items"]
+                    for wheel in row["wheels"]
+                )
+                check_conditional(origin, pack_path, pack_response)
+            if not expected <= entries:
+                raise ConformanceFailure("per-pack indexes lack a locked release and digest")
+        elif not {(name, version) for name, version, _ in expected} <= {
+            (item["name"], item["version"]) for item in index["items"]
+        }:
+            raise ConformanceFailure("locale index lacks a locked release")
         check_conditional(origin, path, response)
         print(f"PASS release static index and conditional GET: {path}")
 

@@ -393,6 +393,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             path += "index.html"
         allowed = (
             re.fullmatch(r"(?:packs|schemas|locales|replacements)/index\.json", path)
+            or re.fullmatch(r"packs/[a-z0-9]+(?:-[a-z0-9]+)*/index\.json", path)
             or re.fullmatch(r"[a-z0-9-]+/simple/(?:[a-z0-9-]+/)?index\.html", path)
             or re.fullmatch(r"packs/[a-z0-9-]+/[^/]+/schemas\.json", path)
             or re.fullmatch(r"wheels/[0-9a-f]{64}/[A-Za-z0-9_.+-]+\.whl", path)
