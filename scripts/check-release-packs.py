@@ -101,7 +101,14 @@ def main() -> None:
             if status["status"] in {"accepted", "rejected", "review"}:
                 break
         assert status["status"] == "accepted", status
-        (entry,) = json.loads(request("/static/packs/index.json"))["items"]
+        catalog = json.loads(request("/static/packs/index.json"))
+        assert catalog["schemaVersion"] == 2
+        (summary,) = catalog["items"]
+        assert (summary["name"], summary["latestVersion"]) == (lock["name"], lock["version"])
+        assert summary["url"] == f"packs/{lock['name']}/index.json"
+        versions = json.loads(request("/static/" + summary["url"]))
+        assert versions["schemaVersion"] == 2 and versions["name"] == lock["name"]
+        (entry,) = versions["items"]
         (published,) = entry["wheels"]
         assert (entry["name"], entry["version"]) == (lock["name"], lock["version"])
         assert published["sha256"] == lock["sha256"]
