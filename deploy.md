@@ -12,6 +12,15 @@ PyTorch backend; it does not provision CUDA wheels for this CPU-only scan.
 Provisioning failures retain bounded installer output and timeout status in
 operator-only scan details, never in public findings.
 
+`fly.toml` sets `DINKSTER_PROBE_PACKAGE_INDEX_URL=https://pypi.org/simple`.
+This operator index supplies ordinary Python dependencies; uv's CPU Torch
+backend also uses `download.pytorch.org`. Registry library requirements use
+active public releases selected from SQL and digest-checked wheels staged from
+the object store, including nested registry library requirements. Their wheels
+are explicit installer inputs, not an additional index. The installer receives
+neither object-store credentials nor host configuration. No secret override of
+the probe index is required.
+
 ## Prerequisites and deployment gate
 
 Do not create a placeholder or health-only registry Machine. Before the first
