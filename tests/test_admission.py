@@ -34,6 +34,7 @@ from dinkster_registry_service.admission_checks import run_manifest_admission
 from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
 from dinkster_registry_service.database import (
+    AuditEventRecord,
     Database,
     NamespaceGrantRecord,
     OutboxRecord,
@@ -44,6 +45,7 @@ from dinkster_registry_service.database import (
     ReleaseScanRunRecord,
 )
 from dinkster_registry_service.digests import artifact_digest
+from dinkster_registry_service.indexes import StaticIndexes, queue_index_rebuild
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore, ObjectStoreError
 from dinkster_registry_service.principals import PrincipalRepository
 from dinkster_registry_service.seed import FIXTURE_ROOT, seed_fixtures
@@ -1379,8 +1381,6 @@ def test_scanner_claims_queued_candidate_while_another_worker_rewrites_indexes(
     service = _service(database, tmp_path)
     candidate = service.submit(b"not a wheel", pack_name="invalid-pack", version="1.0.0")
     with ThreadPoolExecutor(max_workers=2) as executor:
-        from dinkster_registry_service.indexes import StaticIndexes
-
         rewrite = executor.submit(
             StaticIndexes(
                 database, BlockingStore(tmp_path / "objects"), "http://testserver"
@@ -1391,6 +1391,60 @@ def test_scanner_claims_queued_candidate_while_another_worker_rewrites_indexes(
             scan = executor.submit(service.run_once)
             assert scan.result(timeout=2)
             assert service.status(candidate).status == "rejected"
+            idle = executor.submit(service.run_once)
+            assert idle.result(timeout=2) is False
         finally:
             finish.set()
         assert rewrite.result(timeout=5) == 0
+
+
+def test_scanner_claim_precedes_pending_index_and_retains_claim_timestamp(
+    database: Database, tmp_path: Path
+) -> None:
+    service = _service(database, tmp_path)
+    candidate = service.submit(b"not a wheel", pack_name="invalid-pack", version="1.0.0")
+    with database.session() as session, session.begin():
+        queue_index_rebuild(session)
+    before = datetime.now(UTC)
+    assert service.run_once()
+    assert service.status(candidate).status == "rejected"
+    with database.session() as session:
+        audit = session.scalar(
+            select(AuditEventRecord).where(
+                AuditEventRecord.event_type == "release_candidate.claimed",
+                AuditEventRecord.subject_id == str(candidate),
+            )
+        )
+        assert audit is not None
+        assert before <= audit.created_at <= datetime.now(UTC)
+        assert audit.data == {"worker": "test-worker", "attempt": 1}
+        pending = session.scalar(
+            select(OutboxRecord).where(OutboxRecord.topic == "indexes.rebuild")
+        )
+        assert pending is not None and pending.state == "pending"
+
+
+def test_burst_admission_publishes_exactly_the_accepted_release_set(
+    database: Database, tmp_path: Path
+) -> None:
+    service = _service(database, tmp_path)
+    names = ("burst-alpha", "burst-beta", "burst-gamma")
+    candidates = [
+        service.submit(_archive(tmp_path, name), pack_name=name, version="1.2.3") for name in names
+    ]
+    candidates.append(service.submit(b"invalid", pack_name="burst-invalid", version="9.0.0"))
+    for _ in range(20):
+        if not service.run_once():
+            break
+    else:
+        pytest.fail("finite publication burst did not drain")
+    assert [service.status(candidate).status for candidate in candidates] == [
+        "accepted",
+        "accepted",
+        "accepted",
+        "rejected",
+    ]
+    payload = json.loads(service.object_store.read("static/packs/index.json"))
+    assert {(row["name"], row["version"]) for row in payload["items"]} == {
+        (name, "1.2.3") for name in names
+    }

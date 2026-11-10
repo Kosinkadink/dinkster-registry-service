@@ -262,20 +262,28 @@ class StaticIndexes:
         with self._locked_session(blocking=False) as session:
             if session is None:
                 return False
+            ready = session.scalar(
+                select(OutboxRecord.id)
+                .where(
+                    OutboxRecord.topic == "indexes.rebuild",
+                    OutboxRecord.state == "pending",
+                    OutboxRecord.available_at <= datetime.now(UTC),
+                )
+                .limit(1)
+            )
+            if ready is None:
+                return False
             events = list(
                 session.scalars(
                     select(OutboxRecord)
                     .where(
                         OutboxRecord.topic == "indexes.rebuild",
                         OutboxRecord.state == "pending",
-                        OutboxRecord.available_at <= datetime.now(UTC),
                     )
                     .order_by(OutboxRecord.created_at, OutboxRecord.id)
                     .with_for_update()
                 )
             )
-            if not events:
-                return False
             for event in events:
                 event.attempts += 1
             try:
