@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import socket
+import tempfile
 import time
 import tomllib
 import zipfile
@@ -28,6 +29,7 @@ from dinkster_schema import (
 )
 from dinkster_workers.manifest import load_manifest
 from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 from packaging.version import Version
 from sqlalchemy import and_, or_, select, text
 from sqlalchemy.orm import Session
@@ -59,6 +61,7 @@ from .seed import MEDIA_TYPE
 from .settings import ServerSettings
 from .versioning import public_version_key, require_public_version
 from .wheels import (
+    Wheel,
     WheelError,
     extracted_wheel,
     inspect_wheel,
@@ -1045,6 +1048,99 @@ class AdmissionService:
                 )
             )
 
+    def _probe_library_wheels(self, requirements: set[str], directory: Path) -> tuple[Path, ...]:
+        with self.database.session() as session:
+            rows = session.execute(
+                select(PackRecord, ReleaseRecord).join(
+                    ReleaseRecord, ReleaseRecord.pack_id == PackRecord.id
+                )
+            ).all()
+            libraries = {
+                canonicalize_name(pack.name)
+                for pack, release in rows
+                if release.manifest.get("kind") == "library"
+            }
+            available: dict[str, list[ReleaseRecord]] = {name: [] for name in libraries}
+            for pack, release in rows:
+                name = canonicalize_name(pack.name)
+                if name in libraries and pack.visibility == "public" and release.state == "active":
+                    available[name].append(release)
+            for releases in available.values():
+                releases.sort(key=lambda release: Version(release.version), reverse=True)
+            artifacts: dict[UUID, tuple[Wheel, bytes]] = {}
+
+            def read(release: ReleaseRecord, name: str) -> tuple[Wheel, bytes]:
+                if release.id not in artifacts:
+                    artifact = session.get(ArtifactRecord, release.artifact_digest)
+                    assert artifact is not None
+                    data = self.object_store.read(artifact.object_key, max_size=MAX_ARTIFACT_SIZE)
+                    if artifact_digest(data) != artifact.digest or len(data) != artifact.size:
+                        raise ValueError(f"Library artifact changed for {name!r}.")
+                    wheel = inspect_wheel(data, name, release.version)
+                    if not wheel.library:
+                        raise ValueError(f"Requirement {name!r} names a pack, not a library.")
+                    artifacts[release.id] = wheel, data
+                return artifacts[release.id]
+
+            def resolve(
+                pending: list[tuple[Requirement, frozenset[str]]],
+                selected: dict[str, ReleaseRecord],
+                expanded: frozenset[tuple[str, frozenset[str]]],
+            ) -> dict[str, ReleaseRecord]:
+                while pending:
+                    requirement, parent_extras = pending.pop(0)
+                    if requirement.marker is not None and not any(
+                        requirement.marker.evaluate({"extra": extra})
+                        for extra in parent_extras | {""}
+                    ):
+                        continue
+                    name = canonicalize_name(requirement.name)
+                    if name not in libraries:
+                        continue
+                    if requirement.url is not None:
+                        raise ValueError(
+                            f"Library requirement {requirement} must use the registry."
+                        )
+                    candidates = [selected[name]] if name in selected else available[name]
+                    failure = ValueError(
+                        f"No active public library {name!r} satisfies "
+                        f"{str(requirement.specifier)!r}."
+                    )
+                    for release in candidates:
+                        if not requirement.specifier.contains(release.version, prereleases=True):
+                            continue
+                        wheel, _ = read(release, name)
+                        extras = frozenset(requirement.extras)
+                        key = name, extras
+                        children = (
+                            [(Requirement(value), extras) for value in wheel.requirements]
+                            if key not in expanded
+                            else []
+                        )
+                        try:
+                            return resolve(
+                                [*pending, *children],
+                                {**selected, name: release},
+                                expanded | {key},
+                            )
+                        except ValueError as exc:
+                            failure = exc
+                    raise failure
+                return selected
+
+            selected = resolve(
+                [(Requirement(value), frozenset()) for value in sorted(requirements)],
+                {},
+                frozenset(),
+            )
+            paths = []
+            for library_name, release in sorted(selected.items()):
+                wheel, data = read(release, library_name)
+                path = directory / wheel.filename
+                path.write_bytes(data)
+                paths.append(path)
+            return tuple(paths)
+
     def _probe_with_dependencies(self, root: Path) -> StageResult:
         manifest_path = root / "dinkster-pack.toml"
         original = manifest_path.read_bytes()
@@ -1107,9 +1203,18 @@ class AdmissionService:
                 document["pack"]["requires"] = sorted(requirements)
                 document["pack"].pop("extra-requires", None)
                 manifest_path.write_text(tomli_w.dumps(document))
-            return run_executable_probe(
-                root, settings=self.settings, require_isolation=self.require_isolation
-            )
+            with tempfile.TemporaryDirectory(prefix="registry-library-wheels-") as directory:
+                wheels = self._probe_library_wheels(requirements, Path(directory))
+                if wheels:
+                    return run_executable_probe(
+                        root,
+                        settings=self.settings,
+                        require_isolation=self.require_isolation,
+                        dependency_wheels=wheels,
+                    )
+                return run_executable_probe(
+                    root, settings=self.settings, require_isolation=self.require_isolation
+                )
         except (ValueError, ObjectStoreError, FileNotFoundError) as exc:
             return StageResult(
                 (

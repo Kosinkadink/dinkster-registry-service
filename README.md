@@ -168,6 +168,16 @@ processes and full probe-isolation preflight. See [deploy.md](deploy.md) for
 secret prerequisites, migration/runtime credential separation, first deploy,
 health-checked rollback and the required live evidence.
 
+Executable probes resolve registry library requirements only from active public
+registry releases, including nested library requirements. The service verifies
+each staged wheel's digest and size and passes its local path to the installer.
+Unavailable ranges and conflicting library requirements block admission; yanked
+or quarantined releases never fall back to a package with the same name on the
+operator index. Ordinary dependencies use `DINKSTER_PROBE_PACKAGE_INDEX_URL`,
+explicitly `https://pypi.org/simple` in `fly.toml`; uv's CPU Torch backend also
+uses `download.pytorch.org`. The installer receives no registry credentials.
+Pack-to-pack dependencies remain separate from library requirements.
+
 The [immutable-image deploy workflow](.github/workflows/deploy.yml) runs on hosted Ubuntu
 after main's CI gates and only when production is enabled. The
 [landed deployment run](https://github.com/Kosinkadink/dinkster-registry-service/actions/runs/41271898612)

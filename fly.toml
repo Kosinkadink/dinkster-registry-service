@@ -9,6 +9,7 @@ kill_timeout = "30s"
 [env]
   DINKSTER_ENV = "production"
   DINKSTER_PUBLIC_BASE_URL = "https://registry.dinkster.org"
+  DINKSTER_PROBE_PACKAGE_INDEX_URL = "https://pypi.org/simple"
   HTTP_HOST = "0.0.0.0"
 
 [deploy]

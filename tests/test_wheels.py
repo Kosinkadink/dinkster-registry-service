@@ -36,14 +36,15 @@ def wheel_bytes(
     *,
     name: str = "demo-nodes",
     package: str = "demo_nodes",
+    version: str = "1.2.3",
     library: bool = False,
     extra: dict[str, bytes] | None = None,
     requirements: tuple[str, ...] = ("demo-core>=2",),
 ) -> bytes:
-    dist = f"{name.replace('-', '_')}-1.2.3.dist-info"
+    dist = f"{name.replace('-', '_')}-{version}.dist-info"
     files = {
         f"{dist}/METADATA": (
-            f"Metadata-Version: 2.4\nName: {name}\nVersion: 1.2.3\n"
+            f"Metadata-Version: 2.4\nName: {name}\nVersion: {version}\n"
             + "".join(f"Requires-Dist: {value}\n" for value in requirements)
             + "\n"
         ).encode(),
@@ -52,7 +53,7 @@ def wheel_bytes(
     }
     if not library:
         files[f"{package}/dinkster-pack.toml"] = (
-            f'[pack]\nname = "{name}"\nversion = "1.2.3"\n'
+            f'[pack]\nname = "{name}"\nversion = "{version}"\n'
         ).encode()
         files[f"{package}/locales/en.json"] = b'{"title":"Example"}'
     files.update(extra or {})
@@ -472,4 +473,125 @@ def test_static_only_pinned_install_imports_library_and_refuses_pack_requirement
         server.shutdown()
         server.server_close()
         thread.join()
+        database.dispose()
+
+
+@pytest.mark.parametrize(
+    "state", ["active", "extras", "cycle", "conflict", "yanked", "quarantined", "out-of-range"]
+)
+def test_probe_resolves_registry_libraries_with_operator_requirements(
+    tmp_path: Path, state: str
+) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'catalog.db'}")
+    store = LocalFilesystemObjectStore(tmp_path / "objects")
+    index = tmp_path / "simple"
+    for name, package, version in (
+        ("operator-only", "operator_only", "1.2.3"),
+        ("demo-core", "demo_core", "9.0"),
+    ):
+        project = index / name
+        project.mkdir(parents=True)
+        data = wheel_bytes(
+            name=name,
+            package=package,
+            version=version,
+            library=True,
+            requirements=(),
+            extra={f"{package}/__init__.py": b"ANSWER = 7\n"},
+        )
+        wheel = inspect_wheel(data, name, version)
+        path = project / wheel.filename
+        path.write_bytes(data)
+        (project / "index.html").write_text(f'<a href="{path.as_uri()}">{path.name}</a>')
+    service = AdmissionService(
+        database,
+        store,
+        require_isolation=False,
+        settings=ServerSettings(probe_package_index_url=index.as_uri()),
+    )
+    principals = PrincipalRepository(database)
+    principals.register_user("operator")
+    principals.register_publisher("dinkster", "operator", datetime.now(UTC).isoformat())
+    try:
+        for name, package, requirements, code in (
+            (
+                "demo-leaf",
+                "demo_leaf",
+                ("demo-core>=1",) if state == "cycle" else (),
+                b"ANSWER = 35\n",
+            ),
+            (
+                "demo-core",
+                "demo_core",
+                (
+                    'demo-leaf==1.2.3; extra == "leaf"'
+                    if state == "extras"
+                    else "demo-leaf==1.2.3",
+                    "operator-only==1.2.3",
+                ),
+                b"from demo_leaf import ANSWER as LEAF\n"
+                b"from operator_only import ANSWER as OPERATOR\nANSWER = LEAF + OPERATOR\n",
+            ),
+        ):
+            data = wheel_bytes(
+                name=name,
+                package=package,
+                library=True,
+                requirements=requirements,
+                extra={f"{package}/__init__.py": code},
+            )
+            candidate = service.submit(data, pack_name=name, version="1.2.3")
+            assert service.run_once()
+            assert service.status(candidate).status == "accepted"
+        if state == "active":
+            candidate = service.submit(
+                wheel_bytes(
+                    name="demo-core",
+                    package="demo_core",
+                    version="2.0",
+                    library=True,
+                    requirements=("demo-leaf>=2",),
+                ),
+                pack_name="demo-core",
+                version="2.0",
+            )
+            assert service.run_once()
+            assert service.status(candidate).status == "accepted"
+        if state in {"yanked", "quarantined"}:
+            with database.session() as session, session.begin():
+                for release in session.scalars(select(ReleaseRecord)):
+                    release.state = state
+        source = tmp_path / "pack"
+        shutil.copytree(FIXTURE_ROOT / "example-pack", source)
+        manifest = source / "dinkster-pack.toml"
+        version_range = ">=2" if state == "out-of-range" else ">=1,<10"
+        extras = "[leaf]" if state == "extras" else ""
+        conflict = ', "demo-leaf>=2"' if state == "conflict" else ""
+        manifest.write_text(
+            manifest.read_text().replace(
+                "[pack]\n",
+                f'[pack]\nrequires = ["demo-core{extras}{version_range}", '
+                f'"operator-only==1.2.3"{conflict}]\n',
+            )
+        )
+        nodes = source / "nodes.py"
+        nodes.write_text("from demo_core import ANSWER\nassert ANSWER == 42\n" + nodes.read_text())
+        candidate = service.submit(
+            build_registry_fixture_archive(source),
+            pack_name="example-pack",
+            version="1.2.3",
+            publisher="dinkster",
+        )
+        assert service.run_once()
+        result = service.status(candidate)
+        if state in {"active", "extras", "cycle"}:
+            assert result.status == "accepted", result
+        else:
+            assert result.status == "rejected", result
+            assert result.reason == "probe.pack-dependencies-unavailable"
+            expected_name = "demo-leaf" if state == "conflict" else "demo-core"
+            assert any(expected_name in finding.message for finding in result.findings)
+            expected_range = ">=2" if state in {"out-of-range", "conflict"} else "<10,>=1"
+            assert any(expected_range in finding.message for finding in result.findings)
+    finally:
         database.dispose()
