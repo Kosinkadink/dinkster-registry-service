@@ -653,7 +653,7 @@ wheels = [
 [[package]]
 name = "dinkster-api"
 version = "0.0.2"
-source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=e8230daac5c65c586e6acab8a62964e363b7a680#e8230daac5c65c586e6acab8a62964e363b7a680" }
+source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=1c264806b52d8332b36838280a74b025754fbb03#1c264806b52d8332b36838280a74b025754fbb03" }
 dependencies = [
     { name = "aiohttp" },
     { name = "alembic" },
@@ -724,7 +724,7 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.16,<2" },
     { name = "blake3", specifier = ">=1.0,<2" },
     { name = "boto3", specifier = ">=1.40,<2" },
-    { name = "dinkster-api", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=e8230daac5c65c586e6acab8a62964e363b7a680" },
+    { name = "dinkster-api", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=1c264806b52d8332b36838280a74b025754fbb03" },
     { name = "fastapi", specifier = ">=0.116,<1" },
     { name = "packaging", specifier = ">=25,<26" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
