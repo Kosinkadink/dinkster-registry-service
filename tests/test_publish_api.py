@@ -205,6 +205,12 @@ def test_published_locks_bind_archive_base_and_visibility(
             ],
         }
     ]
+    locks["linux-cpu"]["lock"].update(
+        format="dinkster.pack-lock/2",
+        engine=">=0.0.2,<0.1",
+        requirements=["dinkster-api<0.1,>=0.0.2", "fixture==1.0"],
+        indexes=["https://example.test/simple"],
+    )
     endpoint = "/v1/publish/locked-pack/versions/1.2.3"
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -234,12 +240,18 @@ def test_published_locks_bind_archive_base_and_visibility(
     download = client.get(lock_url, params=query)
     assert download.status_code == 200
     assert download.json() == locks["linux-cpu"]["lock"]
+    assert download.content == json.dumps(
+        locks["linux-cpu"]["lock"], sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("ascii")
     windows = client.get(
         lock_url.replace("linux-cpu", "win-cpu"),
         params={"baseId": "sha256:" + "2" * 64},
     )
     assert windows.status_code == 200
     assert windows.json() == locks["win-cpu"]["lock"]
+    assert windows.content == json.dumps(
+        locks["win-cpu"]["lock"], sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("ascii")
     assert windows.content != download.content
     facts = detail["installLocks"]["linux-cpu"]
     assert facts["artifactDigest"] == artifact_digest(archive)
@@ -295,6 +307,65 @@ def test_published_locks_bind_archive_base_and_visibility(
     stored = tmp_path / "objects" / "pack-locks" / "blake3" / digest[:2] / f"{digest}.json"
     stored.write_bytes(b"damaged retained lock")
     assert client.get(lock_url, params=query).status_code == 500
+
+
+def test_format2_lock_validation_preserves_legacy_exact_locks(tmp_path: Path) -> None:
+    client, app, token = _client(tmp_path)
+    archive = _archive(tmp_path, "locked-pack")
+    locks = json.loads(json.dumps(_locks(archive)))
+    lock = locks["linux-cpu"]["lock"]
+    lock.update(format="dinkster.pack-lock/2", engine=">=0.0.2,<0.1")
+    api = {
+        "name": "dinkster-api",
+        "version": "0.0.2",
+        "wheels": [
+            {
+                "filename": "dinkster_api-0.0.2-py3-none-any.whl",
+                "size": 17,
+                "sha256": "a" * 64,
+                "url": "https://example.test/dinkster_api-0.0.2-py3-none-any.whl",
+            }
+        ],
+    }
+    locks["win-cpu"]["lock"]["packages"] = [api]
+
+    def publish(payload: dict[str, object]) -> Response:
+        return client.post(
+            "/v1/publish/locked-pack/versions/1.2.3",
+            headers={"Authorization": f"Bearer {token}"},
+            files={"archive": ("pack.whl", archive, "application/zip")},
+            data={"locks": json.dumps(payload)},
+        )
+
+    for changes, reason in (
+        ({"engine": ""}, "engine API requires a nonempty compatibility range"),
+        ({"engine": 7}, "engine compatibility range must be a string"),
+        ({"packages": [api]}, "engine API must not also be an exact lock package"),
+        ({"format": "dinkster.pack-lock/3"}, "unsupported dependency lock format"),
+    ):
+        invalid = json.loads(json.dumps(locks))
+        invalid["linux-cpu"]["lock"].update(changes)
+        response = publish(invalid)
+        assert response.status_code == 400, response.text
+        assert reason in response.json()["error"]["message"]
+        assert not (tmp_path / "objects").exists()
+
+    submitted = publish(locks)
+    assert submitted.status_code == 202, submitted.text
+    admission = AdmissionService(
+        app.state.database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        require_isolation=False,
+    )
+    assert admission.run_once()
+    assert admission.status(UUID(submitted.json()["candidateId"])).status == "accepted"
+    for variant, binding in locks.items():
+        response = client.get(
+            f"/v1/packs/locked-pack/versions/1.2.3/locks/{variant}",
+            params={"baseId": binding["baseId"]},
+        )
+        assert response.status_code == 200
+        assert response.json() == binding["lock"]
 
 
 @pytest.mark.parametrize(
