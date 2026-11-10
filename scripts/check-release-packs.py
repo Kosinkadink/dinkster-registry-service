@@ -101,6 +101,7 @@ def main() -> None:
             if status["status"] in {"accepted", "rejected", "review"}:
                 break
         assert status["status"] == "accepted", status
+        cli("scanner", "--once")
         catalog = json.loads(request("/static/packs/index.json"))
         assert catalog["schemaVersion"] == 2
         (summary,) = catalog["items"]

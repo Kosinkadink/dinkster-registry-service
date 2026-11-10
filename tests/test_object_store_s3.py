@@ -193,6 +193,7 @@ def test_accepted_publish_updates_both_s3_indexes_with_conditional_get(
         )
         assert service.run_once()
         assert service.status(candidate).status == "accepted"
+        assert service.run_once()
         schema_key = "static/packs/example-pack/1.2.3/schemas.json"
         schemas = client.get(f"/{schema_key}")
         assert schemas.status_code == 200
@@ -269,6 +270,7 @@ def test_accepted_publish_updates_both_s3_indexes_with_conditional_get(
         )
         assert service.run_once()
         assert service.status(second).status == "accepted"
+        assert service.run_once()
         for key, etag in etags.items():
             response = client.get(f"/static/{key}", headers={"If-None-Match": etag})
             assert response.status_code == 200
