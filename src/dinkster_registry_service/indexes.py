@@ -77,6 +77,8 @@ class StaticIndexes:
         # A disappearing latest must leave the catalog before its per-pack file.
         self._replace_json("packs/index.json", {"schemaVersion": 2, "items": intermediate})
         for name, releases in sorted(versions.items()):
+            if not releases and not self.object_store.exists(f"static/packs/{name}/index.json"):
+                continue
             self._replace_json(
                 f"packs/{name}/index.json",
                 {"schemaVersion": 2, "name": name, "items": releases},

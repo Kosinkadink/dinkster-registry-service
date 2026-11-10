@@ -431,6 +431,40 @@ def test_sqlite_rebuild_is_deterministic_and_excludes_quarantined_releases(
         database.dispose()
 
 
+@pytest.mark.parametrize("formerly_public", [False, True])
+def test_inactive_pack_index_exists_only_to_withdraw_a_public_pack(
+    tmp_path: Path, formerly_public: bool
+) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'catalog.db'}")
+    store = LocalFilesystemObjectStore(tmp_path / "objects")
+    try:
+        seed_fixtures(database, store)
+        indexes = StaticIndexes(database, store, "http://testserver")
+        if formerly_public:
+            indexes.rebuild()
+            assert json.loads(store.read("static/packs/example-pack/index.json"))["items"]
+        with database.session() as session, session.begin():
+            pack = session.scalar(select(PackRecord).where(PackRecord.name == "example-pack"))
+            assert pack is not None
+            release = session.scalar(select(ReleaseRecord).where(ReleaseRecord.pack_id == pack.id))
+            assert release is not None
+            release.state = "quarantined" if formerly_public else "pending_review"
+        for _ in range(2):
+            indexes.rebuild()
+            assert {
+                row["name"] for row in json.loads(store.read("static/packs/index.json"))["items"]
+            } == {"color-tools"}
+            assert store.exists("static/packs/example-pack/index.json") == formerly_public
+            if formerly_public:
+                assert json.loads(store.read("static/packs/example-pack/index.json")) == {
+                    "schemaVersion": 2,
+                    "name": "example-pack",
+                    "items": [],
+                }
+    finally:
+        database.dispose()
+
+
 def test_pack_catalog_size_is_independent_of_version_count(tmp_path: Path) -> None:
     database = Database(f"sqlite:///{tmp_path / 'catalog.db'}")
     store = LocalFilesystemObjectStore(tmp_path / "objects")
