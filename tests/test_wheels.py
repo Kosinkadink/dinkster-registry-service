@@ -477,7 +477,8 @@ def test_static_only_pinned_install_imports_library_and_refuses_pack_requirement
 
 
 @pytest.mark.parametrize(
-    "state", ["active", "extras", "cycle", "conflict", "yanked", "quarantined", "out-of-range"]
+    "state",
+    ["active", "extras", "cycle", "conflict", "yanked", "quarantined", "out-of-range", "url"],
 )
 def test_probe_resolves_registry_libraries_with_operator_requirements(
     tmp_path: Path, state: str
@@ -527,7 +528,9 @@ def test_probe_resolves_registry_libraries_with_operator_requirements(
                     'demo-leaf==1.2.3; extra == "leaf"'
                     if state == "extras"
                     else "demo-leaf==1.2.3",
-                    "operator-only==1.2.3",
+                    "operator-only @ https://example.invalid/untrusted.whl"
+                    if state == "url"
+                    else "operator-only==1.2.3",
                 ),
                 b"from demo_leaf import ANSWER as LEAF\n"
                 b"from operator_only import ANSWER as OPERATOR\nANSWER = LEAF + OPERATOR\n",
@@ -591,7 +594,10 @@ def test_probe_resolves_registry_libraries_with_operator_requirements(
             assert result.reason == "probe.pack-dependencies-unavailable"
             expected_name = "demo-leaf" if state == "conflict" else "demo-core"
             assert any(expected_name in finding.message for finding in result.findings)
-            expected_range = ">=2" if state in {"out-of-range", "conflict"} else "<10,>=1"
-            assert any(expected_range in finding.message for finding in result.findings)
+            if state == "url":
+                assert any("must use the package index" in item.message for item in result.findings)
+            else:
+                expected_range = ">=2" if state in {"out-of-range", "conflict"} else "<10,>=1"
+                assert any(expected_range in finding.message for finding in result.findings)
     finally:
         database.dispose()

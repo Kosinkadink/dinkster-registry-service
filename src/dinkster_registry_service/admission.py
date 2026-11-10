@@ -1079,6 +1079,10 @@ class AdmissionService:
                     wheel = inspect_wheel(data, name, release.version)
                     if not wheel.library:
                         raise ValueError(f"Requirement {name!r} names a pack, not a library.")
+                    if any(Requirement(value).url is not None for value in wheel.requirements):
+                        raise ValueError(
+                            f"Library {name!r} dependencies must use the package index."
+                        )
                     artifacts[release.id] = wheel, data
                 return artifacts[release.id]
 
