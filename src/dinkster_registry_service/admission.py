@@ -995,7 +995,6 @@ class AdmissionService:
                 )
         if failure is not None:
             return True
-        self.indexes.deliver_one()
         self.object_store.remove(source_key)
         for variant in release.install_locks:
             self.object_store.remove(quarantine_lock_key(candidate_id, variant))

@@ -194,6 +194,7 @@ def test_library_admission_static_download_collision_and_yank(tmp_path: Path) ->
     candidate = service.submit(data, pack_name="demo-nodes", version="1.2.3")
     assert service.run_once()
     assert service.status(candidate).status == "accepted"
+    assert service.run_once()
     with database.session() as session:
         assert list(session.scalars(select(NamespaceGrantRecord))) == []
     app = create_app(ServerSettings(database_url=url, object_store_root=store.root))
@@ -405,6 +406,7 @@ def test_static_only_pinned_install_imports_library_and_refuses_pack_requirement
         )
         assert service.run_once()
         assert service.status(candidate).status == "accepted", service.status(candidate)
+        assert service.run_once()
         for name in ("demo-core", "example-pack"):
             assert store.read(f"static/cpu/simple/{name}/index.html") == store.read(
                 f"static/cuda/simple/{name}/index.html"
