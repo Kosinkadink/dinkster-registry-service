@@ -6,7 +6,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -429,3 +429,86 @@ def test_sqlite_rebuild_is_deterministic_and_excludes_quarantined_releases(
         assert [item["name"] for item in json.loads(before)["items"]] == ["example-pack"]
     finally:
         database.dispose()
+
+
+def test_pending_rebuilds_are_served_by_one_catalog_snapshot(
+    seeded_catalog: tuple[Database, LocalFilesystemObjectStore],
+) -> None:
+    database, store = seeded_catalog
+    with database.session() as session, session.begin():
+        for _ in range(3):
+            queue_index_rebuild(session)
+        session.flush()
+        delayed = session.scalar(select(OutboxRecord).order_by(OutboxRecord.created_at).limit(1))
+        assert delayed is not None
+        delayed.available_at = datetime.now(UTC) + timedelta(minutes=1)
+    indexes = StaticIndexes(database, store, "http://testserver")
+    assert indexes.deliver_one()
+    with database.session() as session:
+        events = list(session.scalars(select(OutboxRecord)))
+        assert len(events) == 3
+        assert {event.state for event in events} == {"delivered"}
+    assert not indexes.deliver_one()
+    assert {
+        (item["name"], item["version"])
+        for item in json.loads(store.read("static/packs/index.json"))["items"]
+    } == {("example-pack", "1.2.3"), ("color-tools", "0.4.0")}
+
+
+@pytest.mark.parametrize("fail", (False, True), ids=("delivered", "retry"))
+def test_rebuild_keeps_requests_committed_during_publication(
+    database: Database, tmp_path: Path, fail: bool
+) -> None:
+    entered = threading.Event()
+    finish = threading.Event()
+
+    class BlockingStore(LocalFilesystemObjectStore):
+        block = True
+        fail_write = fail
+
+        def replace_index(self, key: str, data: bytes) -> None:
+            if key == "static/packs/index.json" and self.block:
+                self.block = False
+                entered.set()
+                assert finish.wait(10)
+                if self.fail_write:
+                    raise ObjectStoreError("synthetic publication failure")
+            super().replace_index(key, data)
+
+    store = BlockingStore(tmp_path / "objects")
+    seed_fixtures(database, store)
+    with database.session() as session, session.begin():
+        for _ in range(3):
+            queue_index_rebuild(session)
+    indexes = StaticIndexes(database, store, "http://testserver")
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(indexes.deliver_one)
+        try:
+            assert entered.wait(5)
+            with database.session() as session, session.begin():
+                pack = session.scalar(select(PackRecord).where(PackRecord.name == "color-tools"))
+                assert pack is not None
+                release = session.scalar(
+                    select(ReleaseRecord).where(ReleaseRecord.pack_id == pack.id)
+                )
+                assert release is not None
+                release.state = "quarantined"
+                queue_index_rebuild(session)
+        finally:
+            finish.set()
+        assert first.result(timeout=5)
+    with database.session() as session, session.begin():
+        events = list(session.scalars(select(OutboxRecord).order_by(OutboxRecord.created_at)))
+        assert len(events) == 4
+        assert [event.state for event in events] == (
+            ["pending"] * 4 if fail else ["delivered"] * 3 + ["pending"]
+        )
+        for event in events:
+            event.available_at = datetime.now(UTC)
+    assert indexes.deliver_one()
+    assert not indexes.deliver_one()
+    for name in ("packs", "locales"):
+        assert {
+            (item["name"], item["version"])
+            for item in json.loads(store.read(f"static/{name}/index.json"))["items"]
+        } == {("example-pack", "1.2.3")}
