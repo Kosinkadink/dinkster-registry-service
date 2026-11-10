@@ -438,6 +438,16 @@ class AdmissionService:
             candidate.lease_expires_at = now + timedelta(seconds=self.lease_seconds)
             candidate.attempt_count += 1
             candidate.status = "scanning"
+            session.add(
+                AuditEventRecord(
+                    id=uuid7(),
+                    created_at=now,
+                    event_type="release_candidate.claimed",
+                    subject_type="release_candidate",
+                    subject_id=str(candidate.id),
+                    data={"worker": self.worker_id, "attempt": candidate.attempt_count},
+                )
+            )
             return CandidateClaim(
                 id=candidate.id,
                 kind=candidate.kind,
@@ -1400,13 +1410,11 @@ class AdmissionService:
             )
 
     def run_once(self) -> bool:
-        if self.indexes.deliver_one():
-            return True
         if self.deliver_one_promotion():
             return True
         claim = self.claim()
         if claim is None:
-            return False
+            return self.indexes.deliver_one()
         self.process(claim)
         return True
 
