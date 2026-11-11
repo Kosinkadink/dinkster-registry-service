@@ -517,11 +517,29 @@ create accounts, claim names or administer other credentials. The former
 bearer-publishing-token administration endpoints are removed; existing tokens
 continue to authenticate uploads and candidate status until expired or revoked.
 
+Authors open `https://id.dinkster.org/registry`, sign in with their Dinkster
+account, choose their account or organization, and claim the attested publisher.
+Create a token with an expiry and optional pack name, save the one-time value
+in a secret manager or publishing workflow secret, then use it for the publish
+endpoint. Refresh lists metadata only. Revoke on the same page to stop further
+uploads. No server access or admin command is needed for an ordinary author.
+
 An operator can freeze a disputed publisher with the audited
 `admin freeze-publisher <publisher> --user <operator> --reason <reason>` command.
 The freeze revokes its existing publishing tokens and prevents new minting in
 one serialized transaction. Published releases are not changed. No such command
 is part of an ordinary author's registration or publishing journey.
+
+The single audited binding/correction command is
+`admin bind-publisher <publisher> --user <operator> --identity-subject <subject>
+--expected-owner <current-subject-or-unbound> --reason <reason>` (one line).
+The operator independently confirms the target's immutable `u_<UUID>` or
+`org:<UUID>` identity, never infers ownership from a matching email or name.
+The command compares the expected owner under lock, replaces the binding and
+old memberships, clears the freeze and appends an immutable ownership event.
+Rebinding revokes all old publisher tokens; initial binding of a reserved name
+keeps existing tokens until the confirmed first-party cutover. Published files,
+admission and tiers stay unchanged. This is not a bulk migration tool.
 
 Pack names use Dinkster's shared closed grammar: 1 through 64 lowercase ASCII
 characters, starting with a letter, with alphanumeric segments separated by

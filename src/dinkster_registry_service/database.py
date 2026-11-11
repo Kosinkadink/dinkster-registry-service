@@ -471,6 +471,13 @@ class Database:
                             f"ALTER TABLE {table} ADD COLUMN install_locks JSON NOT NULL "
                             "DEFAULT '{}'"
                         )
+                for operation in ("UPDATE", "DELETE"):
+                    connection.exec_driver_sql(
+                        f"CREATE TRIGGER IF NOT EXISTS ownership_audit_no_{operation.lower()} "
+                        f"BEFORE {operation} ON audit_events "
+                        "WHEN OLD.event_type = 'ownership.transferred' "
+                        "BEGIN SELECT RAISE(ABORT, 'ownership audit is append-only'); END"
+                    )
         self._sessions = sessionmaker(self.engine, expire_on_commit=False)
 
     @property

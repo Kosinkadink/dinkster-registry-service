@@ -3,14 +3,22 @@ from __future__ import annotations
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
-from dinkster_registry import TOKEN_PREFIX
+from dinkster_registry import TOKEN_PREFIX, RegistryError
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
+from sqlalchemy.exc import DatabaseError
 
 from dinkster_registry_service.cli import main
-from dinkster_registry_service.database import Database, ReleaseRecord
+from dinkster_registry_service.database import (
+    AuditEventRecord,
+    Database,
+    PublisherBindingRecord,
+    PublisherMembershipRecord,
+    ReleaseRecord,
+)
 from dinkster_registry_service.indexes import StaticIndexes
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore, ObjectStoreError
 from dinkster_registry_service.principals import PrincipalRepository
@@ -52,6 +60,91 @@ def test_admin_cli_bootstraps_the_unified_service(
         principals.authorize("owner", "example-org", "publish")
         principals.authorize_token(token, "example-org", "example-pack")
         assert principals.is_operator("owner")
+    finally:
+        database.dispose()
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
+def test_publisher_binding_and_transfer_are_audited_and_revoke_previous_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    backend: str,
+) -> None:
+    if backend == "postgresql":
+        request.getfixturevalue("database")
+        url = request.getfixturevalue("database_url")
+    else:
+        url = f"sqlite:///{tmp_path / 'registry.db'}"
+    base = ("admin", "--database-url", url)
+    _run(monkeypatch, *base, "add-user", "operator", "--operator")
+    _run(monkeypatch, *base, "add-user", "owner")
+    _run(monkeypatch, *base, "add-publisher", "reserved-name", "--owner", "owner")
+    database = Database(url)
+    principals = PrincipalRepository(database)
+    now = datetime.now(UTC)
+    secret, _ = principals.mint_token(
+        "reserved-name", "owner", now.isoformat(), (now + timedelta(days=1)).isoformat()
+    )
+    first = f"u_{uuid4()}"
+    second = f"org:{uuid4()}"
+
+    def bind(
+        target: str, previous: str, *, actor: str = "operator", reason: str = "Confirmed"
+    ) -> None:
+        _run(
+            monkeypatch,
+            *base,
+            "bind-publisher",
+            "reserved-name",
+            "--user",
+            actor,
+            "--identity-subject",
+            target,
+            "--expected-owner",
+            previous,
+            "--reason",
+            reason,
+        )
+
+    try:
+        with pytest.raises(SystemExit, match="registry operator"):
+            bind(first, "unbound", actor="owner")
+        bind(first, "unbound")
+        # Initial binding preserves the existing first-party publishing token until cutover.
+        assert principals.verify_token(secret, now.isoformat()).publisher == "reserved-name"
+        principals.authorize("owner", "reserved-name", "publish")
+        with pytest.raises(SystemExit, match="owner changed"):
+            bind(second, "unbound")
+        with pytest.raises(SystemExit, match="requires a reason"):
+            bind(second, first, reason=" ")
+        with pytest.raises(SystemExit, match="immutable Dinkster"):
+            bind("someone@example.test", first)
+        principals.freeze_publisher("reserved-name", "operator", now.isoformat(), "Dispute")
+        bind(second, first)
+        with pytest.raises(RegistryError):
+            principals.authorize("owner", "reserved-name", "publish")
+        with pytest.raises(RegistryError, match="revoked"):
+            principals.verify_token(secret, now.isoformat())
+        with database.session() as session:
+            binding = session.get(PublisherBindingRecord, "reserved-name")
+            assert binding is not None and binding.identity_subject == second
+            owners = list(session.scalars(select(PublisherMembershipRecord)))
+            assert [(owner.user_id, owner.role) for owner in owners] == [(second, "owner")]
+            events = list(session.scalars(select(AuditEventRecord).order_by(AuditEventRecord.id)))
+            assert len(events) == 2
+            assert events[0].data["previousOwner"] is None
+            assert events[0].data["owner"] == first
+            assert events[1].data["previousOwner"] == first
+            assert events[1].data["owner"] == second
+            assert events[1].data["actor"] == "operator"
+            event_id = events[1].id
+        for statement in (
+            update(AuditEventRecord).where(AuditEventRecord.id == event_id).values(data={}),
+            delete(AuditEventRecord).where(AuditEventRecord.id == event_id),
+        ):
+            with pytest.raises(DatabaseError), database.session() as session, session.begin():
+                session.execute(statement)
     finally:
         database.dispose()
 

@@ -1,7 +1,8 @@
+import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -12,8 +13,12 @@ from joserfc.jwk import OKPKey
 from sqlalchemy import select
 
 from dinkster_registry_service import accounts
+from dinkster_registry_service.admission import AdmissionService
 from dinkster_registry_service.app import create_app
+from dinkster_registry_service.artifacts import build_registry_fixture_archive
 from dinkster_registry_service.database import PublisherBindingRecord, PublisherTokenRecord
+from dinkster_registry_service.object_store import LocalFilesystemObjectStore
+from dinkster_registry_service.seed import FIXTURE_ROOT
 from dinkster_registry_service.settings import ServerSettings
 
 
@@ -122,6 +127,32 @@ def test_human_identity_claims_mints_and_revokes_without_operator(
         assert secret not in listed.text and "secret_hash" not in listed.text
         assert listed.json()["tokens"][0]["pack"] == "alice-pack"
         publish_headers = {"Authorization": f"Bearer {secret}"}
+        source = tmp_path / "alice-pack"
+        shutil.copytree(FIXTURE_ROOT / "example-pack", source)
+        manifest = source / "dinkster-pack.toml"
+        manifest.write_text(
+            manifest.read_text()
+            .replace('publisher = "dinkster"', 'publisher = "alice"')
+            .replace('name = "example-pack"', 'name = "alice-pack"')
+            .replace('namespaces = ["example"]', 'namespaces = ["alice-pack"]')
+        )
+        nodes = source / "nodes.py"
+        nodes.write_text(nodes.read_text().replace("example.", "alice-pack."))
+        submitted = browser.post(
+            "/v1/publish/alice-pack/versions/1.2.3",
+            content=build_registry_fixture_archive(source),
+            headers=publish_headers,
+        )
+        assert submitted.status_code == 202, submitted.text
+        scanner = AdmissionService(
+            app.state.database,
+            LocalFilesystemObjectStore(tmp_path / "objects"),
+            require_isolation=False,
+        )
+        assert scanner.run_once()
+        assert scanner.status(UUID(submitted.json()["candidateId"])).status == "accepted"
+        published = browser.get("/v1/packs/alice-pack/versions/1.2.3")
+        assert published.status_code == 200 and published.json()["state"] == "active"
         assert browser.get("/v1/tokens", headers=publish_headers).status_code == 404
         assert (
             browser.post(
