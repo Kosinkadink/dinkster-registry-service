@@ -41,6 +41,7 @@ def check_candidate(wheels: Path, case: str) -> None:
         manifest.write_text(
             manifest.read_text()
             .replace('publisher = "dinkster"\n', "")
+            .replace('namespaces = ["example"]', 'namespaces = ["example-pack"]')
             .replace(
                 "[pack]\n",
                 '[pack]\nrequires = ["' + torch_requirement + '", "torchvision==0.22.1+cpu"]\n',
@@ -52,7 +53,8 @@ def check_candidate(wheels: Path, case: str) -> None:
             "assert torch.version.cuda is None\n"
             "assert torch.arange(3).sum().item() == 3\n"
             "assert torchvision.ops.nms(torch.tensor([[0., 0., 2., 2.]]), "
-            "torch.tensor([0.9]), 0.5).tolist() == [0]\n" + nodes.read_text()
+            "torch.tensor([0.9]), 0.5).tolist() == [0]\n"
+            + nodes.read_text().replace("example.", "example-pack.")
         )
         database = Database(f"sqlite:///{root / 'catalog.db'}")
         try:
