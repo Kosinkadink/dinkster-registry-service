@@ -35,6 +35,7 @@ from .object_store import MAX_ARTIFACT_SIZE, ObjectStoreError
 from .pack_locks import MAX_LOCKS_SIZE, PackLocksError, lock_object_key
 from .principals import PrincipalRepository
 from .repository import CatalogDataError, CatalogRepository
+from .security_repository import NoticeChange, SecurityRepository, UploadChange
 from .settings import ServerSettings
 from .versioning import VersionError, require_public_version
 from .wire import ErrorCode, ErrorResponse, ResponseModel
@@ -100,6 +101,11 @@ class ReviewRequest(RequestModel):
 
 
 class RevokeTokenRequest(RequestModel):
+    reason: str = Field(min_length=1, max_length=1024)
+
+
+class SecurityRoleRequest(RequestModel):
+    enabled: bool = Field(strict=True)
     reason: str = Field(min_length=1, max_length=1024)
 
 
@@ -292,6 +298,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     object_store = configured.create_object_store()
     repository = CatalogRepository(database, CursorCodec(configured.cursor_secret))
     principals = PrincipalRepository(database)
+    security = SecurityRepository(database, configured.public_base_url)
     admission = AdmissionService(database, object_store, settings=configured)
 
     @asynccontextmanager
@@ -554,6 +561,72 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         return _json_response(
             request,
             _candidate_payload(status),
+            cache_control=NO_STORE,
+            conditional=False,
+            include_etag=False,
+        )
+
+    @app.put("/v1/security/uploads")
+    def set_upload_control(request: Request, body: UploadChange) -> Response:
+        _query(request, EmptyQuery)
+        token = _authenticate(request, principals)
+        try:
+            security.set_uploads(actor=token.minted_by, change=body, token=token)
+        except RegistryError as exc:
+            raise ProtocolError(403, "forbidden", str(exc)) from None
+        return _json_response(
+            request,
+            body.model_dump(mode="json", by_alias=True),
+            cache_control=NO_STORE,
+            conditional=False,
+            include_etag=False,
+        )
+
+    @app.put("/v1/security/roles/{user}")
+    def set_security_role(request: Request, user: str, body: SecurityRoleRequest) -> Response:
+        _query(request, EmptyQuery)
+        token = _authenticate(request, principals)
+        if token.pack is not None:
+            raise ProtocolError(403, "forbidden", "Role administration needs an unscoped token.")
+        try:
+            security.set_role(
+                actor=token.minted_by, user=user, enabled=body.enabled, reason=body.reason
+            )
+        except RegistryError as exc:
+            raise ProtocolError(403, "forbidden", str(exc)) from None
+        return _json_response(
+            request,
+            {"user": user, "enabled": body.enabled},
+            cache_control=NO_STORE,
+            conditional=False,
+            include_etag=False,
+        )
+
+    @app.get("/v1/security/notices/history")
+    def security_notice_history(request: Request) -> Response:
+        _query(request, EmptyQuery)
+        _authenticate(request, principals)
+        return _json_response(
+            request,
+            {"notices": [row.model_dump(mode="json", by_alias=True) for row in security.history()]},
+            cache_control=NO_STORE,
+            conditional=False,
+            include_etag=False,
+        )
+
+    @app.post("/v1/security/notices")
+    def change_security_notice(request: Request, body: NoticeChange) -> Response:
+        _query(request, EmptyQuery)
+        token = _authenticate(request, principals)
+        try:
+            notice = security.change(actor=token.minted_by, change=body, token=token)
+        except ValidationError as exc:
+            raise ProtocolError(400, "invalid_request", str(exc)) from None
+        except RegistryError as exc:
+            raise ProtocolError(403, "forbidden", str(exc)) from None
+        return _json_response(
+            request,
+            notice.model_dump(mode="json", by_alias=True),
             cache_control=NO_STORE,
             conditional=False,
             include_etag=False,

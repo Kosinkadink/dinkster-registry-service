@@ -48,6 +48,7 @@ from dinkster_registry_service.digests import artifact_digest
 from dinkster_registry_service.indexes import StaticIndexes, queue_index_rebuild
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore, ObjectStoreError
 from dinkster_registry_service.principals import PrincipalRepository
+from dinkster_registry_service.security_repository import SecurityRepository, UploadChange
 from dinkster_registry_service.seed import FIXTURE_ROOT, seed_fixtures
 from dinkster_registry_service.settings import ServerSettings
 from dinkster_registry_service.wheels import (
@@ -589,6 +590,31 @@ def test_failed_object_promotion_is_retried_without_exposing_release(
         outbox = session.scalar(select(OutboxRecord))
         assert outbox is not None
         assert (outbox.state, outbox.attempts) == ("pending", 1)
+        outbox.available_at = outbox.created_at
+
+    principals = PrincipalRepository(database)
+    principals.register_user("responder")
+    principals.add_operator("responder", "responder", datetime.now(UTC).isoformat())
+    security = SecurityRepository(database, "https://registry.example")
+    security.set_role(actor="responder", user="responder", enabled=True, reason="response")
+    control = UploadChange(
+        subject_type="pack", subject="example-pack", stopped=True, reason="review queued activation"
+    )
+    security.set_uploads(actor="responder", change=control)
+    assert service.run_once()
+    assert (service.status(candidate_id).status, service.status(candidate_id).reason) == (
+        "promoting",
+        "uploads-stopped",
+    )
+    with _client(database_url, tmp_path / "objects") as client:
+        assert client.get("/v1/packs/example-pack").status_code == 404
+    assert store.exists(quarantine_object_key(candidate_id))
+    security.set_uploads(actor="responder", change=control.model_copy(update={"stopped": False}))
+    with database.session() as session, session.begin():
+        outbox = session.scalar(
+            select(OutboxRecord).where(OutboxRecord.topic == "artifact.promote")
+        )
+        assert outbox is not None
         outbox.available_at = outbox.created_at
 
     assert service.run_once()

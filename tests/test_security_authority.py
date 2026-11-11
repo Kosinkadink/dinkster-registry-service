@@ -1,0 +1,334 @@
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from threading import Barrier
+
+import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from dinkster_registry import RegistryError
+from fastapi.testclient import TestClient
+from sqlalchemy import select
+
+from dinkster_registry_service.app import create_app
+from dinkster_registry_service.artifacts import build_registry_fixture_archive
+from dinkster_registry_service.database import Database, PackRecord, ReleaseRecord
+from dinkster_registry_service.object_store import LocalFilesystemObjectStore
+from dinkster_registry_service.principals import PrincipalRepository
+from dinkster_registry_service.security import SecurityRelease, sign_security_document
+from dinkster_registry_service.security_repository import NoticeChange, SecurityRepository
+from dinkster_registry_service.seed import FIXTURE_ROOT, seed_fixtures
+from dinkster_registry_service.settings import ServerSettings
+
+
+def test_security_authority_history_and_clearing_survive_reopen(tmp_path: Path) -> None:
+    settings = ServerSettings(
+        database_url=f"sqlite:///{tmp_path / 'security.db'}",
+        object_store_root=tmp_path / "objects",
+        public_base_url="http://testserver",
+    )
+    app = create_app(settings)
+    database = app.state.database
+    seed_fixtures(database, app.state.object_store)
+    principals = PrincipalRepository(database)
+    now = datetime.now(UTC)
+    headers = {}
+    for user in ("operator", "publisher", "responder", "outsider"):
+        principals.register_user(user)
+        principals.register_publisher(user, user, now.isoformat())
+        plaintext, _ = principals.mint_token(
+            user, user, now.isoformat(), (now + timedelta(hours=1)).isoformat()
+        )
+        headers[user] = {"Authorization": f"Bearer {plaintext}"}
+    principals.add_operator("operator", "operator", now.isoformat())
+    with database.session() as session, session.begin():
+        pack = session.scalar(select(PackRecord).where(PackRecord.name == "example-pack"))
+        assert pack is not None
+        pack.publisher_id = "publisher"
+        release = session.scalar(select(ReleaseRecord).where(ReleaseRecord.pack_id == pack.id))
+        assert release is not None
+        identity = {
+            "pack": pack.name,
+            "version": release.version,
+            "artifactDigest": release.artifact_digest,
+        }
+        original_state = release.state
+    change = {
+        "operation": "issue",
+        "release": identity,
+        "expectedRevision": 0,
+        "state": "vulnerable",
+        "reason": "unsafe-input",
+        "message": "A fix is available.",
+        "incident": "https://example.test/incidents/1",
+    }
+    client = TestClient(app)
+    endpoint = "/v1/security/notices"
+    role = {"enabled": True, "reason": "incident responder"}
+    assert client.post(endpoint, json=change).status_code == 401
+    assert (
+        client.put(
+            "/v1/security/roles/outsider", json=role, headers=headers["outsider"]
+        ).status_code
+        == 403
+    )
+    assert (
+        client.put(
+            "/v1/security/roles/responder", json=role, headers=headers["operator"]
+        ).status_code
+        == 200
+    )
+    assert client.post(endpoint, json=change, headers=headers["outsider"]).status_code == 403
+    issued = client.post(endpoint, json=change, headers=headers["publisher"])
+    assert issued.status_code == 200, issued.text
+    first = issued.json()
+    assert first["status"] == "active" and first["authority"] == "publisher"
+    withdraw = {**change, "operation": "withdraw", "expectedRevision": first["revision"]}
+    cleared = client.post(endpoint, json=withdraw, headers=headers["publisher"])
+    assert cleared.status_code == 200 and cleared.json()["status"] == "cleared"
+    reissue = {**change, "expectedRevision": cleared.json()["revision"]}
+    active = client.post(endpoint, json=reissue, headers=headers["publisher"]).json()
+    confirmed = client.post(
+        endpoint,
+        json={**change, "operation": "confirm", "expectedRevision": active["revision"]},
+        headers=headers["responder"],
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["securityConfirmed"] is True
+    stale = client.post(endpoint, json=withdraw, headers=headers["publisher"])
+    assert stale.status_code == 403
+    assert (
+        client.post(
+            endpoint,
+            json={**withdraw, "expectedRevision": confirmed.json()["revision"]},
+            headers=headers["publisher"],
+        ).status_code
+        == 403
+    )
+    correction = client.post(
+        endpoint,
+        json={
+            **change,
+            "operation": "correct",
+            "state": "malicious",
+            "expectedRevision": confirmed.json()["revision"],
+        },
+        headers=headers["responder"],
+    )
+    assert correction.status_code == 200, correction.text
+    for user in ("publisher", "operator"):
+        assert (
+            client.post(
+                endpoint,
+                json={
+                    **change,
+                    "operation": "lift",
+                    "state": "malicious",
+                    "expectedRevision": correction.json()["revision"],
+                },
+                headers=headers[user],
+            ).status_code
+            == 403
+        )
+    lifted = client.post(
+        endpoint,
+        json={
+            **change,
+            "operation": "lift",
+            "state": "malicious",
+            "expectedRevision": correction.json()["revision"],
+        },
+        headers=headers["responder"],
+    )
+    assert lifted.status_code == 200 and lifted.json()["status"] == "cleared"
+    history = client.get(endpoint + "/history", headers=headers["publisher"]).json()["notices"]
+    assert [row["status"] for row in history] == [
+        "active",
+        "cleared",
+        "active",
+        "active",
+        "active",
+        "cleared",
+    ]
+    assert [row["state"] for row in history] == ["vulnerable"] * 4 + ["malicious"] * 2
+    assert len({row["id"] for row in history}) == 1
+    assert all(a["revision"] < b["revision"] for a, b in zip(history, history[1:], strict=False))
+    database.dispose()
+    reopened = create_app(settings)
+    repository = SecurityRepository(reopened.state.database, settings.public_base_url)
+    assert [row.model_dump(mode="json", by_alias=True) for row in repository.history()] == history
+    document = repository.document(issued_at=now, expires_at=now + timedelta(hours=1))
+    assert len(document.notices) == 1 and document.notices[0].status == "cleared"
+    assert b'"cleared"' in sign_security_document(document, Ed25519PrivateKey.generate())
+    with reopened.state.database.session() as session:
+        stored = session.scalar(
+            select(ReleaseRecord).where(ReleaseRecord.artifact_digest == identity["artifactDigest"])
+        )
+        assert stored is not None and stored.state == original_state
+    reopened.state.database.dispose()
+
+
+def test_upload_stops_cover_pack_and_publisher_without_changing_published_releases(
+    tmp_path: Path,
+) -> None:
+    settings = ServerSettings(
+        database_url=f"sqlite:///{tmp_path / 'security.db'}",
+        object_store_root=tmp_path / "objects",
+        public_base_url="http://testserver",
+    )
+    app = create_app(settings)
+    database = app.state.database
+    seed_fixtures(database, app.state.object_store)
+    principals = PrincipalRepository(database)
+    now = datetime.now(UTC)
+    headers = {}
+    for user in ("owner", "responder", "other"):
+        principals.register_user(user)
+        principals.register_publisher(user, user, now.isoformat())
+        plaintext, _ = principals.mint_token(
+            user, user, now.isoformat(), (now + timedelta(hours=1)).isoformat()
+        )
+        headers[user] = {"Authorization": f"Bearer {plaintext}"}
+    principals.add_operator("owner", "owner", now.isoformat())
+    repository = SecurityRepository(database, settings.public_base_url)
+    repository.set_role(actor="owner", user="responder", enabled=True, reason="response")
+    with database.session() as session, session.begin():
+        for pack in session.scalars(select(PackRecord)):
+            pack.publisher_id = "owner"
+        original = {
+            row.id: (row.state, row.artifact_digest)
+            for row in session.scalars(select(ReleaseRecord))
+        }
+    client = TestClient(app)
+    archive = build_registry_fixture_archive(FIXTURE_ROOT / "example-pack")
+    endpoint = "/v1/security/uploads"
+    stop = {"subjectType": "pack", "subject": "example-pack", "stopped": True, "reason": "review"}
+    assert client.put(endpoint, json=stop, headers=headers["other"]).status_code == 403
+    assert client.put(endpoint, json=stop, headers=headers["owner"]).status_code == 200
+    assert (
+        client.post(
+            "/v1/publish/example-pack/versions/1.2.4", content=archive, headers=headers["owner"]
+        ).status_code
+        == 409
+    )
+    assert (
+        client.put(
+            endpoint, json={**stop, "stopped": False}, headers=headers["responder"]
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/v1/publish/example-pack/versions/1.2.4", content=archive, headers=headers["owner"]
+        ).status_code
+        == 202
+    )
+    assert client.put(endpoint, json=stop, headers=headers["responder"]).status_code == 200
+    # Repeating the stop cannot downgrade security authority to publisher authority.
+    assert client.put(endpoint, json=stop, headers=headers["owner"]).status_code == 200
+    assert (
+        client.put(endpoint, json={**stop, "stopped": False}, headers=headers["owner"]).status_code
+        == 403
+    )
+    assert (
+        client.put(
+            endpoint, json={**stop, "stopped": False}, headers=headers["responder"]
+        ).status_code
+        == 200
+    )
+    publisher_stop = {**stop, "subjectType": "publisher", "subject": "owner"}
+    assert client.put(endpoint, json=publisher_stop, headers=headers["owner"]).status_code == 403
+    assert (
+        client.put(endpoint, json=publisher_stop, headers=headers["responder"]).status_code == 200
+    )
+    for name in ("example-pack", "color-tools", "new-pack"):
+        assert (
+            client.post(
+                f"/v1/publish/{name}/versions/2.0", content=archive, headers=headers["owner"]
+            ).status_code
+            == 409
+        )
+    assert (
+        client.post(
+            "/v1/publish/unrelated-pack/versions/2.0", content=archive, headers=headers["other"]
+        ).status_code
+        == 202
+    )
+    assert (
+        client.put(
+            endpoint, json={**publisher_stop, "stopped": False}, headers=headers["responder"]
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/v1/publish/new-pack/versions/2.0", content=archive, headers=headers["owner"]
+        ).status_code
+        == 202
+    )
+    with database.session() as session:
+        assert {
+            row.id: (row.state, row.artifact_digest)
+            for row in session.scalars(select(ReleaseRecord))
+        } == original
+    database.dispose()
+
+
+def test_concurrent_security_changes_have_one_winner_and_role_revocation_is_effective(
+    seeded_catalog: tuple[Database, LocalFilesystemObjectStore],
+) -> None:
+    database, _ = seeded_catalog
+    principals = PrincipalRepository(database)
+    now = datetime.now(UTC).isoformat()
+    for user in ("operator", "responder"):
+        principals.register_user(user)
+    principals.add_operator("operator", "operator", now)
+    repository = SecurityRepository(database, "https://registry.example")
+    repository.set_role(actor="operator", user="responder", enabled=True, reason="response")
+    with database.session() as session:
+        pack = session.scalar(select(PackRecord).where(PackRecord.name == "example-pack"))
+        assert pack is not None
+        release = session.scalar(select(ReleaseRecord).where(ReleaseRecord.pack_id == pack.id))
+        assert release is not None
+        identity = SecurityRelease(
+            pack=pack.name, version=release.version, artifact_digest=release.artifact_digest
+        )
+    change = NoticeChange(
+        operation="issue",
+        release=identity,
+        expected_revision=0,
+        state="vulnerable",
+        reason="review",
+        message="Details",
+        incident="case1",
+    )
+    original = repository.change(actor="responder", change=change)
+    start = Barrier(2)
+
+    def update(operation: str) -> str:
+        body = NoticeChange.model_validate_json(change.model_dump_json())
+        body = NoticeChange.model_validate_json(
+            body.model_copy(
+                update={"operation": operation, "expected_revision": original.revision}
+            ).model_dump_json()
+        )
+        start.wait(timeout=10)
+        try:
+            repository.change(actor="responder", change=body)
+        except RegistryError as exc:
+            assert "current revision" in str(exc)
+            return "conflict"
+        return "changed"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(update, ("confirm", "lift")))
+    assert sorted(results) == ["changed", "conflict"]
+    history = repository.history()
+    assert len(history) == 2
+    assert history[1].previous_revision == history[0].revision
+    assert history[1].revision > history[0].revision
+    repository.set_role(actor="operator", user="responder", enabled=False, reason="shift ended")
+    next_change = change.model_copy(update={"expected_revision": history[-1].revision})
+    with pytest.raises(RegistryError):
+        repository.change(actor="responder", change=next_change)

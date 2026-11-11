@@ -57,6 +57,7 @@ from .ids import uuid7
 from .indexes import StaticIndexes, queue_index_rebuild
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStore, ObjectStoreError
 from .pack_locks import lock_object_key, parse_pack_locks, quarantine_lock_key
+from .security_repository import SecurityRepository, UploadStopped, lock_security
 from .seed import MEDIA_TYPE
 from .settings import ServerSettings
 from .versioning import public_version_key, require_public_version
@@ -219,6 +220,8 @@ class AdmissionService:
             for lock in prepared:
                 self.object_store.put(quarantine_lock_key(candidate_id, lock.variant), lock.data)
             with self.database.session() as session, session.begin():
+                lock_security(session)
+                SecurityRepository.require_uploads(session, pack_name, publisher)
                 supersedes = None
                 if prepared:
                     if self.database.is_postgresql:
@@ -226,8 +229,6 @@ class AdmissionService:
                             text("SELECT pg_advisory_xact_lock(hashtext(:identity))"),
                             {"identity": f"{pack_name}:{public_version_key(version)}"},
                         )
-                    else:
-                        session.execute(text("BEGIN IMMEDIATE"))
                     previous_candidates = session.scalars(
                         select(ReleaseCandidateRecord)
                         .where(
@@ -634,9 +635,11 @@ class AdmissionService:
         try:
             wheel = inspect_wheel(data, claim.pack_name, claim.version)
             with self.database.session() as session, session.begin():
-                if not self.database.is_postgresql:
-                    session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+                lock_security(session)
                 candidate = self._leased_candidate(session, claim)
+                SecurityRepository.require_uploads(
+                    session, candidate.pack_name, candidate.publisher_id
+                )
                 if self.database.is_postgresql:
                     session.execute(
                         text("SELECT pg_advisory_xact_lock(hashtext(:pack_name))"),
@@ -889,7 +892,7 @@ class AdmissionService:
                 StageResult((AdmissionFinding(exc.code, "error", "block", str(exc)),)),
             )
             return
-        except PromotionConflict as exc:
+        except (PromotionConflict, UploadStopped) as exc:
             self._record_promotion_conflict(claim, str(exc))
             return
         self.deliver_one_promotion()
@@ -898,6 +901,7 @@ class AdmissionService:
         failure: BaseException | None = None
         source_key = ""
         with self.database.session() as session, session.begin():
+            lock_security(session)
             outbox = session.scalar(
                 select(OutboxRecord)
                 .where(
@@ -920,6 +924,14 @@ class AdmissionService:
             release = session.get(ReleaseRecord, release_id)
             if candidate is None or release is None:
                 raise AdmissionError("promotion outbox references absent catalog state")
+            try:
+                SecurityRepository.require_uploads(
+                    session, candidate.pack_name, candidate.publisher_id
+                )
+            except UploadStopped:
+                outbox.available_at = datetime.now(UTC) + timedelta(seconds=60)
+                candidate.status_reason = "uploads-stopped"
+                return True
             try:
                 if self.object_store.exists(source_key):
                     data = self.object_store.read(source_key, max_size=MAX_ARTIFACT_SIZE)
