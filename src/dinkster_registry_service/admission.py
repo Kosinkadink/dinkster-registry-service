@@ -334,7 +334,7 @@ class AdmissionService:
                         (item for item in previous_candidates if item.status != "rejected"), None
                     )
                     if previous is not None:
-                        if previous.status not in {"queued", "scanning", "accepted"}:
+                        if previous.status not in {"queued", "retrying", "scanning", "accepted"}:
                             raise AdmissionError(f"release candidate is {previous.status}")
                         self.object_store.remove(object_key)
                         for lock in prepared:
@@ -467,7 +467,7 @@ class AdmissionService:
                     select(ReleaseCandidateRecord)
                     .where(
                         or_(
-                            ReleaseCandidateRecord.status == "queued",
+                            ReleaseCandidateRecord.status.in_(("queued", "retrying")),
                             and_(
                                 ReleaseCandidateRecord.status == "scanning",
                                 ReleaseCandidateRecord.lease_expires_at <= now,
@@ -524,6 +524,7 @@ class AdmissionService:
             candidate.lease_expires_at = now + timedelta(seconds=self.lease_seconds)
             candidate.attempt_count += 1
             candidate.status = "scanning"
+            candidate.status_reason = None
             session.add(
                 AuditEventRecord(
                     id=uuid7(),
@@ -628,10 +629,32 @@ class AdmissionService:
                 candidate.status_reason = next(
                     finding.code for finding in result.findings if finding.effect == "block"
                 )
+                blocks = {finding.code for finding in result.findings if finding.effect == "block"}
+                probe_timeout = blocks == {"probe.timeout"}
+                install_timeout = (
+                    blocks == {"probe.dependencies-unresolved"}
+                    and (result.operator_details or {}).get("timedOut") is True
+                )
+                if stage == "executable_probe" and (probe_timeout or install_timeout):
+                    limit = (
+                        self.settings.probe_timeout_seconds
+                        if probe_timeout
+                        else self.settings.probe_dependency_timeout_seconds
+                    )
+                    candidate.status_reason = (
+                        f"{candidate.status_reason}: {limit}s time limit exceeded "
+                        f"after {claim.attempt} attempts"
+                    )
+                    if claim.attempt < self.settings.scanner_max_attempts:
+                        candidate.status = "retrying"
                 candidate.lease_owner = None
                 candidate.lease_token = None
                 candidate.lease_expires_at = None
-                if candidate.kind == "rescan" and candidate.release_id is not None:
+                if (
+                    candidate.status == "rejected"
+                    and candidate.kind == "rescan"
+                    and candidate.release_id is not None
+                ):
                     self._quarantine_release(
                         session,
                         candidate.release_id,

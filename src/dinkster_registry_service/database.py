@@ -311,7 +311,8 @@ class ReleaseCandidateRecord(Base):
     __table_args__ = (
         CheckConstraint("kind IN ('upload', 'rescan')", name="ck_release_candidates_kind"),
         CheckConstraint(
-            "status IN ('queued', 'scanning', 'review', 'rejected', 'promoting', 'accepted')",
+            "status IN ('queued', 'retrying', 'scanning', 'review', "
+            "'rejected', 'promoting', 'accepted')",
             name="ck_release_candidates_status",
         ),
         CheckConstraint(
