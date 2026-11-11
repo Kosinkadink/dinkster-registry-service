@@ -37,7 +37,13 @@ from .ownership import transfer_ownership
 from .pack_locks import MAX_LOCKS_SIZE, PackLocksError, lock_object_key
 from .principals import PrincipalRepository
 from .repository import CatalogDataError, CatalogRepository
-from .security_repository import NoticeChange, OwnershipChange, SecurityRepository, UploadChange
+from .security_repository import (
+    NoticeChange,
+    OwnershipChange,
+    SecurityRepository,
+    UploadChange,
+    UploadStopped,
+)
 from .settings import ServerSettings
 from .versioning import VersionError, require_public_version
 from .wire import ErrorCode, ErrorResponse, ResponseModel
@@ -480,10 +486,19 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         _query(request, EmptyQuery)
         name = _pack_name(canonical_name)
         version = _version(canonical_version)
-        token = _authenticate(request, principals)
+        reason = request.headers.get("x-registry-security-reason")
+        if reason is not None and not reason.strip():
+            raise ProtocolError(
+                403, "forbidden", "Security publication requires a nonblank reason."
+            )
+        credential = (
+            _authenticate(request, principals) if reason is None else await identity(request)
+        )
         try:
-            principals.authorize(token.minted_by, token.publisher, "publish")
-            principals.authorize_token(token, token.publisher, name)
+            with security.transaction() as session:
+                authorization = security.authorize_upload(session, credential, name, reason)
+        except UploadStopped as exc:
+            raise ProtocolError(409, "publish_in_progress", str(exc)) from None
         except RegistryError as exc:
             raise ProtocolError(403, "forbidden", str(exc)) from None
         locks = None
@@ -533,12 +548,11 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
                 archive,
                 pack_name=name,
                 version=version,
-                submitted_by=token.minted_by,
-                publisher=token.publisher,
+                authorization=authorization,
                 locks=locks,
             )
             principals.record(
-                token.minted_by,
+                authorization.actor,
                 "submit-release",
                 str(candidate_id),
                 datetime.now(UTC).isoformat(),
