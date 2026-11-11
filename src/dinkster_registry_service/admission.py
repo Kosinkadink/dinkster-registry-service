@@ -60,6 +60,7 @@ from .indexes import StaticIndexes, queue_index_rebuild
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStore, ObjectStoreError
 from .pack_locks import lock_object_key, parse_pack_locks, quarantine_lock_key
 from .principals import PrincipalRepository
+from .scan_engine import parse_scan_engine
 from .security_publication import SecurityPublication
 from .security_repository import (
     SecurityRepository,
@@ -107,6 +108,7 @@ class CandidateClaim:
     object_key: str
     lease_token: UUID
     attempt: int
+    scan_engine: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -266,10 +268,12 @@ class AdmissionService:
         declared_digest: str | None = None,
         declared_size: int | None = None,
         locks: bytes | None = None,
+        engine: bytes | None = None,
         authorization: UploadAuthorization | None = None,
     ) -> UUID:
         require_canonical_pack_name(pack_name)
         require_public_version(version)
+        scan_engine = parse_scan_engine(engine)
         if authorization is not None:
             publisher = authorization.publisher
             submitted_by = authorization.actor
@@ -305,30 +309,35 @@ class AdmissionService:
                     SecurityRepository.require_authorization(session, authorization, pack_name)
                 SecurityRepository.require_uploads(session, pack_name, publisher)
                 supersedes = None
-                if prepared:
-                    if self.database.is_postgresql:
-                        session.execute(
-                            text("SELECT pg_advisory_xact_lock(hashtext(:identity))"),
-                            {"identity": f"{pack_name}:{public_version_key(version)}"},
-                        )
-                    previous_candidates = session.scalars(
-                        select(ReleaseCandidateRecord)
-                        .where(
-                            ReleaseCandidateRecord.kind == "upload",
-                            ReleaseCandidateRecord.pack_name == pack_name,
-                            ReleaseCandidateRecord.version_key == public_version_key(version),
-                            ReleaseCandidateRecord.publisher_id == publisher,
-                        )
-                        .order_by(ReleaseCandidateRecord.submitted_at.desc())
-                    ).all()
+                if self.database.is_postgresql:
+                    session.execute(
+                        text("SELECT pg_advisory_xact_lock(hashtext(:identity))"),
+                        {"identity": f"{pack_name}:{public_version_key(version)}"},
+                    )
+                previous_candidates = session.scalars(
+                    select(ReleaseCandidateRecord)
+                    .where(
+                        ReleaseCandidateRecord.kind == "upload",
+                        ReleaseCandidateRecord.pack_name == pack_name,
+                        ReleaseCandidateRecord.version_key == public_version_key(version),
+                        ReleaseCandidateRecord.publisher_id == publisher,
+                    )
+                    .order_by(ReleaseCandidateRecord.submitted_at.desc())
+                ).all()
+                if (
+                    prepared
+                    or scan_engine is not None
+                    or any(item.scan_engine is not None for item in previous_candidates)
+                ):
                     for recorded in previous_candidates:
                         if (
                             recorded.declared_digest != digest
                             or recorded.declared_size != size
                             or recorded.install_locks != install_locks
+                            or recorded.scan_engine != scan_engine
                         ):
                             raise AdmissionError(
-                                "release already has different archive or lock bindings"
+                                "release already has different archive, lock or engine bindings"
                             )
                     previous = next(
                         (item for item in previous_candidates if item.status != "rejected"), None
@@ -358,6 +367,7 @@ class AdmissionService:
                         declared_size=size,
                         object_key=object_key,
                         install_locks=install_locks,
+                        scan_engine=scan_engine,
                         status="queued",
                         status_reason=None,
                         submitted_at=now,
@@ -432,6 +442,7 @@ class AdmissionService:
                     declared_digest=artifact.digest,
                     declared_size=artifact.size,
                     object_key=artifact.object_key,
+                    scan_engine=release.scan_engine,
                     status="queued",
                     status_reason=None,
                     submitted_at=now,
@@ -546,6 +557,7 @@ class AdmissionService:
                 object_key=candidate.object_key,
                 lease_token=token,
                 attempt=candidate.attempt_count,
+                scan_engine=candidate.scan_engine,
             )
 
     @staticmethod
@@ -884,6 +896,7 @@ class AdmissionService:
                     artifact_digest=candidate.declared_digest,
                     manifest=manifest,
                     install_locks=candidate.install_locks,
+                    scan_engine=candidate.scan_engine,
                     next_scan_at=now + RESCAN_INTERVAL,
                 )
                 session.add(release)

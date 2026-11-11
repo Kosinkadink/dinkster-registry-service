@@ -218,6 +218,7 @@ class ReleaseRecord(Base):
     )
     manifest: Mapped[dict[str, Any]] = mapped_column(JSON_STORAGE)
     install_locks: Mapped[dict[str, Any]] = mapped_column(JSON_STORAGE, default=dict)
+    scan_engine: Mapped[dict[str, str] | None] = mapped_column(JSON_STORAGE, nullable=True)
     next_scan_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
@@ -343,6 +344,7 @@ class ReleaseCandidateRecord(Base):
     declared_size: Mapped[int] = mapped_column(BigInteger)
     object_key: Mapped[str] = mapped_column(Text)
     install_locks: Mapped[dict[str, Any]] = mapped_column(JSON_STORAGE, default=dict)
+    scan_engine: Mapped[dict[str, str] | None] = mapped_column(JSON_STORAGE, nullable=True)
     status: Mapped[str] = mapped_column(String(16))
     status_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -487,6 +489,10 @@ class Database:
                         connection.exec_driver_sql(
                             f"ALTER TABLE {table} ADD COLUMN install_locks JSON NOT NULL "
                             "DEFAULT '{}'"
+                        )
+                    if "scan_engine" not in columns:
+                        connection.exec_driver_sql(
+                            f"ALTER TABLE {table} ADD COLUMN scan_engine JSON"
                         )
                 for operation in ("UPDATE", "DELETE"):
                     connection.exec_driver_sql(

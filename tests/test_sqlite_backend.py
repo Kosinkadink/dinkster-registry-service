@@ -38,6 +38,7 @@ def _sqlite_client(tmp_path: Path, *, legacy_schema: bool = False) -> Iterator[T
             with database.engine.begin() as connection:
                 for table in ("release_candidates", "releases"):
                     connection.exec_driver_sql(f"ALTER TABLE {table} DROP COLUMN install_locks")
+                    connection.exec_driver_sql(f"ALTER TABLE {table} DROP COLUMN scan_engine")
     finally:
         database.dispose()
     app = create_app(
