@@ -22,6 +22,7 @@ from uuid import UUID
 import pytest
 from dinkster_registry import RegistryError
 from dinkster_registry.archive_admission import (
+    AdmissionFinding,
     StageResult,
     run_doctor_static,
     run_executable_probe,
@@ -261,7 +262,7 @@ def test_probe_timing_and_scanner_are_persisted(
     assert service.run_once()
     total = time.monotonic() - started
     status = service.status(candidate_id)
-    assert status.status == ("rejected" if times_out else "accepted")
+    assert status.status == ("retrying" if times_out else "accepted")
     with database.session() as session:
         run = session.scalar(
             select(ReleaseScanRunRecord).where(
@@ -279,6 +280,122 @@ def test_probe_timing_and_scanner_are_persisted(
             assert elapsed >= 1
             finding = next(f for f in status.findings if f.code == "probe.timeout")
             assert finding.message == f"Executable probe exceeded 1s (elapsed {elapsed:.6f}s)."
+
+
+@pytest.mark.parametrize("stage", ["install", "probe"])
+@pytest.mark.parametrize("recovers", [False, True])
+def test_scan_timeouts_retry_same_candidate_until_success_or_exhaustion(
+    database: Database,
+    database_url: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    recovers: bool,
+) -> None:
+    service = _service(database, tmp_path)
+    principals = PrincipalRepository(database)
+    now = datetime.now(UTC)
+    principals.register_user("publisher")
+    principals.register_publisher("publisher", "publisher", now.isoformat())
+    secret, _ = principals.mint_token(
+        "publisher", "publisher", now.isoformat(), (now + timedelta(hours=1)).isoformat()
+    )
+    archive = _archive(tmp_path)
+    candidate = service.submit(
+        archive, pack_name="example-pack", version="1.2.3", publisher="publisher"
+    )
+    failures = 2 if recovers else 3
+    code = "probe.dependencies-unresolved" if stage == "install" else "probe.timeout"
+    limit = 300 if stage == "install" else 30
+
+    def probe(root: Path, **kwargs: Any) -> StageResult:
+        nonlocal failures
+        if failures:
+            failures -= 1
+            return StageResult(
+                (AdmissionFinding(code, "error", "block", "Stage passed its time limit."),),
+                operator_details={"timedOut": True, "returnCode": -9},
+            )
+        return run_executable_probe(root, **kwargs)
+
+    monkeypatch.setattr(admission_module, "run_executable_probe", probe)
+    with _client(database_url, tmp_path / "objects") as client:
+        for attempt in range(1, 4):
+            claim = service.claim()
+            assert claim is not None and claim.id == candidate
+            assert service.status(candidate).status == "scanning"
+            assert service.status(candidate).reason is None
+            service.process(claim)
+            response = client.get(
+                f"/v1/publish/{candidate}", headers={"Authorization": f"Bearer {secret}"}
+            )
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["candidateId"] == str(candidate)
+            assert payload["artifactDigest"] == artifact_digest(archive)
+            assert payload["attempts"] == attempt
+            if attempt < 3:
+                assert payload["status"] == "retrying"
+                assert f"{limit}s" in payload["reason"]
+                assert client.get("/v1/packs/example-pack/versions/1.2.3").status_code == 404
+            else:
+                assert payload["status"] == ("accepted" if recovers else "rejected")
+                if recovers:
+                    assert payload["reason"] is None
+                    assert client.get("/v1/packs/example-pack/versions/1.2.3").status_code == 200
+                else:
+                    assert f"{limit}s" in payload["reason"]
+                    assert "3 attempts" in payload["reason"]
+        assert service.claim() is None
+
+
+@pytest.mark.parametrize("failure", ["install", "import", "killed"])
+def test_pack_failures_reject_without_retry(
+    database: Database,
+    tmp_path: Path,
+    probe_package_index: tuple[str, list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    source = _fixture_source(tmp_path)
+    if failure == "install":
+        manifest = source / "dinkster-pack.toml"
+        manifest.write_text(
+            manifest.read_text().replace(
+                "[pack]\n", '[pack]\nrequires = ["probe-dependency==99"]\n'
+            )
+        )
+    elif failure == "import":
+        (source / "nodes.py").write_text('raise RuntimeError("broken pack")\n')
+    else:
+        monkeypatch.setattr(
+            admission_module,
+            "run_executable_probe",
+            lambda *args, **kwargs: StageResult(
+                (
+                    AdmissionFinding(
+                        "probe.dependencies-unresolved", "error", "block", "Installer was killed."
+                    ),
+                ),
+                operator_details={"timedOut": False, "returnCode": -9},
+            ),
+        )
+    service = AdmissionService(
+        database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        settings=ServerSettings(probe_package_index_url=probe_package_index[0]),
+        require_isolation=False,
+    )
+    candidate = service.submit(
+        build_registry_fixture_archive(source), pack_name="example-pack", version="1.2.3"
+    )
+    assert service.run_once()
+    status = service.status(candidate)
+    assert status.status == "rejected" and status.attempts == 1
+    assert status.reason == (
+        "entry.unresolvable" if failure == "import" else "probe.dependencies-unresolved"
+    )
+    assert service.claim() is None
 
 
 @pytest.fixture
