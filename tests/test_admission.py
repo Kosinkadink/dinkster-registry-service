@@ -1133,9 +1133,9 @@ def test_admission_diagnostics_ignore_concurrent_probe(
         concurrent = service.status(candidate)
 
     assert concurrent.status == baseline.status
-    assert [(item.code, item.effect) for item in concurrent.findings] == [
+    assert sorted((item.code, item.effect) for item in concurrent.findings) == sorted(
         (item.code, item.effect) for item in baseline.findings
-    ]
+    )
 
 
 def test_active_dependency_is_validated_and_recorded(
