@@ -9,11 +9,18 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from dinkster_registry import RegistryError
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
 
 from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
-from dinkster_registry_service.database import Database, PackRecord, ReleaseRecord
+from dinkster_registry_service.database import (
+    AuditEventRecord,
+    Database,
+    PackRecord,
+    PublisherMembershipRecord,
+    ReleaseRecord,
+)
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore
 from dinkster_registry_service.principals import PrincipalRepository
 from dinkster_registry_service.security import SecurityRelease, sign_security_document
@@ -34,7 +41,7 @@ def test_security_authority_history_and_clearing_survive_reopen(tmp_path: Path) 
     principals = PrincipalRepository(database)
     now = datetime.now(UTC)
     headers = {}
-    for user in ("operator", "publisher", "responder", "outsider"):
+    for user in ("operator", "publisher", "responder", "outsider", "colleague"):
         principals.register_user(user)
         principals.register_publisher(user, user, now.isoformat())
         plaintext, _ = principals.mint_token(
@@ -46,6 +53,9 @@ def test_security_authority_history_and_clearing_survive_reopen(tmp_path: Path) 
         pack = session.scalar(select(PackRecord).where(PackRecord.name == "example-pack"))
         assert pack is not None
         pack.publisher_id = "publisher"
+        session.add(
+            PublisherMembershipRecord(publisher_id="publisher", user_id="colleague", role="member")
+        )
         release = session.scalar(select(ReleaseRecord).where(ReleaseRecord.pack_id == pack.id))
         assert release is not None
         identity = {
@@ -80,12 +90,39 @@ def test_security_authority_history_and_clearing_survive_reopen(tmp_path: Path) 
         == 200
     )
     assert client.post(endpoint, json=change, headers=headers["outsider"]).status_code == 403
+    for invalid in (
+        {**identity, "artifactDigest": "blake3:" + "0" * 64},
+        {**identity, "pack": "missing-pack"},
+        {**identity, "version": "999.0"},
+    ):
+        assert (
+            client.post(
+                endpoint, json={**change, "release": invalid}, headers=headers["publisher"]
+            ).status_code
+            == 403
+        )
+    scoped, _ = principals.mint_token(
+        "publisher",
+        "publisher",
+        now.isoformat(),
+        (now + timedelta(hours=1)).isoformat(),
+        pack="color-tools",
+    )
+    assert (
+        client.post(
+            endpoint, json=change, headers={"Authorization": f"Bearer {scoped}"}
+        ).status_code
+        == 403
+    )
     issued = client.post(endpoint, json=change, headers=headers["publisher"])
     assert issued.status_code == 200, issued.text
     first = issued.json()
     assert first["status"] == "active" and first["authority"] == "publisher"
     withdraw = {**change, "operation": "withdraw", "expectedRevision": first["revision"]}
-    cleared = client.post(endpoint, json=withdraw, headers=headers["publisher"])
+    colleague, _ = principals.mint_token(
+        "publisher", "colleague", now.isoformat(), (now + timedelta(hours=1)).isoformat()
+    )
+    cleared = client.post(endpoint, json=withdraw, headers={"Authorization": f"Bearer {colleague}"})
     assert cleared.status_code == 200 and cleared.json()["status"] == "cleared"
     reissue = {**change, "expectedRevision": cleared.json()["revision"]}
     active = client.post(endpoint, json=reissue, headers=headers["publisher"]).json()
@@ -166,6 +203,35 @@ def test_security_authority_history_and_clearing_survive_reopen(tmp_path: Path) 
             select(ReleaseRecord).where(ReleaseRecord.artifact_digest == identity["artifactDigest"])
         )
         assert stored is not None and stored.state == original_state
+    for mutation in (
+        update(AuditEventRecord)
+        .where(AuditEventRecord.event_type == "security.notice")
+        .values(data={}),
+        delete(AuditEventRecord).where(AuditEventRecord.event_type == "security.notice"),
+    ):
+        with pytest.raises(IntegrityError, match="immutable"):
+            with reopened.state.database.session() as session, session.begin():
+                session.execute(mutation)
+    assert [row.model_dump(mode="json", by_alias=True) for row in repository.history()] == history
+    malicious = client.post(
+        endpoint,
+        json={**change, "state": "malicious", "expectedRevision": history[-1]["revision"]},
+        headers=headers["publisher"],
+    )
+    assert malicious.status_code == 200, malicious.text
+    assert (
+        client.post(
+            endpoint,
+            json={
+                **change,
+                "operation": "withdraw",
+                "state": "malicious",
+                "expectedRevision": malicious.json()["revision"],
+            },
+            headers=headers["publisher"],
+        ).status_code
+        == 403
+    )
     reopened.state.database.dispose()
 
 

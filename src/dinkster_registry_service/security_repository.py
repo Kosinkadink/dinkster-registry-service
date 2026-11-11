@@ -161,14 +161,22 @@ class SecurityRepository:
             elif previous is None or previous.status != "active":
                 raise RegistryError("security operation requires an active notice")
             if change.operation == "withdraw":
+                reporting_publisher = session.scalar(
+                    select(AuditEventRecord.data["publisherId"].as_string()).where(
+                        AuditEventRecord.event_type == "security.notice",
+                        AuditEventRecord.data["revision"].as_integer() == change.expected_revision,
+                    )
+                )
                 if (
                     security
                     or previous is None
-                    or previous.actor != actor
+                    or reporting_publisher != pack.publisher_id
                     or previous.state != "vulnerable"
                     or previous.security_confirmed
                 ):
-                    raise RegistryError("only the unconfirmed vulnerability reporter may withdraw")
+                    raise RegistryError(
+                        "only the reporting publisher may withdraw an unconfirmed vulnerability"
+                    )
             elif not security and (change.operation != "issue" or change.state == "affected"):
                 raise RegistryError("security role authority is required")
             if change.operation in {"confirm", "lift", "withdraw"} and previous is not None:
@@ -206,6 +214,7 @@ class SecurityRepository:
                         "operation": change.operation,
                         "notice": notice.model_dump_json(),
                         "revision": revision,
+                        "publisherId": pack.publisher_id,
                     },
                 )
             )

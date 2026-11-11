@@ -17,6 +17,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Table,
     Text,
     UniqueConstraint,
     Uuid,
@@ -25,7 +26,7 @@ from sqlalchemy import (
     inspect,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 JSON_STORAGE = JSON().with_variant(JSONB(), "postgresql")
@@ -359,6 +360,19 @@ class AuditEventRecord(Base):
     subject_type: Mapped[str] = mapped_column(String(64))
     subject_id: Mapped[str] = mapped_column(String(128))
     data: Mapped[dict[str, Any]] = mapped_column(JSON_STORAGE)
+
+
+@event.listens_for(AuditEventRecord.__table__, "after_create")
+def _protect_security_audit(_table: Table, connection: Connection, **_kwargs: Any) -> None:
+    if connection.dialect.name != "sqlite":
+        return
+    for operation in ("UPDATE", "DELETE"):
+        connection.exec_driver_sql(
+            f"CREATE TRIGGER security_audit_{operation.lower()} "
+            f"BEFORE {operation} ON audit_events FOR EACH ROW "
+            "WHEN OLD.event_type LIKE 'security.%' "
+            "BEGIN SELECT RAISE(ABORT, 'security audit records are immutable'); END"
+        )
 
 
 class OutboxRecord(Base):

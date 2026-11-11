@@ -84,9 +84,10 @@ changes name the current notice revision. Operations are `issue`, `confirm`,
 `correct`, `lift` and `withdraw`. The service derives issuer and authority from
 the authenticated actor, not the submitted JSON. Only an exact catalog release
 identity is accepted. A publisher may immediately issue a vulnerability or
-malicious report for its own release; only the original reporter may withdraw
-an unconfirmed vulnerability. Security confirmation or correction prevents
-publisher withdrawal. Only the security role may lift a malicious report or
+malicious report for its own release; an authorized member of that reporting
+publisher may withdraw its unconfirmed vulnerability. The audit preserves the
+reporting publisher identity as well as the individual actor. Security
+confirmation or correction prevents publisher withdrawal. Only the security role may lift a malicious report or
 confirm, correct or lift a classification. An operator without that role has
 no classification authority. Security actions require an unscoped token.
 
