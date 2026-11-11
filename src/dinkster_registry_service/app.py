@@ -329,13 +329,26 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     async def request_metadata(request: Request, call_next: Any) -> Response:
         request.state.request_id = uuid7()
         account_request = request.url.path.startswith("/v1/account/")
+        template_read = request.method in {"GET", "HEAD", "OPTIONS"} and re.fullmatch(
+            r"/index/(?:templates|packs/[^/]+/versions/[^/]+/templates/[^/]+(?:/thumbnail)?)",
+            request.url.path.rstrip("/"),
+        )
         origin = request.headers.get("origin")
         if account_request and origin is not None and origin != configured.identity_issuer:
             return _error_response(request, ProtocolError(403, "forbidden", "Origin is forbidden."))
-        if account_request and request.method == "OPTIONS":
+        if (account_request or template_read) and request.method == "OPTIONS":
             response = Response(status_code=204)
         else:
             response = await call_next(request)
+        if template_read:
+            response.headers.update(
+                {
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+                    "Access-Control-Allow-Headers": "If-None-Match",
+                    "Access-Control-Expose-Headers": "ETag",
+                }
+            )
         if account_request and origin == configured.identity_issuer:
             response.headers.update(
                 {
@@ -824,7 +837,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             etag_context={"endpoint": "schemas", "name": name, "version": version},
         )
 
-    @app.get("/index/templates")
+    @app.api_route("/index/templates", methods=["GET", "HEAD"])
     def templates(request: Request) -> Response:
         query = _query(request, TemplatesQuery)
         try:
@@ -895,7 +908,10 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             return Response(status_code=304, headers=headers)
         return Response(content=data, media_type=str(template["mediaType"]), headers=headers)
 
-    @app.get("/index/packs/{canonical_name}/versions/{canonical_version}/templates/{template_id}")
+    @app.api_route(
+        "/index/packs/{canonical_name}/versions/{canonical_version}/templates/{template_id}",
+        methods=["GET", "HEAD"],
+    )
     def template_document(
         request: Request, canonical_name: str, canonical_version: str, template_id: str
     ) -> Response:
@@ -903,8 +919,9 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             request, canonical_name, canonical_version, template_id, thumbnail=False
         )
 
-    @app.get(
-        "/index/packs/{canonical_name}/versions/{canonical_version}/templates/{template_id}/thumbnail"
+    @app.api_route(
+        "/index/packs/{canonical_name}/versions/{canonical_version}/templates/{template_id}/thumbnail",
+        methods=["GET", "HEAD"],
     )
     def template_thumbnail(
         request: Request, canonical_name: str, canonical_version: str, template_id: str
