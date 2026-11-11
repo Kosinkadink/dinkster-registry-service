@@ -652,8 +652,8 @@ wheels = [
 
 [[package]]
 name = "dinkster-api"
-version = "0.0.2"
-source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=1c264806b52d8332b36838280a74b025754fbb03#1c264806b52d8332b36838280a74b025754fbb03" }
+version = "0.0.3"
+source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=ff7a927a6b7c1cace7e5b4837e9492a18bd475a5#ff7a927a6b7c1cace7e5b4837e9492a18bd475a5" }
 dependencies = [
     { name = "aiohttp" },
     { name = "alembic" },
@@ -725,7 +725,7 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.16,<2" },
     { name = "blake3", specifier = ">=1.0,<2" },
     { name = "boto3", specifier = ">=1.40,<2" },
-    { name = "dinkster-api", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=1c264806b52d8332b36838280a74b025754fbb03" },
+    { name = "dinkster-api", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=ff7a927a6b7c1cace7e5b4837e9492a18bd475a5" },
     { name = "dinkster-token-verifier", url = "https://github.com/Kosinkadink/dinkster-token-verifier/releases/download/v0.1.1/dinkster_token_verifier-0.1.1-py3-none-any.whl" },
     { name = "fastapi", specifier = ">=0.116,<1" },
     { name = "packaging", specifier = ">=25,<26" },

@@ -645,9 +645,25 @@ startup. Invalid values stop the process with an error naming the variable.
 | `DINKSTER_SCANNER_MAX_ATTEMPTS` | 3 | 1-10 claims |
 
 `DINKSTER_PROBE_PACKAGE_INDEX_URL` selects the operator-controlled package index
-(default `https://pypi.org/simple`). Installer subprocesses do not inherit host
-credentials or configuration. The scanner image includes uv; host-process
-scanners must also have uv on PATH.
+(default `https://pypi.org/simple`). `DINKSTER_PROBE_DEPENDENCY_SOURCE` accepts
+`cpu` (the default) or `index`. The CPU mode retains uv's CPU Torch backend;
+`index` resolves every requirement, including torch and torchvision, from the
+configured index without a separate PyTorch index. For an offline disposable
+registry, stage all required wheels in that index and deny external networking.
+Missing or incompatible wheels fail admission; this setting does not relax
+isolation, integrity checks or dependency limits. Installer subprocesses do not
+inherit host credentials or configuration. The scanner image includes uv;
+host-process scanners must also have uv on PATH.
+
+`scripts/check-local-index-probe.py /staged` checks the real scanner against a
+directory containing the CPU torch 2.7.1+cpu and torchvision 0.22.1+cpu wheels and
+all their transitive wheels for the image's Python/platform. Run it in the
+service image with external networking denied and the wheel directory mounted
+read-only at `/staged`. As with the isolated-probe container check, nested
+bubblewrap needs `--privileged`. It verifies an active release using a local
+file index, then rejects a missing torchvision wheel and an incompatible torch
+requirement without creating releases. Every case uses a disposable database
+and object store; it never connects to the production registry.
 
 Packs declaring `[pack] node-source = "remote-gateway-catalog"` may publish an
 empty offline node catalog. The validated declaration is retained as

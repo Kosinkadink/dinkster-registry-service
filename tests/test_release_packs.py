@@ -40,6 +40,7 @@ def test_real_wheel_accepts_reordered_dependency_specifiers(tmp_path: Path) -> N
         )
         assert service.run_once()
         assert service.status(candidate).status == "accepted", service.status(candidate)
+        assert service.run_once()
         (entry,) = json.loads(store.read("static/packs/index.json"))["items"]
         (entry,) = json.loads(store.read("static/" + entry["url"]))["items"]
         (wheel,) = entry["wheels"]
