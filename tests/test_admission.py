@@ -6,6 +6,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zipfile
@@ -1094,6 +1095,47 @@ def test_duplicate_semantic_version_rejects(database: Database, tmp_path: Path) 
     _assert_rejected(service, candidate_id, "manifest.invalid")
     with database.session() as session:
         assert session.scalar(select(func.count()).select_from(ReleaseRecord)) == 2
+
+
+@pytest.mark.parametrize(
+    ("statement", "code"),
+    (
+        ("from example_pack.helpers import VALUE", "entry.unresolvable"),
+        ("from dinkster_nodes_provider._helpers import VALUE", "imports.private-module"),
+    ),
+    ids=("undeclared-pack", "private-pack"),
+)
+def test_admission_diagnostics_ignore_concurrent_probe(
+    database: Database,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    statement: str,
+    code: str,
+) -> None:
+    probe_directory = tmp_path / "probes"
+    probe_directory.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(probe_directory))
+    service = _service(database, tmp_path)
+    source = _fixture_source(tmp_path, "unrelated-pack")
+    nodes = source / "nodes.py"
+    nodes.write_text(statement + "\n" + nodes.read_text())
+    archive = build_registry_fixture_archive(source)
+    control = service.submit(archive, pack_name="unrelated-pack", version="1.2.3")
+    assert service.run_once()
+    baseline = service.status(control)
+    assert baseline.status == "rejected"
+    assert any(finding.code == code for finding in baseline.findings), baseline
+
+    sibling = _archive(tmp_path)
+    with extracted_wheel(sibling, inspect_wheel(sibling, "example-pack", "1.2.3")):
+        candidate = service.submit(archive, pack_name="unrelated-pack", version="1.2.3")
+        assert service.run_once()
+        concurrent = service.status(candidate)
+
+    assert concurrent.status == baseline.status
+    assert sorted((item.code, item.effect) for item in concurrent.findings) == sorted(
+        (item.code, item.effect) for item in baseline.findings
+    )
 
 
 def test_active_dependency_is_validated_and_recorded(

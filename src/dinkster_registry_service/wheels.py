@@ -284,7 +284,10 @@ def _inspect_wheel(data: bytes, name: str, version: str) -> Wheel:
 def extracted_wheel(data: bytes, wheel: Wheel) -> Iterator[Path]:
     """Expose installed imports and manifest-relative assets to the existing probe."""
     with tempfile.TemporaryDirectory(prefix="registry-wheel-probe-") as temporary:
-        root = Path(temporary)
+        # The doctor discovers packs beside its root; keep other scans outside
+        # that parent so their manifests cannot affect admission diagnostics.
+        root = Path(temporary) / "pack"
+        root.mkdir()
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             for name, payload in _members(archive).items():
                 destination = root / name
