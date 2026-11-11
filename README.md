@@ -77,8 +77,11 @@ not against the directory containing the JSON index. An installer uses the
 recorded pins, never unrestricted dependency resolution against the simple index.
 
 Every accepted publish queues a durable rebuild of `packs/index.json` and
-`locales/index.json` in the configured object store and immediately
-attempts delivery. Catalog, per-pack files and locales contain deterministic JSON
+`locales/index.json` in the configured object store. Continuous scanners deliver
+pending rebuilds on a separate thread even while candidates are being processed;
+one-shot scans retain candidate priority and deliver indexes when idle. Database
+locking serializes writers across replicas, and each rewrite coalesces pending
+requests. Catalog, per-pack files and locales contain deterministic JSON
 with `schemaVersion: 2`. Per-pack `items` are ordered by version text; catalog
 latest versions use semantic version order. Each release includes `name`,
 `version` and a `wheels` array. Each wheel has
