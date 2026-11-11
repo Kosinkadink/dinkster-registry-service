@@ -592,8 +592,14 @@ startup. Invalid values stop the process with an error naming the variable.
 | `DINKSTER_SCANNER_MAX_ATTEMPTS` | 3 | 1-10 claims |
 
 `DINKSTER_PROBE_PACKAGE_INDEX_URL` selects the operator-controlled package index
-(default `https://pypi.org/simple`). Installer subprocesses do not inherit host
-credentials or configuration. The scanner image includes uv; host-process
+(default `https://pypi.org/simple`). `DINKSTER_PROBE_DEPENDENCY_SOURCE` accepts
+`cpu` (the default) or `index`. The CPU mode retains uv's CPU Torch backend;
+`index` resolves every requirement, including torch and torchvision, from the
+configured index without a separate PyTorch index. For an offline disposable
+registry, stage all required wheels in that index and deny external networking.
+Missing or incompatible wheels fail admission; this setting does not relax
+isolation, integrity checks or dependency limits. Installer subprocesses do not
+inherit host credentials or configuration. The scanner image includes uv; host-process
 scanners must also have uv on PATH.
 
 Packs declaring `[pack] node-source = "remote-gateway-catalog"` may publish an

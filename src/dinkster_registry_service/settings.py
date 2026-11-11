@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, cast
 
 from dinkster_registry.archive_admission import ProbeSettings
 
@@ -47,6 +47,8 @@ class ServerSettings(ProbeSettings):
     scanner_max_attempts: int = 3
 
     def __post_init__(self) -> None:
+        if self.probe_dependency_source not in {"cpu", "index"}:
+            raise ValueError("DINKSTER_PROBE_DEPENDENCY_SOURCE must be cpu or index")
         _require_range("DINKSTER_PROBE_TIMEOUT_SECONDS", self.probe_timeout_seconds, 1, 600)
         _require_range(
             "DINKSTER_PROBE_DEPENDENCY_TIMEOUT_SECONDS",
@@ -104,6 +106,10 @@ class ServerSettings(ProbeSettings):
             ),
             probe_package_index_url=os.getenv(
                 "DINKSTER_PROBE_PACKAGE_INDEX_URL", defaults.probe_package_index_url
+            ),
+            probe_dependency_source=cast(
+                Literal["cpu", "index"],
+                os.getenv("DINKSTER_PROBE_DEPENDENCY_SOURCE", defaults.probe_dependency_source),
             ),
             probe_output_limit_bytes=_environment_integer(
                 "DINKSTER_PROBE_OUTPUT_LIMIT_BYTES", defaults.probe_output_limit_bytes
