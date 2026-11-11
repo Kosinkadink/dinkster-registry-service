@@ -47,6 +47,7 @@ class ServerSettings(ProbeSettings):
     scanner_max_attempts: int = 3
     identity_issuer: str = "https://id.dinkster.org"
     identity_audience: str = "dinkster-registry"
+    security_signing_key_path: Path | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.probe_dependency_source not in {"cpu", "index"}:
@@ -95,6 +96,9 @@ class ServerSettings(ProbeSettings):
                 "/"
             ),
             identity_audience=os.getenv("DINKSTER_IDENTITY_AUDIENCE", defaults.identity_audience),
+            security_signing_key_path=Path(os.environ["DINKSTER_SECURITY_SIGNING_KEY_PATH"])
+            if os.getenv("DINKSTER_SECURITY_SIGNING_KEY_PATH")
+            else None,
             s3_endpoint_url=os.getenv("S3_ENDPOINT_URL"),
             s3_bucket=os.getenv("S3_BUCKET"),
             s3_access_key_id=os.getenv("S3_ACCESS_KEY_ID"),

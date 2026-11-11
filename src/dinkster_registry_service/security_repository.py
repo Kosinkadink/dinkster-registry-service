@@ -16,6 +16,7 @@ from .accounts import PublisherIdentity
 from .database import (
     AuditEventRecord,
     Database,
+    OutboxRecord,
     PackRecord,
     PublisherFreezeRecord,
     PublisherRecord,
@@ -252,6 +253,7 @@ class SecurityRepository:
                     },
                 )
             )
+            queue_security_publication(session, revision)
             return notice
 
     def history(self) -> tuple[SecurityNotice, ...]:
@@ -436,27 +438,49 @@ class SecurityRepository:
 
     def document(self, *, issued_at: datetime, expires_at: datetime) -> SecurityDocument:
         with self.transaction() as session:
-            history = self._history(session)
-            current = {notice.id: notice for notice in history}
-            ownership = sorted(
-                (
-                    OwnershipNotice.model_validate_json(row.data["notice"])
-                    for row in session.scalars(
-                        select(AuditEventRecord).where(
-                            AuditEventRecord.event_type == "security.ownership"
-                        )
+            return self.document_in_transaction(session, issued_at=issued_at, expires_at=expires_at)
+
+    def document_in_transaction(
+        self, session: Session, *, issued_at: datetime, expires_at: datetime
+    ) -> SecurityDocument:
+        history = self._history(session)
+        current = {notice.id: notice for notice in history}
+        ownership = sorted(
+            (
+                OwnershipNotice.model_validate_json(row.data["notice"])
+                for row in session.scalars(
+                    select(AuditEventRecord).where(
+                        AuditEventRecord.event_type == "security.ownership"
                     )
-                ),
-                key=lambda notice: notice.revision,
-            )
-            return SecurityDocument(
-                registry=self.registry,
-                revision=self.revision(session),
-                issued_at=issued_at,
-                expires_at=expires_at,
-                notices=tuple(current.values()),
-                ownership_changes=tuple(ownership),
-            )
+                )
+            ),
+            key=lambda notice: notice.revision,
+        )
+        return SecurityDocument(
+            registry=self.registry,
+            revision=self.revision(session),
+            issued_at=issued_at,
+            expires_at=expires_at,
+            notices=tuple(current.values()),
+            ownership_changes=tuple(ownership),
+        )
+
+
+def queue_security_publication(session: Session, revision: int) -> None:
+    now = datetime.now(UTC)
+    session.add(
+        OutboxRecord(
+            id=uuid7(),
+            created_at=now,
+            available_at=now,
+            delivered_at=None,
+            topic="security.publish",
+            event_key=f"security:{revision}",
+            payload={"revision": revision},
+            state="pending",
+            attempts=0,
+        )
+    )
 
 
 class UploadStopped(RegistryError):

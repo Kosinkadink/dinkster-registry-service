@@ -282,22 +282,6 @@ class DownloadTicket(ResponseModel):
     required_headers: dict[str, str]
 
 
-class SecurityBlock(ResponseModel):
-    pack_name: str
-    version: str
-    artifact_digest: str
-    blocked_at: datetime
-    reason_code: str
-    message: str
-    fixed_version: str | None
-
-
-class SecurityBlocksResponse(ResponseModel):
-    generated_at: datetime
-    items: list[SecurityBlock]
-    next_cursor: str | None
-
-
 ErrorCode = Literal[
     "invalid_request",
     "unauthenticated",

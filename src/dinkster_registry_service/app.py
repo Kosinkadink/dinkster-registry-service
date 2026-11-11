@@ -85,10 +85,6 @@ class ProvidersQuery(RequestModel):
     include_prerelease: bool = False
 
 
-class BlocksQuery(RequestModel):
-    since: str | None = Field(default=None, min_length=1, max_length=4096)
-
-
 class TemplatesQuery(RequestModel):
     q: str = Field(default="", max_length=200)
     tag: str = Field(default="", max_length=128)
@@ -441,6 +437,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             path += "index.html"
         allowed = (
             re.fullmatch(r"(?:packs|schemas|locales|replacements)/index\.json", path)
+            or path == "security/index.json"
             or re.fullmatch(r"packs/[a-z0-9]+(?:-[a-z0-9]+)*/index\.json", path)
             or re.fullmatch(r"[a-z0-9-]+/simple/(?:[a-z0-9-]+/)?index\.html", path)
             or re.fullmatch(r"packs/[a-z0-9-]+/[^/]+/schemas\.json", path)
@@ -1028,18 +1025,6 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
 
     @app.get("/v1/security/blocks")
     def security_blocks(request: Request) -> Response:
-        query = _query(request, BlocksQuery)
-        if query.since is not None:
-            raise ProtocolError(
-                400,
-                "invalid_request",
-                "No security block cursor has been issued by this catalog.",
-            )
-        return _json_response(
-            request,
-            repository.security_blocks(),
-            cache_control=PUBLIC_CACHE,
-            etag_context={"endpoint": "security-blocks", "query": {"since": None}},
-        )
+        return static_index(request, "security/index.json")
 
     return app

@@ -59,6 +59,7 @@ from .indexes import StaticIndexes, queue_index_rebuild
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStore, ObjectStoreError
 from .pack_locks import lock_object_key, parse_pack_locks, quarantine_lock_key
 from .principals import PrincipalRepository
+from .security_publication import SecurityPublication
 from .security_repository import (
     SecurityRepository,
     UploadAuthorization,
@@ -1527,6 +1528,13 @@ class AdmissionService:
             )
 
     def run_once(self) -> bool:
+        if SecurityPublication(
+            self.database,
+            self.object_store,
+            self.settings.public_base_url,
+            self.settings.security_signing_key_path,
+        ).deliver_one():
+            return True
         if self.deliver_one_promotion():
             return True
         claim = self.claim()
