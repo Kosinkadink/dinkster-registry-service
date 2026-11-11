@@ -49,7 +49,11 @@ from dinkster_registry_service.database import (
 )
 from dinkster_registry_service.digests import artifact_digest
 from dinkster_registry_service.indexes import StaticIndexes, queue_index_rebuild
-from dinkster_registry_service.object_store import LocalFilesystemObjectStore, ObjectStoreError
+from dinkster_registry_service.object_store import (
+    MAX_ARTIFACT_SIZE,
+    LocalFilesystemObjectStore,
+    ObjectStoreError,
+)
 from dinkster_registry_service.ownership import transfer_ownership
 from dinkster_registry_service.principals import PrincipalRepository
 from dinkster_registry_service.security import SecurityRelease
@@ -1700,6 +1704,94 @@ def test_scanner_claims_queued_candidate_while_another_worker_rewrites_indexes(
         finally:
             finish.set()
         assert rewrite.result(timeout=5) == 0
+
+
+def test_scanner_delivers_accepted_release_while_a_scan_and_queue_remain_busy(
+    database: Database, tmp_path: Path
+) -> None:
+    scanning = threading.Event()
+    published = threading.Event()
+    finish = threading.Event()
+
+    class BlockingStore(LocalFilesystemObjectStore):
+        held_key: str | None = None
+
+        def read(self, key: str, *, max_size: int = MAX_ARTIFACT_SIZE) -> bytes:
+            if key == self.held_key:
+                scanning.set()
+                assert finish.wait(15)
+                raise KeyboardInterrupt("stop the disposable scanner")
+            return super().read(key, max_size=max_size)
+
+        def replace_index(self, key: str, data: bytes) -> None:
+            if key == "static/packs/example-pack/index.json":
+                assert scanning.wait(15)
+            super().replace_index(key, data)
+            if key == "static/packs/example-pack/index.json":
+                published.set()
+
+    store = BlockingStore(tmp_path / "objects")
+    seed_fixtures(database, store)
+    service = AdmissionService(database, store, require_isolation=False)
+    first = service.submit(b"invalid", pack_name="held-pack", version="1.0.0")
+    second = service.submit(b"invalid", pack_name="queued-pack", version="1.0.0")
+    store.held_key = quarantine_object_key(first)
+    with database.session() as session, session.begin():
+        queue_index_rebuild(session)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scanner = executor.submit(service.run, poll_seconds=0.01)
+        try:
+            assert scanning.wait(5)
+            assert published.wait(5), "static delivery waited for the busy scanner"
+            assert service.status(first).status == "scanning"
+            assert service.status(second).status == "queued"
+            document = json.loads(store.read("static/packs/example-pack/index.json"))
+            assert {(row["name"], row["version"]) for row in document["items"]} == {
+                ("example-pack", "1.2.3")
+            }
+        finally:
+            finish.set()
+            with pytest.raises(KeyboardInterrupt, match="stop the disposable scanner"):
+                scanner.result(timeout=10)
+
+
+def test_continuous_scanner_claims_new_work_while_its_index_writer_is_busy(
+    database: Database, tmp_path: Path
+) -> None:
+    rewriting = threading.Event()
+    scanning = threading.Event()
+    finish = threading.Event()
+
+    class BlockingStore(LocalFilesystemObjectStore):
+        def replace_index(self, key: str, data: bytes) -> None:
+            if key == "static/packs/example-pack/index.json":
+                rewriting.set()
+                assert finish.wait(15)
+            super().replace_index(key, data)
+
+        def read(self, key: str, *, max_size: int = MAX_ARTIFACT_SIZE) -> bytes:
+            if key.startswith("quarantine/uploads/"):
+                scanning.set()
+                assert finish.wait(15)
+                raise KeyboardInterrupt("stop the disposable scanner")
+            return super().read(key, max_size=max_size)
+
+    store = BlockingStore(tmp_path / "objects")
+    seed_fixtures(database, store)
+    service = AdmissionService(database, store, require_isolation=False)
+    with database.session() as session, session.begin():
+        queue_index_rebuild(session)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scanner = executor.submit(service.run, poll_seconds=0.01)
+        try:
+            assert rewriting.wait(5)
+            candidate = service.submit(b"invalid", pack_name="new-pack", version="1.0.0")
+            assert scanning.wait(5), "new candidate waited behind this worker's index rewrite"
+            assert service.status(candidate).status == "scanning"
+        finally:
+            finish.set()
+            with pytest.raises(KeyboardInterrupt, match="stop the disposable scanner"):
+                scanner.result(timeout=10)
 
 
 def test_scanner_claim_precedes_pending_index_and_retains_claim_timestamp(

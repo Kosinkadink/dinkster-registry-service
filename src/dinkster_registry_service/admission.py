@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import socket
 import tempfile
+import threading
 import time
 import tomllib
 import zipfile
@@ -1527,7 +1528,7 @@ class AdmissionService:
                 ),
             )
 
-    def run_once(self) -> bool:
+    def run_once(self, *, deliver_indexes: bool = True) -> bool:
         if SecurityPublication(
             self.database,
             self.object_store,
@@ -1539,20 +1540,36 @@ class AdmissionService:
             return True
         claim = self.claim()
         if claim is None:
-            return self.indexes.deliver_one()
+            return self.indexes.deliver_one() if deliver_indexes else False
         self.process(claim)
         return True
 
     def run(self, *, poll_seconds: float = 1.0) -> None:
         if poll_seconds <= 0:
             raise ValueError("poll_seconds must be positive")
-        while True:
+        stopped = threading.Event()
+
+        def deliver_indexes() -> None:
+            while not stopped.is_set():
+                if not self.indexes.deliver_one():
+                    stopped.wait(poll_seconds)
+
+        # A long-running scan must not prevent accepted releases reaching static storage.
+        # The existing database lock still serializes writers across replicas.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            delivery = executor.submit(deliver_indexes)
             try:
-                worked = self.run_once()
-            except LeaseLost:
-                continue
-            if not worked:
-                time.sleep(poll_seconds)
+                while True:
+                    if delivery.done():
+                        delivery.result()
+                    try:
+                        worked = self.run_once(deliver_indexes=False)
+                    except LeaseLost:
+                        continue
+                    if not worked:
+                        time.sleep(poll_seconds)
+            finally:
+                stopped.set()
 
     def resolve_review(
         self, candidate_id: UUID, *, accepted: bool, actor: str, reason: str
