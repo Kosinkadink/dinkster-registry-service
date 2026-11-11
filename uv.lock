@@ -653,12 +653,13 @@ wheels = [
 [[package]]
 name = "dinkster-api"
 version = "0.0.3"
-source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=aaffe496d2b2619dfd6859a4c68f728a9fe6457e#aaffe496d2b2619dfd6859a4c68f728a9fe6457e" }
+source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=2fb2b8ca4eb915dfc7010b77b647d4bd03800fca#2fb2b8ca4eb915dfc7010b77b647d4bd03800fca" }
 dependencies = [
     { name = "aiohttp" },
     { name = "alembic" },
     { name = "av" },
     { name = "blake3" },
+    { name = "cryptography" },
     { name = "dinkster-opentimelineio" },
     { name = "filelock" },
     { name = "numpy" },
@@ -666,6 +667,7 @@ dependencies = [
     { name = "pillow" },
     { name = "psd-tools" },
     { name = "psutil" },
+    { name = "pydantic" },
     { name = "sqlalchemy" },
 ]
 
@@ -727,7 +729,7 @@ requires-dist = [
     { name = "blake3", specifier = ">=1.0,<2" },
     { name = "boto3", specifier = ">=1.40,<2" },
     { name = "cryptography", specifier = ">=46,<51" },
-    { name = "dinkster-api", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=aaffe496d2b2619dfd6859a4c68f728a9fe6457e" },
+    { name = "dinkster-api", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=2fb2b8ca4eb915dfc7010b77b647d4bd03800fca" },
     { name = "dinkster-token-verifier", url = "https://github.com/Kosinkadink/dinkster-token-verifier/releases/download/v0.1.1/dinkster_token_verifier-0.1.1-py3-none-any.whl" },
     { name = "fastapi", specifier = ">=0.116,<1" },
     { name = "packaging", specifier = ">=25,<26" },
