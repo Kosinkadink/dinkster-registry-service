@@ -45,6 +45,8 @@ class ServerSettings(ProbeSettings):
     s3_region: str | None = None
     cursor_secret: bytes = b"local-cursor-secret-change-in-production"
     scanner_max_attempts: int = 3
+    identity_issuer: str = "https://id.dinkster.org"
+    identity_audience: str = "dinkster-registry"
 
     def __post_init__(self) -> None:
         if self.probe_dependency_source not in {"cpu", "index"}:
@@ -89,6 +91,10 @@ class ServerSettings(ProbeSettings):
                 "DINKSTER_PUBLIC_BASE_URL", "PUBLIC_BASE_URL", defaults.public_base_url
             ).rstrip("/"),
             environment=os.getenv("DINKSTER_ENV", defaults.environment),
+            identity_issuer=os.getenv("DINKSTER_IDENTITY_ISSUER", defaults.identity_issuer).rstrip(
+                "/"
+            ),
+            identity_audience=os.getenv("DINKSTER_IDENTITY_AUDIENCE", defaults.identity_audience),
             s3_endpoint_url=os.getenv("S3_ENDPOINT_URL"),
             s3_bucket=os.getenv("S3_BUCKET"),
             s3_access_key_id=os.getenv("S3_ACCESS_KEY_ID"),

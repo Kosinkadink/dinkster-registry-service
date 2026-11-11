@@ -25,6 +25,7 @@ from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response, StreamingResponse
 
+from .accounts import AccountError, account_router
 from .admission import AdmissionError, AdmissionService, CandidateStatus
 from .cursors import CursorCodec, CursorError
 from .database import Database, ReleaseCandidateRecord
@@ -96,10 +97,6 @@ class TemplatesQuery(RequestModel):
 
 class ReviewRequest(RequestModel):
     decision: Literal["accept", "reject"]
-    reason: str = Field(min_length=1, max_length=1024)
-
-
-class RevokeTokenRequest(RequestModel):
     reason: str = Field(min_length=1, max_length=1024)
 
 
@@ -303,13 +300,43 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     app = FastAPI(title="Dinkster Registry", lifespan=lifespan)
     app.state.database = database
     app.state.object_store = object_store
+    app.include_router(account_router(database, configured))
 
     @app.middleware("http")
     async def request_metadata(request: Request, call_next: Any) -> Response:
         request.state.request_id = uuid7()
-        response: Response = await call_next(request)
+        account_request = request.url.path.startswith("/v1/account/")
+        origin = request.headers.get("origin")
+        if account_request and origin is not None and origin != configured.identity_issuer:
+            return _error_response(request, ProtocolError(403, "forbidden", "Origin is forbidden."))
+        if account_request and request.method == "OPTIONS":
+            response = Response(status_code=204)
+        else:
+            response = await call_next(request)
+        if account_request and origin == configured.identity_issuer:
+            response.headers.update(
+                {
+                    "Access-Control-Allow-Origin": configured.identity_issuer,
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+                    "Vary": "Origin",
+                }
+            )
         response.headers.setdefault("X-Request-Id", str(request.state.request_id))
         return response
+
+    @app.exception_handler(AccountError)
+    async def account_error_handler(request: Request, error: AccountError) -> Response:
+        code: ErrorCode = (
+            "unauthenticated"
+            if error.status == 401
+            else "forbidden"
+            if error.status == 403
+            else "not_found"
+            if error.status == 404
+            else "invalid_request"
+        )
+        return _error_response(request, ProtocolError(error.status, code, error.message))
 
     @app.exception_handler(ProtocolError)
     async def protocol_error_handler(request: Request, error: ProtocolError) -> Response:
@@ -554,61 +581,6 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         return _json_response(
             request,
             _candidate_payload(status),
-            cache_control=NO_STORE,
-            conditional=False,
-            include_etag=False,
-        )
-
-    @app.get("/v1/tokens")
-    def list_tokens(request: Request) -> Response:
-        _query(request, EmptyQuery)
-        token = _authenticate(request, principals)
-        if token.pack is not None:
-            raise ProtocolError(
-                403, "forbidden", "Token administration requires an unscoped token."
-            )
-        try:
-            records = principals.administered_tokens(token.publisher, token.minted_by)
-        except RegistryError as exc:
-            raise ProtocolError(403, "forbidden", str(exc)) from None
-        return _json_response(
-            request,
-            {
-                "tokens": [
-                    {
-                        "id": record.token_id,
-                        "publisher": record.publisher,
-                        "mintedBy": record.minted_by,
-                        "pack": record.pack,
-                        "createdAt": record.created_at,
-                        "expiresAt": record.expires_at,
-                        "revoked": record.revoked,
-                        "revokedReason": record.revoked_reason,
-                    }
-                    for record in records
-                ]
-            },
-            cache_control=NO_STORE,
-            conditional=False,
-            include_etag=False,
-        )
-
-    @app.post("/v1/tokens/{token_id}/revoke")
-    def revoke_token(request: Request, token_id: str, body: RevokeTokenRequest) -> Response:
-        _query(request, EmptyQuery)
-        token = _authenticate(request, principals)
-        try:
-            principals.revoke_token(
-                token_id,
-                token.minted_by,
-                datetime.now(UTC).isoformat(),
-                body.reason,
-            )
-        except RegistryError:
-            raise ProtocolError(403, "forbidden", "Token revocation is forbidden.") from None
-        return _json_response(
-            request,
-            {"revoked": token_id},
             cache_control=NO_STORE,
             conditional=False,
             include_etag=False,

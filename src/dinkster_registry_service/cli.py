@@ -20,6 +20,7 @@ from .app import create_app
 from .database import Database, PackRecord, ReleaseRecord
 from .indexes import StaticIndexes, queue_index_rebuild
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStoreError
+from .ownership import transfer_ownership
 from .principals import PrincipalRepository
 from .seed import seed_fixtures
 from .settings import ServerSettings
@@ -113,6 +114,23 @@ def _parser() -> argparse.ArgumentParser:
     revoke_token.add_argument("token")
     revoke_token.add_argument("--user", required=True)
     revoke_token.add_argument("--reason", required=True)
+
+    freeze_publisher = admin_commands.add_parser(
+        "freeze-publisher", help="freeze a disputed publisher and revoke its publishing tokens"
+    )
+    freeze_publisher.add_argument("publisher")
+    freeze_publisher.add_argument("--user", required=True)
+    freeze_publisher.add_argument("--reason", required=True)
+    bind_publisher = admin_commands.add_parser(
+        "bind-publisher", help="bind or transfer a publisher to a confirmed Dinkster identity"
+    )
+    bind_publisher.add_argument("publisher")
+    bind_publisher.add_argument("--user", required=True)
+    bind_publisher.add_argument("--identity-subject", required=True)
+    bind_publisher.add_argument(
+        "--expected-owner", required=True, help="current subject or unbound"
+    )
+    bind_publisher.add_argument("--reason", required=True)
     return parser
 
 
@@ -226,6 +244,26 @@ def main() -> None:
                     print(
                         f"{token.token_id}\t{token.minted_by}\t{scope}\t{token.expires_at}\t{state}"
                     )
+            elif args.admin_command == "freeze-publisher":
+                principals.freeze_publisher(args.publisher, args.user, now, args.reason)
+                print(f"froze publisher {args.publisher}; publishing tokens revoked")
+            elif args.admin_command == "bind-publisher":
+                with database.session() as session, session.begin():
+                    if not database.is_postgresql:
+                        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+                    event_id = transfer_ownership(
+                        session,
+                        actor=args.user,
+                        subject_kind="publisher",
+                        subject_id=args.publisher,
+                        expected_owner=(
+                            None if args.expected_owner == "unbound" else args.expected_owner
+                        ),
+                        target_owner=args.identity_subject,
+                        reason=args.reason,
+                        at=datetime.now(UTC),
+                    )
+                print(f"bound publisher {args.publisher}; audit event {event_id}")
             else:
                 principals.revoke_token(args.token, args.user, now, args.reason)
                 print(f"revoked token {args.token}")
