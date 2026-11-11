@@ -16,8 +16,14 @@ from dinkster_registry_service import accounts
 from dinkster_registry_service.admission import AdmissionService
 from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
-from dinkster_registry_service.database import PublisherBindingRecord, PublisherTokenRecord
+from dinkster_registry_service.database import (
+    PublisherBindingRecord,
+    PublisherMembershipRecord,
+    PublisherTokenRecord,
+)
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore
+from dinkster_registry_service.ownership import transfer_ownership
+from dinkster_registry_service.principals import PrincipalRepository
 from dinkster_registry_service.seed import FIXTURE_ROOT
 from dinkster_registry_service.settings import ServerSettings
 
@@ -213,3 +219,34 @@ def test_human_identity_claims_mints_and_revokes_without_operator(
             assert binding is not None and binding.identity_subject == f"u_{alice}"
             stored = session.scalar(select(PublisherTokenRecord))
             assert stored is not None and stored.revoked and stored.secret_hash != secret
+
+        principals = PrincipalRepository(app.state.database)
+        principals.register_user("operator")
+        principals.add_operator("operator", "operator", datetime.now(UTC).isoformat())
+        original_mint = PrincipalRepository.mint_token
+
+        def transfer_before_mint(self: PrincipalRepository, *args: Any, **kwargs: Any) -> Any:
+            with self.database.session() as session, session.begin():
+                if not self.database.is_postgresql:
+                    session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+                transfer_ownership(
+                    session,
+                    actor="operator",
+                    subject_kind="publisher",
+                    subject_id="alice",
+                    expected_owner=f"u_{alice}",
+                    target_owner=f"org:{uuid4()}",
+                    reason="Confirmed ownership correction",
+                    at=datetime.now(UTC),
+                )
+                session.add(
+                    PublisherMembershipRecord(
+                        publisher_id="alice", user_id=f"u_{alice}", role="owner"
+                    )
+                )
+            return original_mint(self, *args, **kwargs)
+
+        monkeypatch.setattr(PrincipalRepository, "mint_token", transfer_before_mint)
+        stale = browser.post(f"{path}/tokens", headers=alice_headers, json={"expires_at": expires})
+        assert stale.status_code == 403
+        assert browser.get(f"{path}/tokens", headers=bob_headers).status_code == 200

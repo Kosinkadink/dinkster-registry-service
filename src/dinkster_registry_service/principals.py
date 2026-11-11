@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from .database import (
     Database,
     PrincipalAuditRecord,
+    PublisherBindingRecord,
     PublisherFreezeRecord,
     PublisherMembershipRecord,
     PublisherRecord,
@@ -30,6 +31,16 @@ from .database import (
 class PrincipalRepository:
     def __init__(self, database: Database) -> None:
         self.database = database
+
+    def _lock_identity(self, session: Session, publisher: str, subject: str) -> None:
+        if not self.database.is_postgresql:
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        session.get(PublisherRecord, publisher, with_for_update=True)
+        binding = session.get(PublisherBindingRecord, publisher)
+        if binding is None or binding.identity_subject != subject:
+            raise RegistryError("publisher identity binding changed")
+        if session.get(PublisherFreezeRecord, publisher) is not None:
+            raise RegistryError("publisher is frozen")
 
     @staticmethod
     def _load(session: Session) -> tuple[PrincipalDirectory, set[str]]:
@@ -131,9 +142,12 @@ class PrincipalRepository:
         *,
         pack: str | None = None,
         secret: str | None = None,
+        identity_subject: str | None = None,
     ) -> tuple[str, TokenRecord]:
         with self.database.session() as session, session.begin():
-            if not self.database.is_postgresql:
+            if identity_subject is not None:
+                self._lock_identity(session, canonical_name(publisher), identity_subject)
+            elif not self.database.is_postgresql:
                 session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             canonical = canonical_name(publisher)
             session.get(PublisherRecord, canonical, with_for_update=True)
@@ -196,8 +210,21 @@ class PrincipalRepository:
                 directory.record(actor, "revoke-token", canonical, at, f"token {token.token_id}")
             self._append_audit(session, directory, audit_count)
 
-    def revoke_token(self, token_id: str, actor: str, at: str, reason: str) -> None:
+    def revoke_token(
+        self,
+        token_id: str,
+        actor: str,
+        at: str,
+        reason: str,
+        *,
+        identity_subject: str | None = None,
+    ) -> None:
         with self.database.session() as session, session.begin():
+            if identity_subject is not None:
+                token = session.get(PublisherTokenRecord, token_id)
+                if token is None:
+                    raise RegistryError("unknown token")
+                self._lock_identity(session, token.publisher_id, identity_subject)
             directory, _ = self._load(session)
             audit_count = len(directory.audit())
             directory.revoke_token(token_id, actor, at, reason)
@@ -228,8 +255,12 @@ class PrincipalRepository:
             directory, _ = self._load(session)
             directory.authorize_token(token, publisher, pack)
 
-    def administered_tokens(self, publisher: str, actor: str) -> tuple[TokenRecord, ...]:
-        with self.database.session() as session:
+    def administered_tokens(
+        self, publisher: str, actor: str, *, identity_subject: str | None = None
+    ) -> tuple[TokenRecord, ...]:
+        with self.database.session() as session, session.begin():
+            if identity_subject is not None:
+                self._lock_identity(session, canonical_name(publisher), identity_subject)
             directory, _ = self._load(session)
             directory.authorize(actor, publisher, "manage-members")
             return directory.tokens(publisher)

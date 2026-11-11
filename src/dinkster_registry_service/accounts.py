@@ -119,10 +119,15 @@ def account_router(database: Database, settings: ServerSettings) -> APIRouter:
                 if not database.is_postgresql:
                     session.connection().exec_driver_sql("BEGIN IMMEDIATE")
                 binding = session.scalar(
-                    select(PublisherBindingRecord)
-                    .where(PublisherBindingRecord.identity_subject == identity.subject)
-                    .with_for_update()
+                    select(PublisherBindingRecord).where(
+                        PublisherBindingRecord.identity_subject == identity.subject
+                    )
                 )
+                if binding is not None:
+                    session.get(PublisherRecord, binding.publisher_id, with_for_update=True)
+                    session.refresh(binding, with_for_update=True)
+                    if binding.identity_subject != identity.subject:
+                        raise AccountError(403, "The publisher identity binding changed.")
                 if binding is None:
                     if not claim:
                         raise AccountError(404, "Claim a publisher before managing tokens.")
@@ -184,7 +189,10 @@ def account_router(database: Database, settings: ServerSettings) -> APIRouter:
     @router.get("/tokens")
     def list_tokens(who: Annotated[PublisherIdentity, Depends(identity)]) -> JSONResponse:
         name = publisher(who)
-        records = principals.administered_tokens(name, who.actor)
+        try:
+            records = principals.administered_tokens(name, who.actor, identity_subject=who.subject)
+        except RegistryError:
+            raise AccountError(403, "Token listing is forbidden.") from None
         return _json(
             {
                 "publisher": name,
@@ -205,7 +213,12 @@ def account_router(database: Database, settings: ServerSettings) -> APIRouter:
         name = publisher(who)
         try:
             secret, record = principals.mint_token(
-                name, who.actor, now.isoformat(), body.expires_at.isoformat(), pack=body.pack
+                name,
+                who.actor,
+                now.isoformat(),
+                body.expires_at.isoformat(),
+                pack=body.pack,
+                identity_subject=who.subject,
             )
         except RegistryError:
             raise AccountError(403, "Token creation is forbidden.") from None
@@ -227,9 +240,19 @@ def account_router(database: Database, settings: ServerSettings) -> APIRouter:
         name = publisher(who)
         if not body.reason.strip():
             raise AccountError(400, "A revocation reason is required.")
-        if token_id not in {t.token_id for t in principals.administered_tokens(name, who.actor)}:
-            raise AccountError(403, "Token revocation is forbidden.")
-        principals.revoke_token(token_id, who.actor, datetime.now(UTC).isoformat(), body.reason)
+        try:
+            records = principals.administered_tokens(name, who.actor, identity_subject=who.subject)
+            if token_id not in {t.token_id for t in records}:
+                raise RegistryError("token belongs to another publisher")
+            principals.revoke_token(
+                token_id,
+                who.actor,
+                datetime.now(UTC).isoformat(),
+                body.reason,
+                identity_subject=who.subject,
+            )
+        except RegistryError:
+            raise AccountError(403, "Token revocation is forbidden.") from None
         return _json({"revoked": token_id})
 
     return router
