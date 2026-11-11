@@ -175,8 +175,9 @@ class SecurityRepository:
             if token is not None:
                 if token.minted_by != actor:
                     raise RegistryError("publisher token actor does not match its issuer")
-                directory, _ = PrincipalRepository._load(session)
-                directory.authorize_token(token, pack.publisher_id or "", pack.name)
+                PrincipalRepository.require_current_token(
+                    session, token, pack.publisher_id or "", pack.name
+                )
             if not security:
                 directory, _ = PrincipalRepository._load(session)
                 if pack.publisher_id is None:
@@ -278,7 +279,9 @@ class SecurityRepository:
                 directory, _ = PrincipalRepository._load(session)
                 directory.authorize(actor, publisher, "publish")
                 if token is not None:
-                    directory.authorize_token(token, publisher, change.subject)
+                    PrincipalRepository.require_current_token(
+                        session, token, publisher, change.subject
+                    )
                 previous = self.upload_control(session, "pack", change.subject)
                 if previous is not None and previous.data["stopped"] and not change.stopped:
                     if previous.data["authority"] == "security":

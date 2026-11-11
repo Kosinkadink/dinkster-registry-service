@@ -49,8 +49,11 @@ from dinkster_registry_service.database import (
 from dinkster_registry_service.digests import artifact_digest
 from dinkster_registry_service.indexes import StaticIndexes, queue_index_rebuild
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore, ObjectStoreError
+from dinkster_registry_service.ownership import transfer_ownership
 from dinkster_registry_service.principals import PrincipalRepository
+from dinkster_registry_service.security import SecurityRelease
 from dinkster_registry_service.security_repository import (
+    NoticeChange,
     SecurityRepository,
     UploadChange,
 )
@@ -628,9 +631,9 @@ def test_failed_object_promotion_is_retried_without_exposing_release(
         assert client.get("/v1/packs/example-pack").status_code == 200
 
 
-@pytest.mark.parametrize("revoke_before_activation", [False, True])
+@pytest.mark.parametrize("authority_change", ["none", "revoke", "transfer", "publisher-transfer"])
 def test_security_maintenance_keeps_owner_and_rechecks_authority(
-    database: Database, database_url: str, tmp_path: Path, revoke_before_activation: bool
+    database: Database, database_url: str, tmp_path: Path, authority_change: str
 ) -> None:
     class HeldPromotionStore(LocalFilesystemObjectStore):
         hold = True
@@ -650,10 +653,10 @@ def test_security_maintenance_keeps_owner_and_rechecks_authority(
         principals.register_user(actor)
         principals.register_publisher(actor, actor, now.isoformat())
     principals.add_operator("responder", "responder", now.isoformat())
-    _, responder_token = principals.mint_token(
+    responder_secret, responder_token = principals.mint_token(
         "responder", "responder", now.isoformat(), (now + timedelta(hours=1)).isoformat()
     )
-    _, publisher_token = principals.mint_token(
+    publisher_secret, publisher_token = principals.mint_token(
         "publisher", "publisher", now.isoformat(), (now + timedelta(hours=1)).isoformat()
     )
     security = SecurityRepository(database, "https://registry.example")
@@ -684,7 +687,12 @@ def test_security_maintenance_keeps_owner_and_rechecks_authority(
         with pytest.raises(RegistryError), security.transaction() as session:
             security.authorize_upload(session, credential, name, reason)
     with security.transaction() as session:
-        authorization = security.authorize_upload(session, human, "example-pack", "repair input")
+        authorization = security.authorize_upload(
+            session,
+            publisher_token if authority_change == "publisher-transfer" else human,
+            "example-pack",
+            None if authority_change == "publisher-transfer" else "repair input",
+        )
     service = AdmissionService(database, store, require_isolation=False)
     candidate_id = service.submit(
         _archive(tmp_path, version="1.2.4"),
@@ -694,10 +702,22 @@ def test_security_maintenance_keeps_owner_and_rechecks_authority(
     )
     assert service.run_once()
     assert service.status(candidate_id).status == "promoting", service.status(candidate_id)
-    if revoke_before_activation:
+    if authority_change == "revoke":
         security.set_role(actor="responder", user="responder", enabled=False, reason="removed")
         with pytest.raises(RegistryError), security.transaction() as session:
             security.authorize_upload(session, human, "example-pack", "repair")
+    if authority_change in {"transfer", "publisher-transfer"}:
+        with database.session() as session, session.begin():
+            transfer_ownership(
+                session,
+                actor="responder",
+                subject_kind="pack",
+                subject_id=str(pack_id),
+                expected_owner="publisher",
+                target_owner="outsider",
+                reason="new maintainer",
+                at=now,
+            )
     store.hold = False
     with database.session() as session, session.begin():
         outbox = session.scalar(
@@ -707,11 +727,15 @@ def test_security_maintenance_keeps_owner_and_rechecks_authority(
         outbox.available_at = now
     assert service.deliver_one_promotion()
     assert service.status(candidate_id).status == (
-        "rejected" if revoke_before_activation else "accepted"
+        "accepted" if authority_change == "none" else "rejected"
     )
     with database.session() as session:
         pack = session.get(PackRecord, pack_id)
-        assert pack is not None and (pack.publisher_id, pack.owner_id) == ("publisher", owner_id)
+        assert pack is not None
+        if authority_change in {"transfer", "publisher-transfer"}:
+            assert pack.publisher_id == "outsider"
+        else:
+            assert (pack.publisher_id, pack.owner_id) == ("publisher", owner_id)
         original = session.scalar(
             select(ReleaseRecord).where(
                 ReleaseRecord.pack_id == pack_id, ReleaseRecord.version == "1.2.3"
@@ -725,8 +749,10 @@ def test_security_maintenance_keeps_owner_and_rechecks_authority(
             )
         )
         assert update is not None
-        assert update.published_by_kind == "registry"
-        assert update.state == ("rejected" if revoke_before_activation else "active")
+        assert update.published_by_kind == (
+            "interactive" if authority_change == "publisher-transfer" else "registry"
+        )
+        assert update.state == ("active" if authority_change == "none" else "rejected")
         audit = session.scalar(
             select(AuditEventRecord).where(
                 AuditEventRecord.event_type == "release_candidate.submitted",
@@ -736,18 +762,82 @@ def test_security_maintenance_keeps_owner_and_rechecks_authority(
         assert audit is not None
         assert audit.data["authorization"] == {
             "publisher": "publisher",
-            "actor": "responder",
-            "token_id": None,
-            "security_reason": "repair input",
+            "actor": "publisher" if authority_change == "publisher-transfer" else "responder",
+            "token_id": publisher_token.token_id
+            if authority_change == "publisher-transfer"
+            else None,
+            "security_reason": None if authority_change == "publisher-transfer" else "repair input",
         }
+    if authority_change in {"transfer", "publisher-transfer"}:
+        with pytest.raises(RegistryError), security.transaction() as session:
+            security.authorize_upload(session, publisher_token, "example-pack", None)
+        return
     with security.transaction() as session:
         ordinary = security.authorize_upload(session, publisher_token, "example-pack", None)
     assert ordinary.publisher == "publisher" and ordinary.security_reason is None
-    if not revoke_before_activation:
+    if authority_change == "none":
+        notice = security.change(
+            actor="responder",
+            change=NoticeChange(
+                operation="issue",
+                release=SecurityRelease(
+                    pack="example-pack", version="1.2.4", artifact_digest=update.artifact_digest
+                ),
+                expected_revision=0,
+                state="vulnerable",
+                reason="review",
+                message="details",
+                incident="case",
+            ),
+        )
+        control = UploadChange(
+            subject_type="pack", subject="example-pack", stopped=True, reason="pause"
+        )
+        security.set_uploads(actor="responder", change=control)
         with _client(database_url, tmp_path / "objects") as client:
             detail = client.get("/v1/packs/example-pack/versions/1.2.4")
             assert detail.status_code == 200
             assert detail.json()["publishedBy"]["kind"] == "registry"
+            artifact_url = "/v1/artifacts/" + detail.json()["artifact"]["digest"]
+            retained = client.get(artifact_url).content
+            yank_url = "/v1/publish/example-pack/versions/1.2.4/yank"
+            assert client.post(yank_url, json={"reason": "withdraw"}).status_code == 401
+            assert (
+                client.post(
+                    yank_url,
+                    json={"reason": "withdraw"},
+                    headers={"Authorization": f"Bearer {responder_secret}"},
+                ).status_code
+                == 403
+            )
+            assert (
+                client.post(
+                    yank_url,
+                    json={"reason": " "},
+                    headers={"Authorization": f"Bearer {publisher_secret}"},
+                ).status_code
+                == 403
+            )
+            yanked = client.post(
+                "/v1/publish/example-pack/versions/1.2.4/yank",
+                json={"reason": "Publisher withdrew registry maintenance release"},
+                headers={"Authorization": f"Bearer {publisher_secret}"},
+            )
+            assert yanked.status_code == 200, yanked.text
+            assert client.get(artifact_url).content == retained
+            assert client.get("/v1/packs/example-pack/versions/1.2.4").json()["state"] == "yanked"
+            assert security.history() == (notice,)
+        with database.session() as session:
+            audit = session.scalar(
+                select(AuditEventRecord).where(AuditEventRecord.event_type == "release.yanked")
+            )
+            assert audit is not None and audit.data == {
+                "actor": "publisher",
+                "reason": "Publisher withdrew registry maintenance release",
+            }
+        security.set_uploads(
+            actor="responder", change=control.model_copy(update={"stopped": False})
+        )
         publisher_source = tmp_path / "ordinary"
         publisher_source.mkdir()
         own_candidate = service.submit(

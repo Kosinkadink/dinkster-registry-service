@@ -14,7 +14,7 @@ from typing import Any, cast
 from uuid import UUID
 
 import tomli_w
-from dinkster_registry import RegistryError
+from dinkster_registry import RegistryError, TokenRecord
 from dinkster_registry.archive_admission import (
     SCAN_POLICY_VERSION,
     AdmissionFinding,
@@ -58,6 +58,7 @@ from .ids import uuid7
 from .indexes import StaticIndexes, queue_index_rebuild
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStore, ObjectStoreError
 from .pack_locks import lock_object_key, parse_pack_locks, quarantine_lock_key
+from .principals import PrincipalRepository
 from .security_repository import (
     SecurityRepository,
     UploadAuthorization,
@@ -165,6 +166,73 @@ def _vulnerabilities() -> dict[str, object]:
 
 
 class AdmissionService:
+    def yank(
+        self, pack_name: str, version: str, *, reason: str, token: TokenRecord | None = None
+    ) -> None:
+        """Withdraw a release without deleting files or changing security classification.
+
+        HTTP callers supply a verified publisher token. The local operator CLI
+        uses the same transaction without a publishing credential.
+        """
+        if not reason.strip():
+            raise RegistryError("yank reason must not be blank")
+        with self.database.session() as session, session.begin():
+            lock_security(session)
+            pack = session.scalar(select(PackRecord).where(PackRecord.name == pack_name))
+            if token is not None:
+                PrincipalRepository.require_current_token(
+                    session,
+                    token,
+                    pack.publisher_id if pack is not None and pack.publisher_id else "",
+                    pack_name,
+                )
+            release = session.scalar(
+                select(ReleaseRecord)
+                .join(PackRecord)
+                .where(PackRecord.name == pack_name, ReleaseRecord.version == version)
+                .with_for_update(of=ReleaseRecord)
+            )
+            if release is None:
+                raise RegistryError(f"unknown release {pack_name} {version}")
+            if release.state != "active":
+                raise RegistryError(f"release is {release.state}; only active can be yanked")
+            now = datetime.now(UTC)
+            release.state = "yanked"
+            release.state_reason = reason
+            release.state_changed_at = now
+            pack = session.get(PackRecord, release.pack_id, with_for_update=True)
+            assert pack is not None
+            if pack.latest_version == release.version:
+                alternatives = session.scalars(
+                    select(ReleaseRecord).where(
+                        ReleaseRecord.pack_id == pack.id, ReleaseRecord.state == "active"
+                    )
+                )
+                latest = max(alternatives, key=lambda row: Version(row.version), default=None)
+                if latest is not None:
+                    pack.latest_version = latest.version
+            pack.updated_at = now
+            session.add(
+                AuditEventRecord(
+                    id=uuid7(),
+                    created_at=now,
+                    event_type="release.yanked",
+                    subject_type="release",
+                    subject_id=str(release.id),
+                    data={
+                        "actor": token.minted_by if token is not None else "operator",
+                        "reason": reason,
+                    },
+                )
+            )
+            queue_index_rebuild(session)
+        try:
+            self.indexes.rebuild()
+        except ObjectStoreError as exc:
+            raise RegistryError(
+                "release yanked, but index rebuild failed; durable rebuild remains queued"
+            ) from exc
+
     def __init__(
         self,
         database: Database,

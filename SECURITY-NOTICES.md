@@ -173,3 +173,13 @@ The immutable audit identifies the human responder and reason. This label in
 the existing publisher's pack listing, together with that audit, notifies the
 publisher; it does not request approval or confer ownership. The publisher
 keeps publishing through its ordinary credentials.
+
+The publisher can withdraw an active registry-maintenance release, just as an
+ordinary release, through `POST /v1/publish/{name}/versions/{version}/yank` with
+its publisher bearer token and `{reason}`. Publisher/pack scope, current token,
+expiry and membership are checked again inside the withdrawal transaction.
+Upload stops do not prevent withdrawal. The existing local `admin yank` command
+uses the same withdrawal operation. Actor and reason are audited; immutable
+artifact/lock bytes remain downloadable, public indexes exclude the release,
+and any security classification remains in force. Withdrawal cannot lift a
+security notice or relabel a maintenance release as publisher-authored.

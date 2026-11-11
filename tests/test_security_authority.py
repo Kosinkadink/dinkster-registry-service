@@ -37,7 +37,11 @@ from dinkster_registry_service.object_store import LocalFilesystemObjectStore
 from dinkster_registry_service.ownership import transfer_ownership
 from dinkster_registry_service.principals import PrincipalRepository
 from dinkster_registry_service.security import SecurityRelease, sign_security_document
-from dinkster_registry_service.security_repository import NoticeChange, SecurityRepository
+from dinkster_registry_service.security_repository import (
+    NoticeChange,
+    SecurityRepository,
+    UploadChange,
+)
 from dinkster_registry_service.seed import FIXTURE_ROOT, seed_fixtures
 from dinkster_registry_service.settings import ServerSettings
 
@@ -644,6 +648,34 @@ def test_pack_transfer_return_and_atomic_notice(
                 ).all()
             )
             == 3
+        )
+        release = session.scalar(select(ReleaseRecord).where(ReleaseRecord.pack_id == pack_id))
+        assert release is not None
+        identity = SecurityRelease(
+            pack="example-pack", version=release.version, artifact_digest=release.artifact_digest
+        )
+    principals.revoke_token(tokens[None].token_id, actors["original"], now.isoformat(), "removed")
+    with pytest.raises(RegistryError):
+        security.change(
+            actor=actors["original"],
+            token=tokens[None],
+            change=NoticeChange(
+                operation="issue",
+                release=identity,
+                expected_revision=0,
+                state="vulnerable",
+                reason="report",
+                message="details",
+                incident="case",
+            ),
+        )
+    with pytest.raises(RegistryError):
+        security.set_uploads(
+            actor=actors["original"],
+            token=tokens[None],
+            change=UploadChange(
+                subject_type="pack", subject="example-pack", stopped=True, reason="stop"
+            ),
         )
     database.dispose()
 

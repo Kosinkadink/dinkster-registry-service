@@ -107,6 +107,10 @@ class SecurityRoleRequest(RequestModel):
     reason: str = Field(min_length=1, max_length=1024)
 
 
+class YankRequest(RequestModel):
+    reason: str = Field(min_length=1, max_length=1024)
+
+
 class ProtocolError(Exception):
     def __init__(
         self,
@@ -598,6 +602,24 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         return _json_response(
             request,
             _candidate_payload(status),
+            cache_control=NO_STORE,
+            conditional=False,
+            include_etag=False,
+        )
+
+    @app.post("/v1/publish/{canonical_name}/versions/{canonical_version}/yank")
+    def yank_release(
+        request: Request, canonical_name: str, canonical_version: str, body: YankRequest
+    ) -> Response:
+        _query(request, EmptyQuery)
+        token = _authenticate(request, principals)
+        try:
+            admission.yank(canonical_name, canonical_version, reason=body.reason, token=token)
+        except RegistryError as exc:
+            raise ProtocolError(403, "forbidden", str(exc)) from None
+        return _json_response(
+            request,
+            {"state": "yanked"},
             cache_control=NO_STORE,
             conditional=False,
             include_etag=False,
