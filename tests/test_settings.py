@@ -8,6 +8,7 @@ from dinkster_registry_service.settings import ServerSettings
 PROBE_ENVIRONMENT_VARIABLES = (
     "DINKSTER_PROBE_TIMEOUT_SECONDS",
     "DINKSTER_PROBE_DEPENDENCY_TIMEOUT_SECONDS",
+    "DINKSTER_PROBE_DEPENDENCY_SOURCE",
     "DINKSTER_PROBE_OUTPUT_LIMIT_BYTES",
     "DINKSTER_PROBE_OPERATOR_TAIL_BYTES",
     "DINKSTER_SCANNER_MAX_ATTEMPTS",
@@ -19,6 +20,7 @@ def test_probe_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) -
         "DINKSTER_PROBE_TIMEOUT_SECONDS": "1",
         "DINKSTER_PROBE_DEPENDENCY_TIMEOUT_SECONDS": "73",
         "DINKSTER_PROBE_PACKAGE_INDEX_URL": "http://127.0.0.1:9001/simple",
+        "DINKSTER_PROBE_DEPENDENCY_SOURCE": "index",
         "DINKSTER_PROBE_OUTPUT_LIMIT_BYTES": "4096",
         "DINKSTER_PROBE_OPERATOR_TAIL_BYTES": "512",
         "DINKSTER_SCANNER_MAX_ATTEMPTS": "1",
@@ -31,9 +33,16 @@ def test_probe_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) -
     assert settings.probe_timeout_seconds == 1
     assert settings.probe_dependency_timeout_seconds == 73
     assert settings.probe_package_index_url == "http://127.0.0.1:9001/simple"
+    assert settings.probe_dependency_source == "index"
     assert settings.probe_output_limit_bytes == 4096
     assert settings.probe_operator_tail_bytes == 512
     assert settings.scanner_max_attempts == 1
+
+
+def test_probe_dependency_source_defaults_to_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DINKSTER_PROBE_DEPENDENCY_SOURCE", raising=False)
+
+    assert ServerSettings.from_environment().probe_dependency_source == "cpu"
 
 
 @pytest.mark.parametrize(
@@ -43,6 +52,7 @@ def test_probe_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) -
         ("DINKSTER_PROBE_TIMEOUT_SECONDS", "601"),
         ("DINKSTER_PROBE_DEPENDENCY_TIMEOUT_SECONDS", "0"),
         ("DINKSTER_PROBE_DEPENDENCY_TIMEOUT_SECONDS", "1801"),
+        ("DINKSTER_PROBE_DEPENDENCY_SOURCE", "public"),
         ("DINKSTER_PROBE_OUTPUT_LIMIT_BYTES", "4095"),
         ("DINKSTER_PROBE_OUTPUT_LIMIT_BYTES", "4194305"),
         ("DINKSTER_PROBE_OPERATOR_TAIL_BYTES", "511"),
