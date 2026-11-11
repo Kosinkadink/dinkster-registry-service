@@ -144,6 +144,65 @@ def test_template_catalog_and_immutable_body_contract(
 
 
 @pytest.mark.parametrize(
+    ("path", "status"),
+    (
+        ("/index/templates", 200),
+        ("/index/templates?limit=0", 400),
+        ("/index/packs/example-pack/versions/1.2.3/templates/starter", 200),
+        ("/index/packs/example-pack/versions/1.2.3/templates/missing", 404),
+        ("/index/packs/example-pack/versions/1.2.3/templates/starter/thumbnail", 404),
+    ),
+)
+def test_public_template_reads_allow_cross_origin_browsers(
+    client: TestClient, path: str, status: int
+) -> None:
+    headers = {"Origin": "https://frontend.example"}
+    response = client.get(path, headers=headers)
+    assert response.status_code == status
+    assert response.headers["access-control-allow-origin"] == "*"
+    assert response.headers["access-control-expose-headers"] == "ETag"
+    assert "access-control-allow-credentials" not in response.headers
+    head = client.head(path, headers=headers)
+    assert head.status_code == status
+    assert head.content == b""
+    assert head.headers["access-control-allow-origin"] == "*"
+    preflight = client.options(
+        path,
+        headers={
+            **headers,
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "If-None-Match",
+        },
+    )
+    assert preflight.status_code == 204
+    assert preflight.headers["access-control-allow-headers"] == "If-None-Match"
+    assert preflight.headers["access-control-allow-methods"] == "GET, HEAD, OPTIONS"
+    if status == 200:
+        conditional = client.get(
+            path, headers={**headers, "If-None-Match": response.headers["etag"]}
+        )
+        assert conditional.status_code == 304
+        assert conditional.headers["access-control-allow-origin"] == "*"
+
+
+def test_template_cors_does_not_authorize_writes_or_account_origins(client: TestClient) -> None:
+    headers = {"Origin": "https://frontend.example"}
+    for path, status in (
+        ("/index/templates", 400),
+        ("/v1/publish/example-pack/versions/1.2.3", 401),
+    ):
+        response = client.post(path, headers=headers)
+        assert response.status_code == status
+        assert "access-control-allow-origin" not in response.headers
+    account = client.get("/v1/account/publishers", headers=headers)
+    assert account.status_code == 403
+    assert "access-control-allow-origin" not in account.headers
+    unrelated = client.get("/index/templates/not-a-template-route", headers=headers)
+    assert unrelated.status_code == 404
+    assert "access-control-allow-origin" not in unrelated.headers
+
+
+@pytest.mark.parametrize(
     ("pack_name", "version"),
     (("example-pack", "1.2.3"), ("color-tools", "0.4.0")),
 )

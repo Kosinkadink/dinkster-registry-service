@@ -137,6 +137,11 @@ The service serves the stored bytes at `/static/packs/index.json` and
 content-derived ETags and `If-None-Match` support (304). Read-only public CORS
 exposes ETag and permits conditional browser requests; mirror operators must
 provide equivalent CORS headers when serving a different browser origin.
+The public `/index/templates` catalog and its per-release template body and
+thumbnail routes use the same wildcard read-only CORS policy for GET, HEAD
+and OPTIONS, including unavailable responses. ETag is exposed and
+If-None-Match is permitted; credentials are not enabled. This policy does not
+apply to account or write routes, whose authorization remains unchanged.
 The object-store indexes have a 60-second public cache lifetime. Artifact and
 per-version schema bytes remain immutable; only the JSON and simple index keys can be
 replaced. Production stores these objects in R2 through the S3 API, not on
