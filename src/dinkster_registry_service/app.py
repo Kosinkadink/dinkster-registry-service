@@ -33,10 +33,11 @@ from .digests import DigestError, require_blake3_digest
 from .identifiers import IdentifierError, require_canonical_pack_name
 from .ids import uuid7
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStoreError
+from .ownership import transfer_ownership
 from .pack_locks import MAX_LOCKS_SIZE, PackLocksError, lock_object_key
 from .principals import PrincipalRepository
 from .repository import CatalogDataError, CatalogRepository
-from .security_repository import NoticeChange, SecurityRepository, UploadChange
+from .security_repository import NoticeChange, OwnershipChange, SecurityRepository, UploadChange
 from .settings import ServerSettings
 from .versioning import VersionError, require_public_version
 from .wire import ErrorCode, ErrorResponse, ResponseModel
@@ -597,6 +598,32 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         return _json_response(
             request,
             _candidate_payload(status),
+            cache_control=NO_STORE,
+            conditional=False,
+            include_etag=False,
+        )
+
+    @app.post("/v1/security/packs/{pack_id}/ownership")
+    async def transfer_pack(request: Request, pack_id: UUID, body: OwnershipChange) -> Response:
+        _query(request, EmptyQuery)
+        who = await identity(request)
+        try:
+            with database.session() as session, session.begin():
+                event_id = transfer_ownership(
+                    session,
+                    actor=who.actor,
+                    subject_kind="pack",
+                    subject_id=str(pack_id),
+                    expected_owner=body.expected_owner,
+                    target_owner=body.target_owner,
+                    reason=body.reason,
+                    at=datetime.now(UTC),
+                )
+        except RegistryError as exc:
+            raise ProtocolError(403, "forbidden", str(exc)) from None
+        return _json_response(
+            request,
+            {"auditId": str(event_id)},
             cache_control=NO_STORE,
             conditional=False,
             include_etag=False,

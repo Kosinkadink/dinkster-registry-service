@@ -27,7 +27,15 @@ from .database import (
 from .identifiers import require_canonical_pack_name
 from .ids import uuid7
 from .principals import PrincipalRepository
-from .security import Digest, SecurityDocument, SecurityModel, SecurityNotice, SecurityRelease, Text
+from .security import (
+    Digest,
+    OwnershipNotice,
+    SecurityDocument,
+    SecurityModel,
+    SecurityNotice,
+    SecurityRelease,
+    Text,
+)
 
 
 class NoticeChange(SecurityModel):
@@ -47,6 +55,12 @@ class UploadChange(SecurityModel):
     subject_type: Literal["pack", "publisher"]
     subject: Text
     stopped: bool
+    reason: Text
+
+
+class OwnershipChange(SecurityModel):
+    expected_owner: Text | None
+    target_owner: Text
     reason: Text
 
 
@@ -421,12 +435,24 @@ class SecurityRepository:
         with self.transaction() as session:
             history = self._history(session)
             current = {notice.id: notice for notice in history}
+            ownership = sorted(
+                (
+                    OwnershipNotice.model_validate_json(row.data["notice"])
+                    for row in session.scalars(
+                        select(AuditEventRecord).where(
+                            AuditEventRecord.event_type == "security.ownership"
+                        )
+                    )
+                ),
+                key=lambda notice: notice.revision,
+            )
             return SecurityDocument(
                 registry=self.registry,
                 revision=self.revision(session),
                 issued_at=issued_at,
                 expires_at=expires_at,
                 notices=tuple(current.values()),
+                ownership_changes=tuple(ownership),
             )
 
 

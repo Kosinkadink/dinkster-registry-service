@@ -49,6 +49,9 @@ who can create or clear a classification.
 `ownershipChanges` contains immutable signed `ownership_transferred` records:
 `id` (the shared audit event ID), `revision`, `packId` (unchanged by transfer),
 `pack`, `previousPublisher`, `publisher`, `actor`, `changedAt` and `reason`.
+`previousPublisher` is required and accepts explicit null for an operator-owned
+pack; omission is invalid. `publisher` is a nonempty registered publisher id
+and must differ from `previousPublisher`.
 Transfers and returns append new records; they never rewrite published files
 or delete a previous ownership record. These notices announce the registry's
 audited ownership transaction, not a second way to perform a transfer.
@@ -124,6 +127,26 @@ classifications. PostgreSQL uses a transaction advisory lock; SQLite uses an
 immediate write transaction. Durable security revisions, not UUID ordering or
 wall-clock order, determine which record replaces another. No database schema
 conversion or compatibility path is involved.
+
+## Pack ownership
+
+`POST /v1/security/packs/{pack_id}/ownership` requires a verified human management
+credential with the current explicit security role. Its body contains required
+`expectedOwner` (publisher id or explicit null), `targetOwner` (registered
+publisher id) and a nonblank `reason`. Takeover, transfer and return all use
+`ownership.transfer_ownership` in one caller transaction; a publisher cannot
+self-reclaim. The returned `auditId` also identifies the signed ownership notice.
+The primitive takes the security lock before publisher, pack and namespace locks.
+Stale ownership refuses without mutation. Pack id, published releases/files and
+admission tier are preserved. Pack and its namespace grants change attribution
+together. Only credentials scoped to the transferred pack are revoked; broad
+credentials and unrelated publisher memberships/grants remain intact but cannot
+publish to the transferred pack. Queued publication rechecks current ownership.
+
+Ownership audit, durable notice and `security.publish` outbox entry commit or
+roll back together, including when notice validation or outbox persistence fails.
+The signed document builder retains all ownership changes. Public feed delivery
+is separate publication work; a pending outbox item does not mean it is published.
 
 ## Maintenance admission
 

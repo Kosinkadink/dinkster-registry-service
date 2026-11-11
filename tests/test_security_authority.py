@@ -16,8 +16,9 @@ from dinkster_token_verifier import TokenVerifier
 from fastapi.testclient import TestClient
 from joserfc import jwt
 from joserfc.jwk import OKPKey
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, event, select, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from dinkster_registry_service import accounts
 from dinkster_registry_service.app import create_app
@@ -25,11 +26,15 @@ from dinkster_registry_service.artifacts import build_registry_fixture_archive
 from dinkster_registry_service.database import (
     AuditEventRecord,
     Database,
+    NamespaceGrantRecord,
+    OutboxRecord,
     PackRecord,
     PublisherMembershipRecord,
+    PublisherTokenRecord,
     ReleaseRecord,
 )
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore
+from dinkster_registry_service.ownership import transfer_ownership
 from dinkster_registry_service.principals import PrincipalRepository
 from dinkster_registry_service.security import SecurityRelease, sign_security_document
 from dinkster_registry_service.security_repository import NoticeChange, SecurityRepository
@@ -496,3 +501,195 @@ def test_concurrent_security_changes_have_one_winner_and_role_revocation_is_effe
     next_change = change.model_copy(update={"expected_revision": history[-1].revision})
     with pytest.raises(RegistryError):
         repository.change(actor="responder", change=next_change)
+
+
+def test_pack_transfer_return_and_atomic_notice(
+    tmp_path: Path,
+    management_headers: Callable[..., dict[str, str]],
+) -> None:
+    app = create_app(
+        ServerSettings(
+            database_url=f"sqlite:///{tmp_path / 'transfer.db'}",
+            object_store_root=tmp_path / "objects",
+            public_base_url="http://testserver",
+        )
+    )
+    database = app.state.database
+    seed_fixtures(database, app.state.object_store)
+    principals = PrincipalRepository(database)
+    now = datetime.now(UTC)
+    actors = {name: f"u_{uuid4()}" for name in ("original", "replacement", "responder")}
+    for name, actor in actors.items():
+        principals.register_user(actor)
+        principals.register_publisher(name, actor, now.isoformat())
+    principals.add_operator(actors["responder"], actors["responder"], now.isoformat())
+    security = SecurityRepository(database, "http://testserver")
+    security.set_role(
+        actor=actors["responder"], user=actors["responder"], enabled=True, reason="response"
+    )
+    tokens = {}
+    for scope in (None, "example-pack", "another-pack"):
+        _, tokens[scope] = principals.mint_token(
+            "original",
+            actors["original"],
+            now.isoformat(),
+            (now + timedelta(hours=1)).isoformat(),
+            pack=scope,
+        )
+    with database.session() as session:
+        pack = session.scalar(select(PackRecord).where(PackRecord.name == "example-pack"))
+        assert pack is not None
+        pack_id = pack.id
+        releases = {
+            row.id: (row.artifact_digest, row.state, row.manifest)
+            for row in session.scalars(
+                select(ReleaseRecord).where(ReleaseRecord.pack_id == pack_id)
+            )
+        }
+    endpoint = f"/v1/security/packs/{pack_id}/ownership"
+    client = TestClient(app)
+    headers = management_headers(actors["responder"], "responder")
+    body = {"expectedOwner": None, "targetOwner": "original", "reason": "case review"}
+    assert client.post(endpoint, json=body).status_code == 401
+    assert (
+        client.post(
+            endpoint, json=body, headers=management_headers(actors["original"], "original")
+        ).status_code
+        == 403
+    )
+    missing = {key: value for key, value in body.items() if key != "expectedOwner"}
+    assert client.post(endpoint, json=missing, headers=headers).status_code == 400
+    first = client.post(endpoint, json=body, headers=headers)
+    assert first.status_code == 200, first.text
+    assert client.post(endpoint, json=body, headers=headers).status_code == 403
+    body.update(expectedOwner="original", targetOwner="replacement")
+    second = client.post(endpoint, json=body, headers=headers)
+    assert second.status_code == 200, second.text
+    with database.session() as session:
+        pack = session.get(PackRecord, pack_id)
+        assert pack is not None and pack.publisher_id == "replacement"
+        for grant in session.scalars(
+            select(NamespaceGrantRecord).where(NamespaceGrantRecord.pack_id == pack_id)
+        ):
+            assert (grant.publisher_id, grant.owner_id) == ("replacement", pack.owner_id)
+        for scope, token in tokens.items():
+            stored = session.get(PublisherTokenRecord, token.token_id)
+            assert stored is not None and stored.revoked == (scope == "example-pack")
+        assert session.get(PublisherMembershipRecord, ("original", actors["original"])) is not None
+        assert {
+            row.id: (row.artifact_digest, row.state, row.manifest)
+            for row in session.scalars(
+                select(ReleaseRecord).where(ReleaseRecord.pack_id == pack_id)
+            )
+        } == releases
+    with pytest.raises(RegistryError), security.transaction() as session:
+        security.authorize_upload(session, tokens[None], "example-pack", None)
+    body.update(expectedOwner="replacement", targetOwner="original")
+    assert (
+        client.post(
+            endpoint, json=body, headers=management_headers(actors["original"], "original")
+        ).status_code
+        == 403
+    )
+    returned = client.post(endpoint, json=body, headers=headers)
+    assert returned.status_code == 200, returned.text
+    document = security.document(issued_at=now, expires_at=now + timedelta(days=1))
+    assert [notice.previous_publisher for notice in document.ownership_changes] == [
+        None,
+        "original",
+        "replacement",
+    ]
+    assert [str(notice.id) for notice in document.ownership_changes] == [
+        response.json()["auditId"] for response in (first, second, returned)
+    ]
+    with database.session() as session:
+        rows = session.scalars(select(OutboxRecord).where(OutboxRecord.topic == "security.publish"))
+        assert [row.payload["auditId"] for row in rows] == [
+            str(notice.id) for notice in document.ownership_changes
+        ]
+
+    # A persistence failure after ownership mutation must roll back every part.
+    def fail_outbox(session: Session, *_args: Any) -> None:
+        if any(
+            isinstance(row, OutboxRecord) and row.topic == "security.publish" for row in session.new
+        ):
+            raise RuntimeError("outbox unavailable")
+
+    event.listen(Session, "before_flush", fail_outbox)
+    try:
+        with pytest.raises(RuntimeError, match="outbox unavailable"):
+            with database.session() as session, session.begin():
+                transfer_ownership(
+                    session,
+                    actor=actors["responder"],
+                    subject_kind="pack",
+                    subject_id=str(pack_id),
+                    expected_owner="original",
+                    target_owner="replacement",
+                    reason="retry",
+                    at=now,
+                )
+    finally:
+        event.remove(Session, "before_flush", fail_outbox)
+    assert security.document(issued_at=now, expires_at=now + timedelta(days=1)) == document
+    with database.session() as session:
+        pack = session.get(PackRecord, pack_id)
+        assert pack is not None and pack.publisher_id == "original"
+        assert (
+            len(
+                session.scalars(
+                    select(AuditEventRecord).where(
+                        AuditEventRecord.event_type == "ownership.transferred"
+                    )
+                ).all()
+            )
+            == 3
+        )
+    database.dispose()
+
+
+def test_concurrent_pack_transfers_have_one_winner(
+    seeded_catalog: tuple[Database, LocalFilesystemObjectStore],
+) -> None:
+    database, _ = seeded_catalog
+    principals = PrincipalRepository(database)
+    now = datetime.now(UTC)
+    principals.register_user("responder")
+    principals.add_operator("responder", "responder", now.isoformat())
+    for name in ("first", "second"):
+        principals.register_user(name)
+        principals.register_publisher(name, name, now.isoformat())
+    security = SecurityRepository(database, "https://registry.example")
+    security.set_role(actor="responder", user="responder", enabled=True, reason="response")
+    with database.session() as session:
+        pack = session.scalar(select(PackRecord).where(PackRecord.name == "example-pack"))
+        assert pack is not None
+        pack_id = pack.id
+    start = Barrier(2)
+
+    def transfer(target: str) -> str:
+        start.wait(timeout=10)
+        try:
+            with database.session() as session, session.begin():
+                transfer_ownership(
+                    session,
+                    actor="responder",
+                    subject_kind="pack",
+                    subject_id=str(pack_id),
+                    expected_owner=None,
+                    target_owner=target,
+                    reason="case-specific takeover",
+                    at=now,
+                )
+        except RegistryError as exc:
+            assert "owner changed" in str(exc)
+            return "conflict"
+        return "changed"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert sorted(executor.map(transfer, ("first", "second"))) == ["changed", "conflict"]
+    document = security.document(issued_at=now, expires_at=now + timedelta(days=1))
+    assert len(document.ownership_changes) == 1
+    with database.session() as session:
+        pack = session.get(PackRecord, pack_id)
+        assert pack is not None and pack.publisher_id == document.ownership_changes[0].publisher

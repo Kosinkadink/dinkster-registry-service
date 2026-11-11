@@ -181,6 +181,23 @@ def test_signed_ownership_change_preserves_pack_identity_and_audit_event() -> No
         **{**_document(revision=2).model_dump(), "ownership_changes": (change,)}
     )
     assert verify_security_document(sign_security_document(document, key), _trust(key)) == document
+    operator_change = OwnershipNotice.model_validate(
+        {**change.model_dump(), "previous_publisher": None}
+    )
+    operator_document = SecurityDocument(
+        **{**document.model_dump(), "ownership_changes": (operator_change,)}
+    )
+    assert (
+        verify_security_document(sign_security_document(operator_document, key), _trust(key))
+        == operator_document
+    )
+    missing = change.model_dump()
+    del missing["previous_publisher"]
+    with pytest.raises(ValidationError):
+        OwnershipNotice.model_validate(missing)
+    for invalid in ("", "original"):
+        with pytest.raises(ValidationError):
+            OwnershipNotice.model_validate({**change.model_dump(), "publisher": invalid})
     with pytest.raises(SecurityError, match="ownership"):
         verify_security_document(
             sign_security_document(_document(revision=3), key), _trust(key), previous=document
