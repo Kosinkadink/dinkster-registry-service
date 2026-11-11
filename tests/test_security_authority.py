@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import shutil
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -21,6 +22,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from dinkster_registry_service import accounts
+from dinkster_registry_service.admission import AdmissionService
 from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
 from dinkster_registry_service.database import (
@@ -445,6 +447,158 @@ def test_upload_stops_cover_pack_and_publisher_without_changing_published_releas
             row.id: (row.state, row.artifact_digest)
             for row in session.scalars(select(ReleaseRecord))
         } == original
+    database.dispose()
+
+
+def test_http_maintenance_requires_explicit_human_authority_and_preserves_publisher(
+    tmp_path: Path, management_headers: Callable[..., dict[str, str]]
+) -> None:
+    app = create_app(
+        ServerSettings(
+            database_url=f"sqlite:///{tmp_path / 'maintenance.db'}",
+            object_store_root=tmp_path / "objects",
+            public_base_url="http://testserver",
+        )
+    )
+    database = app.state.database
+    seed_fixtures(database, app.state.object_store)
+    principals = PrincipalRepository(database)
+    now = datetime.now(UTC)
+    actors = {name: f"u_{uuid4()}" for name in ("publisher", "responder")}
+    tokens = {}
+    headers = {}
+    for name, actor in actors.items():
+        principals.register_user(actor)
+        principals.register_publisher(name, actor, now.isoformat())
+        secret, tokens[name] = principals.mint_token(
+            name,
+            actor,
+            now.isoformat(),
+            (now + timedelta(hours=1)).isoformat(),
+            pack="example-pack",
+        )
+        headers[name] = {"Authorization": f"Bearer {secret}"}
+    principals.add_operator(actors["responder"], actors["responder"], now.isoformat())
+    security = SecurityRepository(database, "http://testserver")
+    security.set_role(
+        actor=actors["responder"], user=actors["responder"], enabled=True, reason="response"
+    )
+    with database.session() as session, session.begin():
+        pack = session.scalar(select(PackRecord).where(PackRecord.name == "example-pack"))
+        assert pack is not None
+        pack.publisher_id = "publisher"
+        pack_id, owner_id = pack.id, pack.owner_id
+        for grant in session.scalars(
+            select(NamespaceGrantRecord).where(NamespaceGrantRecord.pack_id == pack_id)
+        ):
+            grant.publisher_id = "publisher"
+    client = TestClient(app)
+    old = client.get("/v1/packs/example-pack/versions/1.2.3").json()
+    artifact_url = "/v1/artifacts/" + old["artifact"]["digest"]
+    original_bytes = client.get(artifact_url).content
+    source = tmp_path / "source"
+    shutil.copytree(FIXTURE_ROOT / "example-pack", source)
+    manifest = source / "dinkster-pack.toml"
+    original_manifest = (
+        manifest.read_text()
+        .replace('publisher = "dinkster"\n', "")
+        .replace('namespaces = ["example"]', 'namespaces = ["example-pack"]')
+    )
+    nodes = source / "nodes.py"
+    nodes.write_text(nodes.read_text().replace("example.", "example-pack."))
+    human = management_headers(actors["responder"], "responder")
+    reason = {"X-Registry-Security-Reason": "repair unsafe input"}
+    endpoint = "/v1/publish/example-pack/versions/1.2.4"
+    archive = build_registry_fixture_archive(source)
+    for credential, extra, expected in (
+        (human, {}, 401),
+        (headers["responder"], {}, 403),
+        (headers["responder"], reason, 401),
+        (headers["publisher"], reason, 401),
+        (management_headers(actors["publisher"], "publisher"), reason, 403),
+        (headers["publisher"], {"X-Registry-Security-Reason": ""}, 403),
+        (human, {"X-Registry-Security-Reason": "  "}, 403),
+        (management_headers(actors["responder"], "responder", kind="agent"), reason, 401),
+        (management_headers(actors["responder"], "responder", aud="wrong"), reason, 401),
+    ):
+        response = client.post(endpoint, content=archive, headers={**credential, **extra})
+        assert response.status_code == expected, response.text
+    missing = client.post(
+        "/v1/publish/absent-pack/versions/1.2.4", content=archive, headers={**human, **reason}
+    )
+    assert missing.status_code == 403
+    assert (
+        client.post(
+            "/v1/publish/another-pack/versions/1.2.4", content=archive, headers=headers["publisher"]
+        ).status_code
+        == 403
+    )
+    scanner = AdmissionService(
+        database,
+        app.state.object_store,
+        settings=ServerSettings(public_base_url="http://testserver"),
+        require_isolation=False,
+    )
+    for version, credential, extra in (
+        ("1.2.4", human, reason),
+        ("1.2.5", headers["publisher"], {}),
+        ("1.2.6", human, reason),
+        ("1.2.7", headers["publisher"], {}),
+    ):
+        manifest.write_text(
+            original_manifest.replace(
+                "[pack]\n", f'[pack]\nversion = "{version}"\nengine = ">=0"\n'
+            )
+        )
+        submitted = client.post(
+            f"/v1/publish/example-pack/versions/{version}",
+            content=build_registry_fixture_archive(source),
+            headers={**credential, **extra},
+        )
+        assert submitted.status_code == 202, submitted.text
+        candidate_id = UUID(submitted.json()["candidateId"])
+        if version == "1.2.6":
+            security.set_role(
+                actor=actors["responder"],
+                user=actors["responder"],
+                enabled=False,
+                reason="shift ended",
+            )
+        if version == "1.2.7":
+            principals.revoke_token(
+                tokens["publisher"].token_id, actors["publisher"], now.isoformat(), "rotated"
+            )
+        assert scanner.run_once()
+        if version in {"1.2.6", "1.2.7"}:
+            assert scanner.status(candidate_id).status == "rejected", scanner.status(candidate_id)
+            assert client.get(f"/v1/packs/example-pack/versions/{version}").status_code == 404
+            continue
+        assert scanner.status(candidate_id).status == "accepted", scanner.status(candidate_id)
+        detail = client.get(f"/v1/packs/example-pack/versions/{version}").json()
+        if extra:
+            assert detail["publishedBy"]["kind"] == "registry"
+            assert detail["publishedBy"]["principalId"] == "http://testserver"
+        with database.session() as session:
+            pack = session.get(PackRecord, pack_id)
+            assert pack is not None and (pack.publisher_id, pack.owner_id) == (
+                "publisher",
+                owner_id,
+            )
+            audit = session.scalar(
+                select(AuditEventRecord).where(
+                    AuditEventRecord.event_type == "release_candidate.submitted",
+                    AuditEventRecord.subject_id == str(candidate_id),
+                )
+            )
+            assert audit is not None
+            assert audit.data["authorization"] == {
+                "publisher": "publisher",
+                "actor": actors["responder" if extra else "publisher"],
+                "token_id": None if extra else tokens["publisher"].token_id,
+                "security_reason": "repair unsafe input" if extra else None,
+            }
+    assert client.get(artifact_url).content == original_bytes
+    assert client.get("/v1/packs/example-pack/versions/1.2.3").json() == old
     database.dispose()
 
 

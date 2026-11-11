@@ -384,7 +384,7 @@ All catalog routes are under `/v1` and use camelCase JSON fields:
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/v1/health` | Check database access and fixture counts. |
-| POST | `/v1/publish/{name}/versions/{version}` | Submit archive bytes with a publisher token. |
+| POST | `/v1/publish/{name}/versions/{version}` | Submit archive bytes with a publisher token, or a verified human security credential with an explicit maintenance reason. |
 | POST | `/v1/publish/{name}/versions/{version}/yank` | Withdraw an active release of the token's publisher/pack, including registry maintenance releases. |
 | GET | `/v1/publish/{candidateId}` | Read publisher-scoped admission status. |
 | POST | `/v1/reviews/{candidateId}` | Accept or reject a candidate as a registry operator. |

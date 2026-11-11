@@ -150,6 +150,14 @@ is separate publication work; a pending outbox item does not mean it is publishe
 
 ## Maintenance admission
 
+The HTTP upload route `POST /v1/publish/{name}/versions/{version}` selects
+maintenance admission only when `X-Registry-Security-Reason` is present and
+nonblank. Its bearer credential must then be a current identity-service human
+management token with the registry security role. An empty or whitespace-only
+header refuses without falling back to ordinary publishing. Without the header,
+the route requires the ordinary publisher/pack-scoped publishing token; the
+token never inherits its creator's security role.
+
 `SecurityRepository.authorize_upload(session, credential, pack_name, security_reason)`
 returns `UploadAuthorization(publisher, actor, token_id, security_reason)` in a caller
 transaction holding `lock_security`. The credential is either an ordinary verified
