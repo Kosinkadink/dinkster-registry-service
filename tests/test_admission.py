@@ -20,6 +20,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from dinkster_api.v1 import TypeRegistry, register_compositor_type
 from dinkster_registry import RegistryError
 from dinkster_registry.archive_admission import (
     StageResult,
@@ -158,6 +159,9 @@ def test_mandatory_stage_functions_accept_the_registry_fixture(
 
 
 def test_probe_supports_current_pack_api(tmp_path: Path) -> None:
+    registry = TypeRegistry()
+    register_compositor_type(registry)
+    assert "COMPOSITOR" in registry
     source = _fixture_source(tmp_path)
     nodes = source / "nodes.py"
     nodes.write_text(
