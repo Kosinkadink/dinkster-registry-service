@@ -8,18 +8,23 @@ from datetime import UTC, datetime
 from typing import Literal
 
 from dinkster_registry import RegistryError, TokenRecord
-from pydantic import Field
+from pydantic import Field, model_validator
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from .accounts import PublisherIdentity
 from .database import (
     AuditEventRecord,
     Database,
     PackRecord,
+    PublisherFreezeRecord,
     PublisherRecord,
+    PublisherTokenRecord,
     RegistryUserRecord,
+    ReleaseCandidateRecord,
     ReleaseRecord,
 )
+from .identifiers import require_canonical_pack_name
 from .ids import uuid7
 from .principals import PrincipalRepository
 from .security import Digest, SecurityDocument, SecurityModel, SecurityNotice, SecurityRelease, Text
@@ -43,6 +48,21 @@ class UploadChange(SecurityModel):
     subject: Text
     stopped: bool
     reason: Text
+
+
+class UploadAuthorization(SecurityModel):
+    publisher: str | None
+    actor: Text
+    token_id: str | None
+    security_reason: Text | None
+
+    @model_validator(mode="after")
+    def credential_kind(self) -> UploadAuthorization:
+        if (self.token_id is None) == (self.security_reason is None):
+            raise ValueError("upload requires either a publishing token or human security intent")
+        if self.security_reason is not None and not self.security_reason.strip():
+            raise ValueError("security publication requires a nonblank reason")
+        return self
 
 
 class SecurityRepository:
@@ -293,6 +313,109 @@ class SecurityRepository:
         )
         if any(control is not None and control.data["stopped"] for control in controls):
             raise UploadStopped("uploads are stopped for this pack or publisher")
+
+    @classmethod
+    def authorize_upload(
+        cls,
+        session: Session,
+        credential: TokenRecord | PublisherIdentity,
+        pack_name: str,
+        security_reason: str | None,
+    ) -> UploadAuthorization:
+        """Authorize in a caller transaction holding lock_security, without committing."""
+        require_canonical_pack_name(pack_name)
+        if security_reason is not None:
+            if not security_reason.strip() or not isinstance(credential, PublisherIdentity):
+                raise RegistryError("security publication requires a verified human and reason")
+            pack = session.scalar(select(PackRecord).where(PackRecord.name == pack_name))
+            if pack is None:
+                raise RegistryError("security publication requires an existing pack")
+            authorization = UploadAuthorization(
+                publisher=pack.publisher_id,
+                actor=credential.actor,
+                token_id=None,
+                security_reason=security_reason,
+            )
+        else:
+            if not isinstance(credential, TokenRecord):
+                raise RegistryError("ordinary publishing requires a publishing token")
+            directory, _ = PrincipalRepository._load(session)
+            current = next(
+                (row for row in directory.tokens(credential.publisher) if row == credential), None
+            )
+            if current is None:
+                raise RegistryError("publishing credential changed")
+            authorization = UploadAuthorization(
+                publisher=credential.publisher,
+                actor=credential.minted_by,
+                token_id=credential.token_id,
+                security_reason=None,
+            )
+        cls.require_authorization(session, authorization, pack_name)
+        return authorization
+
+    @classmethod
+    def require_authorization(
+        cls, session: Session, authorization: UploadAuthorization, pack_name: str
+    ) -> None:
+        if authorization.publisher is not None:
+            session.get(PublisherRecord, authorization.publisher, with_for_update=True)
+        if authorization.token_id is not None:
+            session.get(PublisherTokenRecord, authorization.token_id, with_for_update=True)
+        pack = session.scalar(select(PackRecord).where(PackRecord.name == pack_name))
+        if pack is not None and pack.publisher_id != authorization.publisher:
+            raise RegistryError("pack ownership changed before publication")
+        if authorization.security_reason is not None:
+            if pack is None or not cls.is_security(session, authorization.actor):
+                raise RegistryError("security publication requires the current security role")
+        else:
+            directory, _ = PrincipalRepository._load(session)
+            publisher = authorization.publisher or ""
+            token = next(
+                (
+                    row
+                    for row in directory.tokens(publisher)
+                    if row.token_id == authorization.token_id
+                ),
+                None,
+            )
+            if (
+                token is None
+                or token.revoked
+                or token.minted_by != authorization.actor
+                or datetime.fromisoformat(token.expires_at) <= datetime.now(UTC)
+                or session.get(PublisherFreezeRecord, publisher) is not None
+            ):
+                raise RegistryError("publishing credential is no longer authorized")
+            directory.authorize(authorization.actor, publisher, "publish")
+            directory.authorize_token(token, publisher, pack_name)
+        cls.require_uploads(session, pack_name, authorization.publisher)
+
+    @classmethod
+    def require_candidate_upload(
+        cls, session: Session, candidate: ReleaseCandidateRecord
+    ) -> UploadAuthorization | None:
+        submission = session.scalar(
+            select(AuditEventRecord).where(
+                AuditEventRecord.event_type == "release_candidate.submitted",
+                AuditEventRecord.subject_id == str(candidate.id),
+            )
+        )
+        raw = submission.data.get("authorization") if submission is not None else None
+        authorization = UploadAuthorization.model_validate(raw) if raw is not None else None
+        if authorization is not None:
+            if (
+                authorization.actor != candidate.submitted_by
+                or authorization.publisher != candidate.publisher_id
+            ):
+                raise RegistryError("candidate does not match its authenticated submission")
+            cls.require_authorization(session, authorization, candidate.pack_name)
+        else:
+            pack = session.scalar(select(PackRecord).where(PackRecord.name == candidate.pack_name))
+            if pack is not None and pack.publisher_id != candidate.publisher_id:
+                raise RegistryError("pack ownership changed before publication")
+            cls.require_uploads(session, candidate.pack_name, candidate.publisher_id)
+        return authorization
 
     def document(self, *, issued_at: datetime, expires_at: datetime) -> SecurityDocument:
         with self.transaction() as session:

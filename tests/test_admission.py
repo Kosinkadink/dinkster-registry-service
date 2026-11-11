@@ -19,6 +19,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from dinkster_registry import RegistryError
 from dinkster_registry.archive_admission import (
     StageResult,
     run_doctor_static,
@@ -29,6 +30,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 import dinkster_registry_service.admission as admission_module
+from dinkster_registry_service.accounts import PublisherIdentity
 from dinkster_registry_service.admission import AdmissionService, quarantine_object_key
 from dinkster_registry_service.admission_checks import run_manifest_admission
 from dinkster_registry_service.app import create_app
@@ -48,7 +50,10 @@ from dinkster_registry_service.digests import artifact_digest
 from dinkster_registry_service.indexes import StaticIndexes, queue_index_rebuild
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore, ObjectStoreError
 from dinkster_registry_service.principals import PrincipalRepository
-from dinkster_registry_service.security_repository import SecurityRepository, UploadChange
+from dinkster_registry_service.security_repository import (
+    SecurityRepository,
+    UploadChange,
+)
 from dinkster_registry_service.seed import FIXTURE_ROOT, seed_fixtures
 from dinkster_registry_service.settings import ServerSettings
 from dinkster_registry_service.wheels import (
@@ -621,6 +626,146 @@ def test_failed_object_promotion_is_retried_without_exposing_release(
     assert service.status(candidate_id).status == "accepted"
     with _client(database_url, tmp_path / "objects") as client:
         assert client.get("/v1/packs/example-pack").status_code == 200
+
+
+@pytest.mark.parametrize("revoke_before_activation", [False, True])
+def test_security_maintenance_keeps_owner_and_rechecks_authority(
+    database: Database, database_url: str, tmp_path: Path, revoke_before_activation: bool
+) -> None:
+    class HeldPromotionStore(LocalFilesystemObjectStore):
+        hold = True
+
+        def put(self, key: str, data: bytes) -> None:
+            if self.hold and key.startswith("artifacts/"):
+                raise ObjectStoreError("hold activation to change authority")
+            super().put(key, data)
+
+    store = HeldPromotionStore(tmp_path / "objects")
+    store.hold = False
+    seed_fixtures(database, store)
+    store.hold = True
+    principals = PrincipalRepository(database)
+    now = datetime.now(UTC)
+    for actor in ("publisher", "responder", "outsider"):
+        principals.register_user(actor)
+        principals.register_publisher(actor, actor, now.isoformat())
+    principals.add_operator("responder", "responder", now.isoformat())
+    _, responder_token = principals.mint_token(
+        "responder", "responder", now.isoformat(), (now + timedelta(hours=1)).isoformat()
+    )
+    _, publisher_token = principals.mint_token(
+        "publisher", "publisher", now.isoformat(), (now + timedelta(hours=1)).isoformat()
+    )
+    security = SecurityRepository(database, "https://registry.example")
+    security.set_role(actor="responder", user="responder", enabled=True, reason="response")
+    with database.session() as session, session.begin():
+        pack = session.scalar(select(PackRecord).where(PackRecord.name == "example-pack"))
+        assert pack is not None
+        pack.publisher_id = "publisher"
+        pack_id = pack.id
+        owner_id = pack.owner_id
+        for grant in session.scalars(
+            select(NamespaceGrantRecord).where(NamespaceGrantRecord.pack_id == pack.id)
+        ):
+            grant.publisher_id = "publisher"
+        old_release = session.scalar(select(ReleaseRecord).where(ReleaseRecord.pack_id == pack.id))
+        assert old_release is not None
+        old_digest, old_state = old_release.artifact_digest, old_release.state
+    human = PublisherIdentity(subject="responder", actor="responder", name="responder")
+    outsider = PublisherIdentity(subject="outsider", actor="outsider", name="outsider")
+    for credential, name, reason in (
+        (responder_token, "example-pack", "repair"),
+        (responder_token, "example-pack", None),
+        (human, "example-pack", None),
+        (human, "example-pack", "  "),
+        (human, "absent-pack", "repair"),
+        (outsider, "example-pack", "repair"),
+    ):
+        with pytest.raises(RegistryError), security.transaction() as session:
+            security.authorize_upload(session, credential, name, reason)
+    with security.transaction() as session:
+        authorization = security.authorize_upload(session, human, "example-pack", "repair input")
+    service = AdmissionService(database, store, require_isolation=False)
+    candidate_id = service.submit(
+        _archive(tmp_path, version="1.2.4"),
+        pack_name="example-pack",
+        version="1.2.4",
+        authorization=authorization,
+    )
+    assert service.run_once()
+    assert service.status(candidate_id).status == "promoting", service.status(candidate_id)
+    if revoke_before_activation:
+        security.set_role(actor="responder", user="responder", enabled=False, reason="removed")
+        with pytest.raises(RegistryError), security.transaction() as session:
+            security.authorize_upload(session, human, "example-pack", "repair")
+    store.hold = False
+    with database.session() as session, session.begin():
+        outbox = session.scalar(
+            select(OutboxRecord).where(OutboxRecord.topic == "artifact.promote")
+        )
+        assert outbox is not None
+        outbox.available_at = now
+    assert service.deliver_one_promotion()
+    assert service.status(candidate_id).status == (
+        "rejected" if revoke_before_activation else "accepted"
+    )
+    with database.session() as session:
+        pack = session.get(PackRecord, pack_id)
+        assert pack is not None and (pack.publisher_id, pack.owner_id) == ("publisher", owner_id)
+        original = session.scalar(
+            select(ReleaseRecord).where(
+                ReleaseRecord.pack_id == pack_id, ReleaseRecord.version == "1.2.3"
+            )
+        )
+        assert original is not None
+        assert (original.artifact_digest, original.state) == (old_digest, old_state)
+        update = session.scalar(
+            select(ReleaseRecord).where(
+                ReleaseRecord.pack_id == pack_id, ReleaseRecord.version == "1.2.4"
+            )
+        )
+        assert update is not None
+        assert update.published_by_kind == "registry"
+        assert update.state == ("rejected" if revoke_before_activation else "active")
+        audit = session.scalar(
+            select(AuditEventRecord).where(
+                AuditEventRecord.event_type == "release_candidate.submitted",
+                AuditEventRecord.subject_id == str(candidate_id),
+            )
+        )
+        assert audit is not None
+        assert audit.data["authorization"] == {
+            "publisher": "publisher",
+            "actor": "responder",
+            "token_id": None,
+            "security_reason": "repair input",
+        }
+    with security.transaction() as session:
+        ordinary = security.authorize_upload(session, publisher_token, "example-pack", None)
+    assert ordinary.publisher == "publisher" and ordinary.security_reason is None
+    if not revoke_before_activation:
+        with _client(database_url, tmp_path / "objects") as client:
+            detail = client.get("/v1/packs/example-pack/versions/1.2.4")
+            assert detail.status_code == 200
+            assert detail.json()["publishedBy"]["kind"] == "registry"
+        publisher_source = tmp_path / "ordinary"
+        publisher_source.mkdir()
+        own_candidate = service.submit(
+            _archive(publisher_source, version="1.2.5"),
+            pack_name="example-pack",
+            version="1.2.5",
+            authorization=ordinary,
+        )
+        assert service.run_once()
+        assert service.status(own_candidate).status == "accepted", service.status(own_candidate)
+    principals.revoke_token(publisher_token.token_id, "publisher", now.isoformat(), "replaced")
+    with pytest.raises(RegistryError, match="no longer authorized"):
+        service.submit(
+            b"unused archive",
+            pack_name="example-pack",
+            version="1.2.6",
+            authorization=ordinary,
+        )
 
 
 def test_tampered_object_rejects_on_digest_and_stays_private(

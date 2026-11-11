@@ -124,3 +124,29 @@ classifications. PostgreSQL uses a transaction advisory lock; SQLite uses an
 immediate write transaction. Durable security revisions, not UUID ordering or
 wall-clock order, determine which record replaces another. No database schema
 conversion or compatibility path is involved.
+
+## Maintenance admission
+
+`SecurityRepository.authorize_upload(session, credential, pack_name, security_reason)`
+returns `UploadAuthorization(publisher, actor, token_id, security_reason)` in a caller
+transaction holding `lock_security`. The credential is either an ordinary verified
+`TokenRecord` or the existing account authenticator's `PublisherIdentity`.
+An absent reason requires a publishing token and its current publisher/pack rights.
+A present reason must be nonblank and requires a verified human with the current
+security role and an existing target pack. A publishing token never inherits its
+creator's security role. The helper never changes pack ownership.
+
+Pass the result as `AdmissionService.submit(..., authorization=authorization)`.
+Admission derives publisher and actor from that result, preserves token id or
+human reason in immutable submission audit, and rechecks authorization at
+submission, preparation and final activation. Removing the role, revoking the
+token or changing pack ownership prevents a queued publication from activating.
+Upload stops apply to both ordinary and maintenance submissions. The internal
+operator archive submission remains a separate existing interface.
+
+Maintenance releases pass the ordinary scanner and appear with
+`publishedBy.kind = "registry"` and the registry base URL as `principalId`.
+The immutable audit identifies the human responder and reason. This label in
+the existing publisher's pack listing, together with that audit, notifies the
+publisher; it does not request approval or confer ownership. The publisher
+keeps publishing through its ordinary credentials.

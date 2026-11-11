@@ -391,6 +391,7 @@ def _protect_security_audit(_table: Table, connection: Connection, **_kwargs: An
             f"CREATE TRIGGER security_audit_{operation.lower()} "
             f"BEFORE {operation} ON audit_events FOR EACH ROW "
             "WHEN OLD.event_type LIKE 'security.%' "
+            "OR OLD.event_type = 'release_candidate.submitted' "
             "BEGIN SELECT RAISE(ABORT, 'security audit records are immutable'); END"
         )
 
