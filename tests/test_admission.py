@@ -905,6 +905,7 @@ def test_active_dependency_is_validated_and_recorded(
     candidate_id = service.submit(data, pack_name="dependent-pack", version="1.2.3")
     assert service.run_once()
     assert service.status(candidate_id).status == "accepted", service.status(candidate_id)
+    assert service.run_once()
     schemas = json.loads(store.read("static/packs/dependent-pack/1.2.3/schemas.json"))["schemas"]
     assert (
         next(item for item in schemas if item["nodeType"] == "dependent-pack.resize")["schema"][
@@ -1360,8 +1361,7 @@ def _assert_reviewed_rescan_decision(
     with _client(database_url, tmp_path / "objects") as client:
         response = client.get("/v1/packs/reviewed-rescan-pack")
         assert response.status_code == (200 if accepted else 404)
-        if not accepted:
-            assert service.run_once()
+        assert service.run_once()
         for key in ("packs/index.json", "locales/index.json"):
             index = client.get(f"/static/{key}")
             assert index.status_code == 200
@@ -1460,6 +1460,14 @@ def test_burst_admission_publishes_exactly_the_accepted_release_set(
         service.submit(_archive(tmp_path, name), pack_name=name, version="1.2.3") for name in names
     ]
     candidates.append(service.submit(b"invalid", pack_name="burst-invalid", version="9.0.0"))
+    assert service.run_once()
+    assert service.status(candidates[0]).status == "accepted"
+    assert service.status(candidates[1]).status == "queued"
+    assert not service.object_store.exists("static/packs/index.json")
+    assert service.run_once()
+    assert service.status(candidates[1]).status == "accepted"
+    assert service.status(candidates[2]).status == "queued"
+    assert not service.object_store.exists("static/packs/index.json")
     for _ in range(20):
         if not service.run_once():
             break
