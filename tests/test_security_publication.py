@@ -137,6 +137,15 @@ def test_publication_recovers_exact_signed_bytes_without_losing_later_changes(
             }
         ),
     )
+    # A clock adjustment cannot move a newer revision ahead of a prepared retry.
+    with database.session() as session, session.begin():
+        events = list(
+            session.scalars(select(OutboxRecord).where(OutboxRecord.topic == "security.publish"))
+        )
+        oldest_time = min(event.created_at for event in events)
+        newer = next(event for event in events if event.payload["revision"] == corrected.revision)
+        newer.created_at = oldest_time - timedelta(seconds=1)
+        newer.available_at = newer.created_at
     # A new process retries the prepared envelope, then publishes the later correction.
     recovered = SecurityPublication(database, store, "http://testserver", path)
     assert recovered.deliver_one()

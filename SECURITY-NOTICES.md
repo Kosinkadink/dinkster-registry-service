@@ -208,7 +208,8 @@ changes into a complete snapshot under the security transaction lock and saves
 its signed bytes durably before any external write. Atomic object replacement
 precedes acknowledgement. Failed writes, ambiguous success and process crashes
 retry those same bytes, including issue/expiry times and revision. Later changes
-remain queued behind that snapshot. Replicas serialize replacement so an older
+remain queued behind that snapshot in durable revision order, not timestamp
+order. Replicas serialize replacement so an older
 snapshot cannot overwrite a newer one. There is no pointer to a second object
 that a reader could observe before its target exists.
 

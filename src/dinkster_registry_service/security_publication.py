@@ -35,7 +35,7 @@ class SecurityPublication:
                     .where(
                         OutboxRecord.topic == "security.publish", OutboxRecord.state == "pending"
                     )
-                    .order_by(OutboxRecord.created_at, OutboxRecord.id)
+                    .order_by(OutboxRecord.payload["revision"].as_integer())
                 )
             )
             if not pending:
@@ -69,7 +69,7 @@ class SecurityPublication:
                     .where(
                         OutboxRecord.topic == "security.publish", OutboxRecord.state == "pending"
                     )
-                    .order_by(OutboxRecord.created_at, OutboxRecord.id)
+                    .order_by(OutboxRecord.payload["revision"].as_integer())
                 )
             )
             if not events or "envelope" not in events[0].payload:
