@@ -1,4 +1,5 @@
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
@@ -65,9 +66,9 @@ def _json(value: object, status: int = 200) -> JSONResponse:
     return JSONResponse(value, status_code=status, headers={"Cache-Control": "no-store"})
 
 
-def account_router(database: Database, settings: ServerSettings) -> APIRouter:
-    router = APIRouter(prefix="/v1/account", tags=["publisher account"])
-    principals = PrincipalRepository(database)
+def management_identity(
+    settings: ServerSettings,
+) -> Callable[[Request], Awaitable[PublisherIdentity]]:
     verifier = TokenVerifier(
         issuer=settings.identity_issuer,
         audience=settings.identity_audience,
@@ -111,6 +112,14 @@ def account_router(database: Database, settings: ServerSettings) -> APIRouter:
                 raise AccountError(403, "Personal management context is required.")
             subject = principal.principal_id
         return PublisherIdentity(subject, principal.principal_id, name)
+
+    return identity
+
+
+def account_router(database: Database, settings: ServerSettings) -> APIRouter:
+    router = APIRouter(prefix="/v1/account", tags=["publisher account"])
+    principals = PrincipalRepository(database)
+    identity = management_identity(settings)
 
     def publisher(identity: PublisherIdentity, *, claim: bool = False) -> str:
         now = datetime.now(UTC).isoformat()

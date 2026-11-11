@@ -14,6 +14,7 @@ from typing import Any, cast
 from uuid import UUID
 
 import tomli_w
+from dinkster_registry import RegistryError, TokenRecord
 from dinkster_registry.archive_admission import (
     SCAN_POLICY_VERSION,
     AdmissionFinding,
@@ -57,6 +58,13 @@ from .ids import uuid7
 from .indexes import StaticIndexes, queue_index_rebuild
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStore, ObjectStoreError
 from .pack_locks import lock_object_key, parse_pack_locks, quarantine_lock_key
+from .principals import PrincipalRepository
+from .security_repository import (
+    SecurityRepository,
+    UploadAuthorization,
+    UploadStopped,
+    lock_security,
+)
 from .seed import MEDIA_TYPE
 from .settings import ServerSettings
 from .versioning import public_version_key, require_public_version
@@ -158,6 +166,73 @@ def _vulnerabilities() -> dict[str, object]:
 
 
 class AdmissionService:
+    def yank(
+        self, pack_name: str, version: str, *, reason: str, token: TokenRecord | None = None
+    ) -> None:
+        """Withdraw a release without deleting files or changing security classification.
+
+        HTTP callers supply a verified publisher token. The local operator CLI
+        uses the same transaction without a publishing credential.
+        """
+        if not reason.strip():
+            raise RegistryError("yank reason must not be blank")
+        with self.database.session() as session, session.begin():
+            lock_security(session)
+            pack = session.scalar(select(PackRecord).where(PackRecord.name == pack_name))
+            if token is not None:
+                PrincipalRepository.require_current_token(
+                    session,
+                    token,
+                    pack.publisher_id if pack is not None and pack.publisher_id else "",
+                    pack_name,
+                )
+            release = session.scalar(
+                select(ReleaseRecord)
+                .join(PackRecord)
+                .where(PackRecord.name == pack_name, ReleaseRecord.version == version)
+                .with_for_update(of=ReleaseRecord)
+            )
+            if release is None:
+                raise RegistryError(f"unknown release {pack_name} {version}")
+            if release.state != "active":
+                raise RegistryError(f"release is {release.state}; only active can be yanked")
+            now = datetime.now(UTC)
+            release.state = "yanked"
+            release.state_reason = reason
+            release.state_changed_at = now
+            pack = session.get(PackRecord, release.pack_id, with_for_update=True)
+            assert pack is not None
+            if pack.latest_version == release.version:
+                alternatives = session.scalars(
+                    select(ReleaseRecord).where(
+                        ReleaseRecord.pack_id == pack.id, ReleaseRecord.state == "active"
+                    )
+                )
+                latest = max(alternatives, key=lambda row: Version(row.version), default=None)
+                if latest is not None:
+                    pack.latest_version = latest.version
+            pack.updated_at = now
+            session.add(
+                AuditEventRecord(
+                    id=uuid7(),
+                    created_at=now,
+                    event_type="release.yanked",
+                    subject_type="release",
+                    subject_id=str(release.id),
+                    data={
+                        "actor": token.minted_by if token is not None else "operator",
+                        "reason": reason,
+                    },
+                )
+            )
+            queue_index_rebuild(session)
+        try:
+            self.indexes.rebuild()
+        except ObjectStoreError as exc:
+            raise RegistryError(
+                "release yanked, but index rebuild failed; durable rebuild remains queued"
+            ) from exc
+
     def __init__(
         self,
         database: Database,
@@ -189,9 +264,13 @@ class AdmissionService:
         declared_digest: str | None = None,
         declared_size: int | None = None,
         locks: bytes | None = None,
+        authorization: UploadAuthorization | None = None,
     ) -> UUID:
         require_canonical_pack_name(pack_name)
         require_public_version(version)
+        if authorization is not None:
+            publisher = authorization.publisher
+            submitted_by = authorization.actor
         if not submitted_by or len(submitted_by) > 128:
             raise AdmissionError("submitted_by must contain 1 through 128 characters")
         digest = artifact_digest(archive) if declared_digest is None else declared_digest
@@ -219,6 +298,10 @@ class AdmissionService:
             for lock in prepared:
                 self.object_store.put(quarantine_lock_key(candidate_id, lock.variant), lock.data)
             with self.database.session() as session, session.begin():
+                lock_security(session)
+                if authorization is not None:
+                    SecurityRepository.require_authorization(session, authorization, pack_name)
+                SecurityRepository.require_uploads(session, pack_name, publisher)
                 supersedes = None
                 if prepared:
                     if self.database.is_postgresql:
@@ -226,8 +309,6 @@ class AdmissionService:
                             text("SELECT pg_advisory_xact_lock(hashtext(:identity))"),
                             {"identity": f"{pack_name}:{public_version_key(version)}"},
                         )
-                    else:
-                        session.execute(text("BEGIN IMMEDIATE"))
                     previous_candidates = session.scalars(
                         select(ReleaseCandidateRecord)
                         .where(
@@ -301,6 +382,9 @@ class AdmissionService:
                             "packName": pack_name,
                             "version": version,
                             "digest": digest,
+                            "authorization": authorization.model_dump()
+                            if authorization is not None
+                            else None,
                             **({"supersedesCandidateId": supersedes} if supersedes else {}),
                         },
                     )
@@ -634,9 +718,9 @@ class AdmissionService:
         try:
             wheel = inspect_wheel(data, claim.pack_name, claim.version)
             with self.database.session() as session, session.begin():
-                if not self.database.is_postgresql:
-                    session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+                lock_security(session)
                 candidate = self._leased_candidate(session, claim)
+                authorization = SecurityRepository.require_candidate_upload(session, candidate)
                 if self.database.is_postgresql:
                     session.execute(
                         text("SELECT pg_advisory_xact_lock(hashtext(:pack_name))"),
@@ -766,8 +850,12 @@ class AdmissionService:
                     state_reason=None,
                     state_changed_at=now,
                     published_at=now,
-                    published_by_kind="interactive",
-                    published_by_principal_id=candidate.submitted_by,
+                    published_by_kind="registry"
+                    if authorization is not None and authorization.security_reason is not None
+                    else "interactive",
+                    published_by_principal_id=self.settings.public_base_url
+                    if authorization is not None and authorization.security_reason is not None
+                    else candidate.submitted_by,
                     artifact_digest=candidate.declared_digest,
                     manifest=manifest,
                     install_locks=candidate.install_locks,
@@ -859,6 +947,9 @@ class AdmissionService:
                         data={
                             "candidateId": str(candidate.id),
                             "digest": candidate.declared_digest,
+                            "authorization": authorization.model_dump()
+                            if authorization is not None
+                            else None,
                         },
                     )
                 )
@@ -889,7 +980,7 @@ class AdmissionService:
                 StageResult((AdmissionFinding(exc.code, "error", "block", str(exc)),)),
             )
             return
-        except PromotionConflict as exc:
+        except (PromotionConflict, RegistryError) as exc:
             self._record_promotion_conflict(claim, str(exc))
             return
         self.deliver_one_promotion()
@@ -898,6 +989,7 @@ class AdmissionService:
         failure: BaseException | None = None
         source_key = ""
         with self.database.session() as session, session.begin():
+            lock_security(session)
             outbox = session.scalar(
                 select(OutboxRecord)
                 .where(
@@ -920,6 +1012,32 @@ class AdmissionService:
             release = session.get(ReleaseRecord, release_id)
             if candidate is None or release is None:
                 raise AdmissionError("promotion outbox references absent catalog state")
+            try:
+                SecurityRepository.require_candidate_upload(session, candidate)
+            except UploadStopped:
+                outbox.available_at = datetime.now(UTC) + timedelta(seconds=60)
+                candidate.status_reason = "uploads-stopped"
+                return True
+            except RegistryError as exc:
+                now = datetime.now(UTC)
+                candidate.status = "rejected"
+                candidate.status_reason = "publication-unauthorized"
+                release.state = "rejected"
+                release.state_reason = "publication-unauthorized"
+                release.state_changed_at = now
+                outbox.state = "delivered"
+                outbox.delivered_at = now
+                session.add(
+                    AuditEventRecord(
+                        id=uuid7(),
+                        created_at=now,
+                        event_type="release.publication_refused",
+                        subject_type="release",
+                        subject_id=str(release.id),
+                        data={"candidateId": str(candidate.id), "reason": str(exc)},
+                    )
+                )
+                return True
             try:
                 if self.object_store.exists(source_key):
                     data = self.object_store.read(source_key, max_size=MAX_ARTIFACT_SIZE)

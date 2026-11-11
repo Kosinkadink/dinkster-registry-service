@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import cast
 
 from dinkster_registry import (
@@ -254,6 +255,27 @@ class PrincipalRepository:
         with self.database.session() as session:
             directory, _ = self._load(session)
             directory.authorize_token(token, publisher, pack)
+
+    @staticmethod
+    def require_current_token(
+        session: Session, token: TokenRecord, publisher: str, pack: str
+    ) -> None:
+        """Recheck a previously verified credential inside its mutation transaction."""
+        session.get(PublisherRecord, token.publisher, with_for_update=True)
+        session.get(PublisherTokenRecord, token.token_id, with_for_update=True)
+        directory, _ = PrincipalRepository._load(session)
+        current = next(
+            (row for row in directory.tokens(token.publisher) if row.token_id == token.token_id),
+            None,
+        )
+        if (
+            current != token
+            or token.revoked
+            or datetime.fromisoformat(token.expires_at) <= datetime.now(UTC)
+        ):
+            raise RegistryError("publishing credential is no longer authorized")
+        directory.authorize(token.minted_by, publisher, "publish")
+        directory.authorize_token(token, publisher, pack)
 
     def administered_tokens(
         self, publisher: str, actor: str, *, identity_subject: str | None = None

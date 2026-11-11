@@ -12,14 +12,12 @@ from uuid import UUID
 
 import uvicorn
 from dinkster_registry import RegistryError
-from packaging.version import Version
-from sqlalchemy import select
 
 from .admission import AdmissionService
 from .app import create_app
-from .database import Database, PackRecord, ReleaseRecord
-from .indexes import StaticIndexes, queue_index_rebuild
-from .object_store import MAX_ARTIFACT_SIZE, ObjectStoreError
+from .database import Database
+from .indexes import StaticIndexes
+from .object_store import MAX_ARTIFACT_SIZE
 from .ownership import transfer_ownership
 from .principals import PrincipalRepository
 from .seed import seed_fixtures
@@ -172,49 +170,9 @@ def main() -> None:
         now = datetime.now(UTC).isoformat()
         try:
             if args.admin_command == "yank":
-                if not args.reason.strip():
-                    raise RegistryError("yank reason must not be blank")
-                indexes = StaticIndexes(
-                    database, settings.create_object_store(), settings.public_base_url
+                AdmissionService(database, settings.create_object_store(), settings=settings).yank(
+                    args.pack, args.version, reason=args.reason
                 )
-                with database.session() as session, session.begin():
-                    if not database.is_postgresql:
-                        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
-                    release = session.scalar(
-                        select(ReleaseRecord)
-                        .join(PackRecord)
-                        .where(PackRecord.name == args.pack, ReleaseRecord.version == args.version)
-                        .with_for_update(of=ReleaseRecord)
-                    )
-                    if release is None:
-                        raise RegistryError(f"unknown release {args.pack} {args.version}")
-                    if release.state != "active":
-                        raise RegistryError(
-                            f"release is {release.state}; only active can be yanked"
-                        )
-                    release.state = "yanked"
-                    release.state_reason = args.reason
-                    release.state_changed_at = datetime.now(UTC)
-                    pack = session.get(PackRecord, release.pack_id, with_for_update=True)
-                    assert pack is not None
-                    if pack.latest_version == release.version:
-                        alternatives = session.scalars(
-                            select(ReleaseRecord).where(
-                                ReleaseRecord.pack_id == pack.id,
-                                ReleaseRecord.state == "active",
-                            )
-                        )
-                        latest = max(alternatives, key=lambda r: Version(r.version), default=None)
-                        if latest is not None:
-                            pack.latest_version = latest.version
-                    pack.updated_at = release.state_changed_at
-                    queue_index_rebuild(session)
-                try:
-                    indexes.rebuild()
-                except ObjectStoreError as exc:
-                    raise RegistryError(
-                        "release yanked, but index rebuild failed; durable rebuild remains queued"
-                    ) from exc
                 print(f"yanked {args.pack} {args.version}; public indexes rebuilt")
             elif args.admin_command == "add-user":
                 principals.register_user(args.user)

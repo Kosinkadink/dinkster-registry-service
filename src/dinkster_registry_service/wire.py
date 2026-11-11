@@ -99,7 +99,7 @@ class ReleasePage(ResponseModel):
 
 
 class Publisher(ResponseModel):
-    kind: Literal["github_actions_oidc", "api_key", "interactive"]
+    kind: Literal["github_actions_oidc", "api_key", "interactive", "registry"]
     principal_id: str
 
 
