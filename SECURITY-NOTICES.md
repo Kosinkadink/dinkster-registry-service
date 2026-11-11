@@ -191,3 +191,60 @@ uses the same withdrawal operation. Actor and reason are audited; immutable
 artifact/lock bytes remain downloadable, public indexes exclude the release,
 and any security classification remains in force. Withdrawal cannot lift a
 security notice or relabel a maintenance release as publisher-authored.
+
+## Static publication and file-copy mirrors
+
+The scanner publishes the complete signed envelope at
+`static/security/index.json` in its object store. The service exposes those
+exact bytes at both `/static/security/index.json` and `/v1/security/blocks`.
+Both return the same content ETag and support conditional GET; the static route
+also supports HEAD and public CORS. Until the first document is published,
+retrieval returns 404, never a fabricated empty or safe verdict. There is no
+cursor, delta response or unsigned compatibility response.
+
+Set `DINKSTER_SECURITY_SIGNING_KEY_PATH` on the scanner to an independently
+provisioned, scanner-readable Ed25519 PKCS8 PEM private-key file. Keep it outside
+public objects and the checkout, with restricted permissions. No key is
+generated, installed or fetched automatically. Without this setting publication
+stays queued; ordinary admission and catalog delivery continue. Web readers
+and mirrors do not need the key. Provision the public trust root independently
+as described above, never by trusting a key obtained from this feed.
+
+Accepted notice mutations and ownership transfers queue publication in the same
+database transaction as their audit records. The scanner coalesces pending
+changes into a complete snapshot under the security transaction lock and saves
+its signed bytes durably before any external write. Atomic object replacement
+precedes acknowledgement. Failed writes, ambiguous success and process crashes
+retry those same bytes, including issue/expiry times and revision. Later changes
+remain queued behind that snapshot in durable revision order, not timestamp
+order. Replicas serialize replacement so an older
+snapshot cannot overwrite a newer one. There is no pointer to a second object
+that a reader could observe before its target exists.
+
+Copy `static/security/index.json` unchanged to `security/index.json` below the
+mirror's static root. A normal file server can then serve
+`<mirror-root>/security/index.json`; no registry API, database, credentials or
+private key is needed there. Copy the same file to removable media for import.
+Pass its complete bytes to `verify_security_document(data, independent_trust,
+previous=last_accepted_document)`, then atomically retain the accepted document
+and its original bytes with the revision checkpoint. Preserve the issuing
+registry identity even when the transport URL is a mirror or local file. An
+older, forged, malformed or wrong-registry copy is rejected without replacing
+the accepted checkpoint. Copying pack indexes alone does not convey a security
+verdict. The independent trust/rotation channel is separate from these files.
+
+`issuedAt`, `expiresAt` and `revision` are signed. Snapshots expire one day after
+issue; this is metadata, not a default execution refusal. Publication is
+change-driven, not a heartbeat or an assertion that no new incidents exist.
+Consumers record last successful verification separately and may opt into a
+freshness policy. Outage or expiry neither clears cached notices nor adds a
+classification; it does not manufacture a "security status unknown" incident.
+Known notices remain usable offline. Authenticated rotation or independent
+recovery replaces trust without deleting cached notices or revision state;
+changing the scanner key alone does not authorize that new key to consumers.
+
+Publication writes only the security object. Upload controls do not become
+execution classifications; ordinary yanks do not clear notices. Catalog,
+per-pack versions, replacement/simple indexes and wheel/lock bytes retain their
+contracts. No public signing credentials, production deployment, automatic fix
+installation or artifact deletion is part of publication.

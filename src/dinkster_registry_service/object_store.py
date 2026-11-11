@@ -14,7 +14,8 @@ from botocore.exceptions import BotoCoreError, ClientError  # type: ignore[impor
 MAX_ARTIFACT_SIZE = 64 * 1024 * 1024
 READ_CHUNK_SIZE = 64 * 1024
 INDEX_KEYS = frozenset(
-    f"static/{name}/index.json" for name in ("packs", "locales", "schemas", "replacements")
+    f"static/{name}/index.json"
+    for name in ("packs", "locales", "schemas", "replacements", "security")
 )
 
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
 
@@ -30,7 +29,6 @@ from .wire import (
     ReleaseDetail,
     ReleasePage,
     SchemasResponse,
-    SecurityBlocksResponse,
 )
 
 
@@ -653,18 +651,6 @@ class CatalogRepository:
                 .limit(1)
             ).one_or_none()
             return None if row is None else (row[0], row[1], row[2])
-
-    def security_blocks(self) -> SecurityBlocksResponse:
-        with self.database.session() as session:
-            # A persisted block feed must derive this timestamp from block records.
-            generated_at = session.scalar(select(func.max(PackRecord.updated_at)))
-            return SecurityBlocksResponse.model_validate(
-                {
-                    "generatedAt": generated_at or datetime(1970, 1, 1, tzinfo=UTC),
-                    "items": [],
-                    "nextCursor": None,
-                }
-            )
 
     def health(self) -> HealthResponse:
         with self.database.session() as session:

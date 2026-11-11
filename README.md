@@ -401,7 +401,7 @@ All catalog routes are under `/v1` and use camelCase JSON fields:
 | GET | `/v1/nodes/{nodeType}/providers` | Find active compatible providers for a node type. |
 | POST | `/v1/packs/{name}/versions/{version}/download-tickets` | Get an immutable public artifact URL. |
 | GET | `/v1/artifacts/{digest}` | Download and verify an active or yanked public release archive. |
-| GET | `/v1/security/blocks` | Read the public digest block feed, currently empty. |
+| GET | `/v1/security/blocks` | Read the complete signed envelope also served at `/static/security/index.json`; see SECURITY-NOTICES.md for independent trust and file-copy mirroring. |
 
 Browse accepts `q`, `ownerType`, `owner`, `nodeType`, `visibility`, `sort`,
 `limit`, and opaque `cursor` parameters. Only `visibility=public` is available

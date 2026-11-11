@@ -96,6 +96,9 @@ def test_s3_store_is_immutable_and_streams_verified_objects(s3_store: S3ObjectSt
     s3_store.replace_index("static/packs/index.json", b'{"items":[]}')
     s3_store.replace_index("static/packs/index.json", b'{"items":[1]}')
     assert s3_store.read("static/packs/index.json") == b'{"items":[1]}'
+    s3_store.replace_index("static/security/index.json", b'{"signed":{"revision":1}}')
+    s3_store.replace_index("static/security/index.json", b'{"signed":{"revision":2}}')
+    assert s3_store.read("static/security/index.json") == b'{"signed":{"revision":2}}'
     with pytest.raises(ObjectStoreError, match="only public static indexes"):
         s3_store.replace_index(key, b"replacement bytes")
     assert s3_store.read(key) == data

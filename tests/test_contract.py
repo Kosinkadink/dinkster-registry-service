@@ -36,7 +36,6 @@ from dinkster_registry_service.wire import (
     ReleaseManifest,
     ReleasePage,
     SchemasResponse,
-    SecurityBlocksResponse,
 )
 
 PUBLIC_CACHE = "public, max-age=60, stale-while-revalidate=300"
@@ -546,12 +545,11 @@ def test_pagination_cursor_is_opaque_and_query_bound(client: TestClient) -> None
     assert ErrorResponse.model_validate(forged.json()).error.code == "invalid_request"
 
 
-def test_security_block_feed_is_an_exact_empty_public_dto(client: TestClient) -> None:
+def test_unpublished_security_feed_is_not_an_empty_verdict(client: TestClient) -> None:
     response = client.get("/v1/security/blocks")
-    payload = SecurityBlocksResponse.model_validate(response.json())
-    assert payload.items == []
-    assert payload.next_cursor is None
-    assert_public_metadata(response)
+    assert response.status_code == 404
+    assert ErrorResponse.model_validate(response.json()).error.code == "not_found"
+    assert client.get("/v1/security/blocks?since=anything").status_code == 400
 
 
 def test_uuid_strings_are_uuid7(client: TestClient) -> None:
