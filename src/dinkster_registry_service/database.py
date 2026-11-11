@@ -90,6 +90,26 @@ class PublisherTokenRecord(Base):
     revoked_reason: Mapped[str] = mapped_column(Text, default="")
 
 
+class PublisherFreezeRecord(Base):
+    __tablename__ = "publisher_freezes"
+
+    publisher_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("publishers.id", ondelete="RESTRICT"), primary_key=True
+    )
+    actor: Mapped[str] = mapped_column(String(128))
+    at: Mapped[str] = mapped_column(String(64))
+    reason: Mapped[str] = mapped_column(Text)
+
+
+class PublisherBindingRecord(Base):
+    __tablename__ = "publisher_bindings"
+
+    publisher_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("publishers.id", ondelete="RESTRICT"), primary_key=True
+    )
+    identity_subject: Mapped[str] = mapped_column(String(128), unique=True)
+
+
 class PrincipalAuditRecord(Base):
     __tablename__ = "principal_audit"
 
@@ -465,6 +485,13 @@ class Database:
                             f"ALTER TABLE {table} ADD COLUMN install_locks JSON NOT NULL "
                             "DEFAULT '{}'"
                         )
+                for operation in ("UPDATE", "DELETE"):
+                    connection.exec_driver_sql(
+                        f"CREATE TRIGGER IF NOT EXISTS ownership_audit_no_{operation.lower()} "
+                        f"BEFORE {operation} ON audit_events "
+                        "WHEN OLD.event_type = 'ownership.transferred' "
+                        "BEGIN SELECT RAISE(ABORT, 'ownership audit is append-only'); END"
+                    )
         self._sessions = sessionmaker(self.engine, expire_on_commit=False)
 
     @property

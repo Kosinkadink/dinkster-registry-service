@@ -61,3 +61,42 @@ def test_only_an_operator_can_add_later_operators(tmp_path: Path) -> None:
 
     repository.add_operator("second", "first", now)
     assert repository.is_operator("second")
+
+
+def test_operator_freeze_revokes_all_scopes_and_prevents_new_tokens(tmp_path: Path) -> None:
+    path = tmp_path / "registry.db"
+    repository = _repository(path)
+    now = datetime.now(UTC)
+    expires = (now + timedelta(days=1)).isoformat()
+    for user in ("operator", "owner"):
+        repository.register_user(user)
+    repository.add_operator("operator", "operator", now.isoformat())
+    repository.register_publisher("disputed", "owner", now.isoformat())
+    repository.register_publisher("unaffected", "owner", now.isoformat())
+    tokens = [
+        repository.mint_token("disputed", "owner", now.isoformat(), expires, pack=pack)[0]
+        for pack in (None, "example-pack")
+    ]
+    unaffected, _ = repository.mint_token("unaffected", "owner", now.isoformat(), expires)
+    with pytest.raises(RegistryError, match="registry operator"):
+        repository.freeze_publisher("disputed", "owner", now.isoformat(), "disputed ownership")
+    for token in tokens:
+        assert repository.verify_token(token, now.isoformat()).publisher == "disputed"
+
+    repository.freeze_publisher("disputed", "operator", now.isoformat(), "disputed ownership")
+    reopened = _repository(path)
+    for token in tokens:
+        with pytest.raises(RegistryError, match="revoked"):
+            reopened.verify_token(token, now.isoformat())
+    with pytest.raises(RegistryError, match="frozen"):
+        reopened.mint_token("disputed", "owner", now.isoformat(), expires)
+    assert reopened.verify_token(unaffected, now.isoformat()).publisher == "unaffected"
+    events = reopened.audit()
+    assert [event.action for event in events[-3:]] == [
+        "freeze-publisher",
+        "revoke-token",
+        "revoke-token",
+    ]
+    assert all(event.actor == "operator" for event in events[-3:])
+    reopened.freeze_publisher("disputed", "operator", now.isoformat(), "repeat")
+    assert reopened.audit() == events

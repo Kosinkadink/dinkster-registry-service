@@ -387,8 +387,10 @@ All catalog routes are under `/v1` and use camelCase JSON fields:
 | POST | `/v1/publish/{name}/versions/{version}` | Submit archive bytes with a publisher token. |
 | GET | `/v1/publish/{candidateId}` | Read publisher-scoped admission status. |
 | POST | `/v1/reviews/{candidateId}` | Accept or reject a candidate as a registry operator. |
-| GET | `/v1/tokens` | List publisher token metadata as an owner. |
-| POST | `/v1/tokens/{tokenId}/revoke` | Revoke a publisher token. |
+| POST | `/v1/account/publisher` | Claim the publisher attested by a Dinkster human identity. |
+| GET | `/v1/account/tokens` | List that publisher's token metadata. |
+| POST | `/v1/account/tokens` | Create an expiring publisher or single-pack publish token. |
+| POST | `/v1/account/tokens/{tokenId}/revoke` | Revoke that publisher's token. |
 | GET | `/v1/packs` | Search, filter, sort, and browse public packs. |
 | GET | `/v1/packs/{name}` | Read pack metadata. |
 | GET | `/v1/packs/{name}/versions` | List active releases, optionally including yanks. |
@@ -487,6 +489,57 @@ Errors use one envelope:
 ```
 
 ## Identity and version rules
+
+Publisher account routes accept only a signed human management token from the
+configured identity service. The fixed audience is `dinkster-registry`; the
+issuer and JWKS endpoint default to `https://id.dinkster.org` and
+`https://id.dinkster.org/.well-known/jwks.json`. Self-hosted installations set
+`DINKSTER_IDENTITY_ISSUER` and, if needed, `DINKSTER_IDENTITY_AUDIENCE` to match
+their identity deployment. No registry sign-in provider or session cookie exists.
+Browser account requests are permitted only from that identity origin.
+
+The identity service attests the allowed publisher spelling in a
+`registry:publisher:<name>` capability alongside `registry:manage`, under one
+personal default-project or organization context. The registry binds personal
+publishers to `u_<account UUID>` and organizations to `org:<organization UUID>`.
+Names submitted by a client grant no ownership. Existing publisher names and
+`dinkster` remain reserved; signing in with a matching handle does not take them
+over or grant official publisher privileges. Claims survive account renaming
+because the binding uses the immutable subject, not the display name.
+
+Create a publishing credential with `POST /v1/account/tokens` and a JSON body
+containing `expires_at` (a timezone-qualified timestamp in the future, at most
+90 days away) and optional canonical `pack`. Omitting `pack` permits publishing
+any pack owned by that publisher. The create response returns `secret` once;
+listing returns metadata without the plaintext or hash. Revoke with a nonblank
+`reason`. All account responses are `no-store`. Publishing credentials cannot
+create accounts, claim names or administer other credentials. The former
+bearer-publishing-token administration endpoints are removed; existing tokens
+continue to authenticate uploads and candidate status until expired or revoked.
+
+Authors open `https://id.dinkster.org/registry`, sign in with their Dinkster
+account, choose their account or organization, and claim the attested publisher.
+Create a token with an expiry and optional pack name, save the one-time value
+in a secret manager or publishing workflow secret, then use it for the publish
+endpoint. Refresh lists metadata only. Revoke on the same page to stop further
+uploads. No server access or admin command is needed for an ordinary author.
+
+An operator can freeze a disputed publisher with the audited
+`admin freeze-publisher <publisher> --user <operator> --reason <reason>` command.
+The freeze revokes its existing publishing tokens and prevents new minting in
+one serialized transaction. Published releases are not changed. No such command
+is part of an ordinary author's registration or publishing journey.
+
+The single audited binding/correction command is
+`admin bind-publisher <publisher> --user <operator> --identity-subject <subject>
+--expected-owner <current-subject-or-unbound> --reason <reason>` (one line).
+The operator independently confirms the target's immutable `u_<UUID>` or
+`org:<UUID>` identity, never infers ownership from a matching email or name.
+The command compares the expected owner under lock, replaces the binding and
+old memberships, clears the freeze and appends an immutable ownership event.
+Rebinding revokes all old publisher tokens; initial binding of a reserved name
+keeps existing tokens until the confirmed first-party cutover. Published files,
+admission and tiers stay unchanged. This is not a bulk migration tool.
 
 Pack names use Dinkster's shared closed grammar: 1 through 64 lowercase ASCII
 characters, starting with a letter, with alphanumeric segments separated by
