@@ -13,7 +13,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from blake3 import blake3
-from dinkster_registry import RegistryError, TokenRecord
+from dinkster_registry import TOKEN_PREFIX, RegistryError, TokenRecord
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from packaging.version import InvalidVersion, Version
@@ -25,7 +25,7 @@ from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response, StreamingResponse
 
-from .accounts import AccountError, account_router
+from .accounts import AccountError, account_router, management_identity
 from .admission import AdmissionError, AdmissionService, CandidateStatus
 from .cursors import CursorCodec, CursorError
 from .database import Database, ReleaseCandidateRecord
@@ -308,6 +308,15 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     app.state.database = database
     app.state.object_store = object_store
     app.include_router(account_router(database, configured))
+    identity = management_identity(configured)
+
+    async def security_actor(request: Request) -> tuple[str, TokenRecord | None]:
+        scheme, _, credential = request.headers.get("authorization", "").partition(" ")
+        if scheme == "Bearer" and credential.startswith(TOKEN_PREFIX):
+            token = _authenticate(request, principals)
+            return token.minted_by, token
+        who = await identity(request)
+        return who.actor, None
 
     @app.middleware("http")
     async def request_metadata(request: Request, call_next: Any) -> Response:
@@ -594,11 +603,11 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         )
 
     @app.put("/v1/security/uploads")
-    def set_upload_control(request: Request, body: UploadChange) -> Response:
+    async def set_upload_control(request: Request, body: UploadChange) -> Response:
         _query(request, EmptyQuery)
-        token = _authenticate(request, principals)
+        actor, token = await security_actor(request)
         try:
-            security.set_uploads(actor=token.minted_by, change=body, token=token)
+            security.set_uploads(actor=actor, change=body, token=token)
         except RegistryError as exc:
             raise ProtocolError(403, "forbidden", str(exc)) from None
         return _json_response(
@@ -610,15 +619,11 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         )
 
     @app.put("/v1/security/roles/{user}")
-    def set_security_role(request: Request, user: str, body: SecurityRoleRequest) -> Response:
+    async def set_security_role(request: Request, user: str, body: SecurityRoleRequest) -> Response:
         _query(request, EmptyQuery)
-        token = _authenticate(request, principals)
-        if token.pack is not None:
-            raise ProtocolError(403, "forbidden", "Role administration needs an unscoped token.")
+        who = await identity(request)
         try:
-            security.set_role(
-                actor=token.minted_by, user=user, enabled=body.enabled, reason=body.reason
-            )
+            security.set_role(actor=who.actor, user=user, enabled=body.enabled, reason=body.reason)
         except RegistryError as exc:
             raise ProtocolError(403, "forbidden", str(exc)) from None
         return _json_response(
@@ -630,9 +635,9 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         )
 
     @app.get("/v1/security/notices/history")
-    def security_notice_history(request: Request) -> Response:
+    async def security_notice_history(request: Request) -> Response:
         _query(request, EmptyQuery)
-        _authenticate(request, principals)
+        await security_actor(request)
         return _json_response(
             request,
             {"notices": [row.model_dump(mode="json", by_alias=True) for row in security.history()]},
@@ -642,11 +647,11 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         )
 
     @app.post("/v1/security/notices")
-    def change_security_notice(request: Request, body: NoticeChange) -> Response:
+    async def change_security_notice(request: Request, body: NoticeChange) -> Response:
         _query(request, EmptyQuery)
-        token = _authenticate(request, principals)
+        actor, token = await security_actor(request)
         try:
-            notice = security.change(actor=token.minted_by, change=body, token=token)
+            notice = security.change(actor=actor, change=body, token=token)
         except ValidationError as exc:
             raise ProtocolError(400, "invalid_request", str(exc)) from None
         except RegistryError as exc:

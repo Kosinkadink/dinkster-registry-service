@@ -1,17 +1,25 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
+from typing import Any
+from uuid import uuid4
 
+import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from dinkster_registry import RegistryError
+from dinkster_token_verifier import TokenVerifier
 from fastapi.testclient import TestClient
+from joserfc import jwt
+from joserfc.jwk import OKPKey
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
+from dinkster_registry_service import accounts
 from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
 from dinkster_registry_service.database import (
@@ -29,7 +37,47 @@ from dinkster_registry_service.seed import FIXTURE_ROOT, seed_fixtures
 from dinkster_registry_service.settings import ServerSettings
 
 
-def test_security_authority_history_and_clearing_survive_reopen(tmp_path: Path) -> None:
+@pytest.fixture
+def management_headers(monkeypatch: pytest.MonkeyPatch) -> Callable[..., dict[str, str]]:
+    key = OKPKey.generate_key("Ed25519", auto_kid=True)
+    jwk = {**key.as_dict(private=False), "alg": "Ed25519", "use": "sig"}
+    verifier = TokenVerifier(
+        issuer="https://id.dinkster.org",
+        audience="dinkster-registry",
+        jwks_url="https://id.dinkster.org/.well-known/jwks.json",
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"keys": [jwk]}))
+        ),
+    )
+    monkeypatch.setattr(accounts, "TokenVerifier", lambda **kwargs: verifier)
+    project = uuid4()
+
+    def credential(actor: str, name: str, **overrides: Any) -> dict[str, str]:
+        now = int(datetime.now(UTC).timestamp())
+        claims = {
+            "iss": "https://id.dinkster.org",
+            "aud": "dinkster-registry",
+            "sub": actor,
+            "kind": "human",
+            "org": None,
+            "acct": actor.removeprefix("u_"),
+            "key": None,
+            "key_scopes": None,
+            "grants": {f"project:{project}": ["registry:manage", f"registry:publisher:{name}"]},
+            "iat": now,
+            "exp": now + 60,
+            "jti": str(uuid4()),
+            **overrides,
+        }
+        token = jwt.encode({"alg": "Ed25519", "kid": key.kid}, claims, key, algorithms=["Ed25519"])
+        return {"Authorization": f"Bearer {token}"}
+
+    return credential
+
+
+def test_security_authority_history_and_clearing_survive_reopen(
+    tmp_path: Path, management_headers: Callable[..., dict[str, str]]
+) -> None:
     settings = ServerSettings(
         database_url=f"sqlite:///{tmp_path / 'security.db'}",
         object_store_root=tmp_path / "objects",
@@ -41,20 +89,30 @@ def test_security_authority_history_and_clearing_survive_reopen(tmp_path: Path) 
     principals = PrincipalRepository(database)
     now = datetime.now(UTC)
     headers = {}
+    publish_headers = {}
+    actors = {}
     for user in ("operator", "publisher", "responder", "outsider", "colleague"):
-        principals.register_user(user)
-        principals.register_publisher(user, user, now.isoformat())
+        actors[user] = actor = f"u_{uuid4()}"
+        principals.register_user(actor)
+        principals.register_publisher(user, actor, now.isoformat())
         plaintext, _ = principals.mint_token(
-            user, user, now.isoformat(), (now + timedelta(hours=1)).isoformat()
+            user, actor, now.isoformat(), (now + timedelta(hours=1)).isoformat()
         )
-        headers[user] = {"Authorization": f"Bearer {plaintext}"}
-    principals.add_operator("operator", "operator", now.isoformat())
+        publish_headers[user] = {"Authorization": f"Bearer {plaintext}"}
+        headers[user] = (
+            management_headers(actor, user)
+            if user in {"operator", "responder", "outsider"}
+            else publish_headers[user]
+        )
+    principals.add_operator(actors["operator"], actors["operator"], now.isoformat())
     with database.session() as session, session.begin():
         pack = session.scalar(select(PackRecord).where(PackRecord.name == "example-pack"))
         assert pack is not None
         pack.publisher_id = "publisher"
         session.add(
-            PublisherMembershipRecord(publisher_id="publisher", user_id="colleague", role="member")
+            PublisherMembershipRecord(
+                publisher_id="publisher", user_id=actors["colleague"], role="member"
+            )
         )
         release = session.scalar(select(ReleaseRecord).where(ReleaseRecord.pack_id == pack.id))
         assert release is not None
@@ -79,16 +137,41 @@ def test_security_authority_history_and_clearing_survive_reopen(tmp_path: Path) 
     assert client.post(endpoint, json=change).status_code == 401
     assert (
         client.put(
-            "/v1/security/roles/outsider", json=role, headers=headers["outsider"]
+            f"/v1/security/roles/{actors['outsider']}", json=role, headers=headers["outsider"]
         ).status_code
         == 403
     )
     assert (
         client.put(
-            "/v1/security/roles/responder", json=role, headers=headers["operator"]
+            f"/v1/security/roles/{actors['responder']}", json=role, headers=headers["operator"]
         ).status_code
         == 200
     )
+    assert (
+        client.put(
+            f"/v1/security/roles/{actors['outsider']}",
+            json=role,
+            headers=publish_headers["operator"],
+        ).status_code
+        == 401
+    )
+    assert (
+        client.post(endpoint, json=change, headers=publish_headers["responder"]).status_code == 403
+    )
+    for overrides in (
+        {"aud": "another-service"},
+        {"kind": "agent"},
+        {"key": str(uuid4())},
+        {"exp": int(now.timestamp()) - 1},
+    ):
+        assert (
+            client.post(
+                endpoint,
+                json=change,
+                headers=management_headers(actors["responder"], "responder", **overrides),
+            ).status_code
+            == 401
+        )
     assert client.post(endpoint, json=change, headers=headers["outsider"]).status_code == 403
     for invalid in (
         {**identity, "artifactDigest": "blake3:" + "0" * 64},
@@ -103,7 +186,7 @@ def test_security_authority_history_and_clearing_survive_reopen(tmp_path: Path) 
         )
     scoped, _ = principals.mint_token(
         "publisher",
-        "publisher",
+        actors["publisher"],
         now.isoformat(),
         (now + timedelta(hours=1)).isoformat(),
         pack="color-tools",
@@ -114,13 +197,19 @@ def test_security_authority_history_and_clearing_survive_reopen(tmp_path: Path) 
         ).status_code
         == 403
     )
+    assert (
+        client.put(
+            f"/v1/security/roles/{actors['publisher']}", json=role, headers=headers["operator"]
+        ).status_code
+        == 200
+    )
     issued = client.post(endpoint, json=change, headers=headers["publisher"])
     assert issued.status_code == 200, issued.text
     first = issued.json()
     assert first["status"] == "active" and first["authority"] == "publisher"
     withdraw = {**change, "operation": "withdraw", "expectedRevision": first["revision"]}
     colleague, _ = principals.mint_token(
-        "publisher", "colleague", now.isoformat(), (now + timedelta(hours=1)).isoformat()
+        "publisher", actors["colleague"], now.isoformat(), (now + timedelta(hours=1)).isoformat()
     )
     cleared = client.post(endpoint, json=withdraw, headers={"Authorization": f"Bearer {colleague}"})
     assert cleared.status_code == 200 and cleared.json()["status"] == "cleared"
@@ -236,7 +325,7 @@ def test_security_authority_history_and_clearing_survive_reopen(tmp_path: Path) 
 
 
 def test_upload_stops_cover_pack_and_publisher_without_changing_published_releases(
-    tmp_path: Path,
+    tmp_path: Path, management_headers: Callable[..., dict[str, str]]
 ) -> None:
     settings = ServerSettings(
         database_url=f"sqlite:///{tmp_path / 'security.db'}",
@@ -249,16 +338,24 @@ def test_upload_stops_cover_pack_and_publisher_without_changing_published_releas
     principals = PrincipalRepository(database)
     now = datetime.now(UTC)
     headers = {}
+    actors = {}
+    publish_headers = {}
     for user in ("owner", "responder", "other"):
-        principals.register_user(user)
-        principals.register_publisher(user, user, now.isoformat())
+        actors[user] = actor = f"u_{uuid4()}"
+        principals.register_user(actor)
+        principals.register_publisher(user, actor, now.isoformat())
         plaintext, _ = principals.mint_token(
-            user, user, now.isoformat(), (now + timedelta(hours=1)).isoformat()
+            user, actor, now.isoformat(), (now + timedelta(hours=1)).isoformat()
         )
-        headers[user] = {"Authorization": f"Bearer {plaintext}"}
-    principals.add_operator("owner", "owner", now.isoformat())
+        publish_headers[user] = {"Authorization": f"Bearer {plaintext}"}
+        headers[user] = (
+            management_headers(actor, user) if user == "responder" else publish_headers[user]
+        )
+    principals.add_operator(actors["owner"], actors["owner"], now.isoformat())
     repository = SecurityRepository(database, settings.public_base_url)
-    repository.set_role(actor="owner", user="responder", enabled=True, reason="response")
+    repository.set_role(
+        actor=actors["owner"], user=actors["responder"], enabled=True, reason="response"
+    )
     with database.session() as session, session.begin():
         for pack in session.scalars(select(PackRecord)):
             pack.publisher_id = "owner"
@@ -270,6 +367,7 @@ def test_upload_stops_cover_pack_and_publisher_without_changing_published_releas
     archive = build_registry_fixture_archive(FIXTURE_ROOT / "example-pack")
     endpoint = "/v1/security/uploads"
     stop = {"subjectType": "pack", "subject": "example-pack", "stopped": True, "reason": "review"}
+    assert client.put(endpoint, json=stop, headers=publish_headers["responder"]).status_code == 403
     assert client.put(endpoint, json=stop, headers=headers["other"]).status_code == 403
     assert client.put(endpoint, json=stop, headers=headers["owner"]).status_code == 200
     assert (

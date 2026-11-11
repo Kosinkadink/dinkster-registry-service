@@ -137,13 +137,12 @@ class SecurityRepository:
     ) -> SecurityNotice:
         with self.transaction() as session:
             pack, release = self._release(session, change.release)
-            security = self.is_security(session, actor)
+            security = token is None and self.is_security(session, actor)
             if token is not None:
-                if token.minted_by != actor or (security and token.pack is not None):
-                    raise RegistryError("security authority requires an unscoped actor token")
-                if not security:
-                    directory, _ = PrincipalRepository._load(session)
-                    directory.authorize_token(token, pack.publisher_id or "", pack.name)
+                if token.minted_by != actor:
+                    raise RegistryError("publisher token actor does not match its issuer")
+                directory, _ = PrincipalRepository._load(session)
+                directory.authorize_token(token, pack.publisher_id or "", pack.name)
             if not security:
                 directory, _ = PrincipalRepository._load(session)
                 if pack.publisher_id is None:
@@ -228,7 +227,7 @@ class SecurityRepository:
         self, *, actor: str, change: UploadChange, token: TokenRecord | None = None
     ) -> None:
         with self.transaction() as session:
-            security = self.is_security(session, actor)
+            security = token is None and self.is_security(session, actor)
             publisher = change.subject
             if change.subject_type == "pack":
                 pack = session.scalar(select(PackRecord).where(PackRecord.name == change.subject))
@@ -237,10 +236,8 @@ class SecurityRepository:
                 publisher = pack.publisher_id or ""
             elif session.get(PublisherRecord, publisher) is None:
                 raise RegistryError("unknown publisher")
-            if token is not None and (
-                token.minted_by != actor or (security and token.pack is not None)
-            ):
-                raise RegistryError("security authority requires an unscoped actor token")
+            if token is not None and token.minted_by != actor:
+                raise RegistryError("publisher token actor does not match its issuer")
             if not security:
                 if change.subject_type != "pack":
                     raise RegistryError("publisher-wide control requires the security role")

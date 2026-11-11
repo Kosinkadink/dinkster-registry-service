@@ -75,7 +75,9 @@ or signing credential is distributed in this repository.
 Security authority is an explicit, revocable role, separate from publisher
 membership and registry operation. An operator assigns or removes that role
 with `PUT /v1/security/roles/{user}` and `{enabled, reason}`. The bearer must be
-unscoped. Role changes preserve the actor, reason and time in the audit log.
+a current registry-audience human management credential verified through the
+same identity-service boundary as publisher account management. Role changes
+preserve the immutable human actor, reason and time in the audit log.
 
 `POST /v1/security/notices` accepts `operation`, `release`, `expectedRevision`,
 `state`, `reason`, `message`, `incident`, optional `fixedRelease`,
@@ -87,9 +89,15 @@ identity is accepted. A publisher may immediately issue a vulnerability or
 malicious report for its own release; an authorized member of that reporting
 publisher may withdraw its unconfirmed vulnerability. The audit preserves the
 reporting publisher identity as well as the individual actor. Security
-confirmation or correction prevents publisher withdrawal. Only the security role may lift a malicious report or
-confirm, correct or lift a classification. An operator without that role has
-no classification authority. Security actions require an unscoped token.
+confirmation or correction prevents publisher withdrawal. Only the security
+role may lift a malicious report or confirm, correct or lift a classification.
+An operator without that role has no classification authority. Security actions
+require verified human management identity as well as the explicit role,
+checked in the mutation transaction. Ordinary publishing tokens retain their
+publisher/pack-limited reporting and upload-control rights, even when their
+creator is a security responder or operator. A token's creator does not confer
+management authority on that token. Agent and API-key-derived credentials do
+not qualify as human management credentials.
 
 `GET /v1/security/notices/history` returns the append-only notice history to an
 authenticated caller. Each change keeps the notice identity and previous
