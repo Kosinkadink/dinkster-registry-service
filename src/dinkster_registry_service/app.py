@@ -28,7 +28,7 @@ from starlette.responses import Response, StreamingResponse
 from .accounts import AccountError, account_router, management_identity
 from .admission import AdmissionError, AdmissionService, CandidateStatus
 from .cursors import CursorCodec, CursorError
-from .database import Database, ReleaseCandidateRecord
+from .database import Database, ReleaseCandidateRecord, ReleaseSetRecord
 from .digests import DigestError, require_blake3_digest
 from .identifiers import IdentifierError, require_canonical_pack_name
 from .ids import uuid7
@@ -36,6 +36,7 @@ from .object_store import MAX_ARTIFACT_SIZE, ObjectStoreError
 from .ownership import transfer_ownership
 from .pack_locks import MAX_LOCKS_SIZE, PackLocksError, lock_object_key
 from .principals import PrincipalRepository
+from .release_sets import MAX_SET_BODY, ReleaseSetError, SetUpload, member_limit, submit_set
 from .repository import CatalogDataError, CatalogRepository
 from .scan_engine import ScanEngineError
 from .security_repository import (
@@ -44,6 +45,7 @@ from .security_repository import (
     SecurityRepository,
     UploadChange,
     UploadStopped,
+    lock_security,
 )
 from .settings import ServerSettings
 from .versioning import VersionError, require_public_version
@@ -64,6 +66,18 @@ class RequestModel(BaseModel):
 
 class EmptyQuery(RequestModel):
     pass
+
+
+class SetMember(RequestModel):
+    name: str = Field(min_length=1, max_length=64)
+    version: str = Field(min_length=1, max_length=128)
+    archive: str = Field(min_length=1, max_length=64)
+    locks: dict[str, Any] | None = None
+    engine: dict[str, str] | None = None
+
+
+class SetManifest(RequestModel):
+    members: list[SetMember] = Field(min_length=1, max_length=65)
 
 
 class LockQuery(RequestModel):
@@ -490,6 +504,96 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             if path.endswith(".whl")
             else "application/json",
             headers={**headers, "Content-Length": str(len(body))},
+        )
+
+    def set_payload(set_id: UUID, token: TokenRecord) -> dict[str, object]:
+        with database.session() as session, session.begin():
+            lock_security(session)
+            record = session.get(ReleaseSetRecord, set_id)
+            if record is None:
+                raise _not_found("The requested publish set was not found.")
+            if record.publisher_id != token.publisher and not principals.is_operator(
+                token.minted_by
+            ):
+                raise ProtocolError(403, "forbidden", "The publish set is not accessible.")
+            return {
+                "setId": str(record.id),
+                "status": record.status,
+                "reason": record.status_reason,
+                "expiresAt": record.expires_at.isoformat(),
+                "members": [
+                    _candidate_payload(admission.status(UUID(member), session=session))
+                    for member in record.members
+                ],
+            }
+
+    @app.post("/v1/publish-sets")
+    async def publish_set(request: Request) -> Response:
+        _query(request, EmptyQuery)
+        token = _authenticate(request, principals)
+        chunks = bytearray()
+        async for chunk in request.stream():
+            if len(chunks) + len(chunk) > MAX_SET_BODY:
+                raise ProtocolError(413, "artifact_too_large", "Set body exceeds 128 MiB.")
+            chunks.extend(chunk)
+
+        async def receive_body() -> dict[str, Any]:
+            return {"type": "http.request", "body": bytes(chunks), "more_body": False}
+
+        bounded = Request(request.scope, receive=receive_body)
+        limit = member_limit(token.publisher)
+        try:
+            async with bounded.form(max_files=65, max_fields=1, max_part_size=MAX_SET_BODY) as form:
+                raw = form.get("manifest")
+                if not isinstance(raw, str):
+                    raise ReleaseSetError("Expected one manifest JSON field.")
+                manifest = SetManifest.model_validate_json(raw)
+                if len(manifest.members) > limit:
+                    raise ReleaseSetError(
+                        f"Requested {len(manifest.members)} members; publisher limit is {limit}."
+                    )
+                fields = [row.archive for row in manifest.members]
+                if len(set(fields)) != len(fields) or "manifest" in fields:
+                    raise ReleaseSetError("Each member requires a distinct archive field.")
+                if sorted(key for key, _ in form.multi_items()) != sorted(["manifest", *fields]):
+                    raise ReleaseSetError("Expected exactly the manifest and its wheel fields.")
+                uploads = []
+                for row in manifest.members:
+                    upload = form[row.archive]
+                    if not isinstance(upload, UploadFile):
+                        raise ReleaseSetError("Every archive field must be a wheel file.")
+                    uploads.append(
+                        SetUpload(
+                            row.name,
+                            row.version,
+                            await upload.read(),
+                            json.dumps(row.locks).encode() if row.locks is not None else None,
+                            json.dumps(row.engine).encode() if row.engine is not None else None,
+                        )
+                    )
+                set_id = submit_set(admission, uploads, token)
+        except (ReleaseSetError, PackLocksError, ScanEngineError, ValidationError) as exc:
+            raise ProtocolError(400, "invalid_request", str(exc)) from None
+        except (AdmissionError, RegistryError) as exc:
+            raise ProtocolError(409, "publish_in_progress", str(exc)) from None
+        return _json_response(
+            request,
+            set_payload(set_id, token),
+            cache_control=NO_STORE,
+            status_code=202,
+            conditional=False,
+            include_etag=False,
+        )
+
+    @app.get("/v1/publish-sets/{set_id}")
+    def publish_set_status(request: Request, set_id: UUID) -> Response:
+        _query(request, EmptyQuery)
+        return _json_response(
+            request,
+            set_payload(set_id, _authenticate(request, principals)),
+            cache_control=NO_STORE,
+            conditional=False,
+            include_etag=False,
         )
 
     @app.post("/v1/publish/{canonical_name}/versions/{canonical_version}")

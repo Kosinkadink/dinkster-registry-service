@@ -26,6 +26,8 @@ from dinkster_registry_service.database import (
     NamespaceGrantRecord,
     OutboxRecord,
     PackRecord,
+    ReleaseCandidateRecord,
+    ReleaseSetRecord,
 )
 from dinkster_registry_service.digests import artifact_digest
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore, ObjectStoreError
@@ -681,3 +683,116 @@ def test_operator_resolves_review_and_publisher_owns_catalog_grants(tmp_path: Pa
         )
         assert pack.publisher_id == "example-org"
         assert grants and {grant.publisher_id for grant in grants} == {"example-org"}
+
+
+def _publish_set(
+    client: TestClient,
+    token: str,
+    members: list[tuple[str, bytes]],
+) -> Response:
+    return client.post(
+        "/v1/publish-sets",
+        headers={"Authorization": f"Bearer {token}"},
+        data={
+            "manifest": json.dumps(
+                {
+                    "members": [
+                        {"name": name, "version": "1.2.3", "archive": f"wheel{index}"}
+                        for index, (name, _) in enumerate(members)
+                    ]
+                }
+            )
+        },
+        files={
+            f"wheel{index}": (f"{name}.whl", data) for index, (name, data) in enumerate(members)
+        },
+    )
+
+
+def test_publish_set_persists_all_members_and_replays_without_changing_expiry(
+    tmp_path: Path,
+    database: Database,
+    database_url: str,
+) -> None:
+    client, app, token = _client(tmp_path, database_url)
+    members = [(name, _archive(tmp_path, name)) for name in ("set-alpha", "set-beta")]
+    response = _publish_set(client, token, members)
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["status"] == "queued"
+    assert {row["packName"] for row in body["members"]} == {"set-alpha", "set-beta"}
+    assert {row["status"] for row in body["members"]} == {"queued"}
+    assert {row["artifactDigest"] for row in body["members"]} == {
+        artifact_digest(data) for _, data in members
+    }
+    replay = _publish_set(client, token, list(reversed(members)))
+    assert replay.status_code == 202, replay.text
+    assert replay.json() == body
+    with app.state.database.session() as session:
+        assert len(list(session.scalars(select(ReleaseSetRecord)))) == 1
+        assert len(list(session.scalars(select(ReleaseCandidateRecord)))) == 2
+    status = client.get(
+        f"/v1/publish-sets/{body['setId']}", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert status.status_code == 200
+    assert status.json() == body
+
+    changed = _publish_set(
+        client,
+        token,
+        [
+            ("set-rolled-back", _archive(tmp_path, "set-rolled-back")),
+            ("set-alpha", members[0][1] + b"changed"),
+        ],
+    )
+    assert changed.status_code == 409
+    with app.state.database.session() as session:
+        assert len(list(session.scalars(select(ReleaseSetRecord)))) == 1
+        assert len(list(session.scalars(select(ReleaseCandidateRecord)))) == 2
+
+
+@pytest.mark.parametrize("publisher,limit", [("example-org", 8), ("dinkster", 64)])
+def test_publish_set_enforces_authenticated_tier_boundaries(
+    tmp_path: Path,
+    publisher: str,
+    limit: int,
+) -> None:
+    client, app, token = _client(tmp_path)
+    if publisher == "dinkster":
+        principals = PrincipalRepository(app.state.database)
+        now = datetime.now(UTC)
+        principals.register_publisher(publisher, "owner", now.isoformat())
+        token, _ = principals.mint_token(
+            publisher, "owner", now.isoformat(), (now + timedelta(hours=1)).isoformat()
+        )
+    members = [
+        (f"tier-pack-{index}", b"queued for full scanner validation") for index in range(limit + 1)
+    ]
+    refused = _publish_set(client, token, members)
+    assert refused.status_code == 400, refused.text
+    assert f"Requested {limit + 1} members; publisher limit is {limit}" in refused.text
+    accepted = _publish_set(client, token, members[:-1])
+    assert accepted.status_code == 202, accepted.text
+    assert len(accepted.json()["members"]) == limit
+
+
+def test_publish_set_checks_every_scope_and_duplicate_before_persisting(tmp_path: Path) -> None:
+    client, app, token = _client(tmp_path)
+    principals = PrincipalRepository(app.state.database)
+    now = datetime.now(UTC)
+    scoped, _ = principals.mint_token(
+        "example-org",
+        "owner",
+        now.isoformat(),
+        (now + timedelta(hours=1)).isoformat(),
+        pack="set-allowed",
+    )
+    members = [("set-allowed", b"first"), ("set-forbidden", b"second")]
+    assert _publish_set(client, scoped, members).status_code == 409
+    duplicate = _publish_set(client, token, [members[0], members[0]])
+    assert duplicate.status_code == 400
+    assert "duplicate pack identity" in duplicate.text
+    with app.state.database.session() as session:
+        assert list(session.scalars(select(ReleaseSetRecord))) == []
+        assert list(session.scalars(select(ReleaseCandidateRecord))) == []
+    assert client.post("/v1/publish-sets", content=b"not authenticated").status_code == 401

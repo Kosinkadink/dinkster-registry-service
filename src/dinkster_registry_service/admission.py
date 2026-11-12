@@ -9,6 +9,7 @@ import time
 import tomllib
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -281,6 +282,8 @@ class AdmissionService:
         locks: bytes | None = None,
         engine: bytes | None = None,
         authorization: UploadAuthorization | None = None,
+        session: Session | None = None,
+        set_id: UUID | None = None,
     ) -> UUID:
         require_canonical_pack_name(pack_name)
         require_public_version(version)
@@ -314,8 +317,13 @@ class AdmissionService:
         try:
             for lock in prepared:
                 self.object_store.put(quarantine_lock_key(candidate_id, lock.variant), lock.data)
-            with self.database.session() as session, session.begin():
-                lock_security(session)
+            own_transaction = session is None
+            with (
+                self.database.session() if session is None else nullcontext(session) as session,
+                session.begin() if own_transaction else nullcontext(),
+            ):
+                if own_transaction:
+                    lock_security(session)
                 if authorization is not None:
                     SecurityRepository.require_authorization(session, authorization, pack_name)
                 SecurityRepository.require_uploads(session, pack_name, publisher)
@@ -338,6 +346,8 @@ class AdmissionService:
                 if (
                     prepared
                     or scan_engine is not None
+                    or set_id is not None
+                    or any(item.set_id is not None for item in previous_candidates)
                     or any(item.scan_engine is not None for item in previous_candidates)
                 ):
                     for recorded in previous_candidates:
@@ -354,6 +364,8 @@ class AdmissionService:
                         (item for item in previous_candidates if item.status != "rejected"), None
                     )
                     if previous is not None:
+                        if previous.set_id != set_id:
+                            raise AdmissionError("release belongs to another pending submission")
                         if previous.status not in {"queued", "retrying", "scanning", "accepted"}:
                             raise AdmissionError(f"release candidate is {previous.status}")
                         self.object_store.remove(object_key)
@@ -369,6 +381,7 @@ class AdmissionService:
                     ReleaseCandidateRecord(
                         id=candidate_id,
                         kind="upload",
+                        set_id=set_id,
                         release_id=None,
                         publisher_id=publisher,
                         pack_name=pack_name,
@@ -494,7 +507,8 @@ class AdmissionService:
                                 ReleaseCandidateRecord.status == "scanning",
                                 ReleaseCandidateRecord.lease_expires_at <= now,
                             ),
-                        )
+                        ),
+                        ReleaseCandidateRecord.set_id.is_(None),
                     )
                     .order_by(ReleaseCandidateRecord.submitted_at, ReleaseCandidateRecord.id)
                     .with_for_update(skip_locked=True)
@@ -1779,8 +1793,8 @@ class AdmissionService:
             self._prepare_promotion(claim, data)
         return self.status(candidate_id)
 
-    def status(self, candidate_id: UUID) -> CandidateStatus:
-        with self.database.session() as session:
+    def status(self, candidate_id: UUID, *, session: Session | None = None) -> CandidateStatus:
+        with self.database.session() if session is None else nullcontext(session) as session:
             candidate = session.get(ReleaseCandidateRecord, candidate_id)
             if candidate is None:
                 raise AdmissionError(f"candidate {candidate_id} was not found")
