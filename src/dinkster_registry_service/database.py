@@ -307,6 +307,28 @@ class ReleaseFindingRecord(Base):
     message: Mapped[str] = mapped_column(Text)
 
 
+class ReleaseSetRecord(Base):
+    __tablename__ = "release_sets"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('queued', 'accepted', 'rejected', 'expired')",
+            name="ck_release_sets_status",
+        ),
+        Index("ix_release_sets_replay", "publisher_id", "binding_digest"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    publisher_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("publishers.id", ondelete="RESTRICT")
+    )
+    binding_digest: Mapped[str] = mapped_column(String(64))
+    members: Mapped[list[str]] = mapped_column(JSON_STORAGE)
+    status: Mapped[str] = mapped_column(String(16))
+    status_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class ReleaseCandidateRecord(Base):
     __tablename__ = "release_candidates"
     __table_args__ = (
@@ -329,6 +351,9 @@ class ReleaseCandidateRecord(Base):
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     kind: Mapped[str] = mapped_column(String(16))
+    set_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("release_sets.id", ondelete="RESTRICT"), nullable=True
+    )
     release_id: Mapped[UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("releases.id", ondelete="RESTRICT"),
@@ -493,6 +518,11 @@ class Database:
                     if "scan_engine" not in columns:
                         connection.exec_driver_sql(
                             f"ALTER TABLE {table} ADD COLUMN scan_engine JSON"
+                        )
+                    if table == "release_candidates" and "set_id" not in columns:
+                        connection.exec_driver_sql(
+                            "ALTER TABLE release_candidates ADD COLUMN set_id CHAR(32) "
+                            "REFERENCES release_sets(id)"
                         )
                 for operation in ("UPDATE", "DELETE"):
                     connection.exec_driver_sql(
