@@ -690,14 +690,25 @@ authorize publishing or public-index writes.
 - `POST /internal/scanner/{candidate_id}/heartbeat` renews a live lease. Reads
   and heartbeats require `X-Scanner-Lease` with the assignment's token; expired
   or replaced tokens return 409 and cannot revive the old assignment.
+- `POST /internal/scanner/{candidate_id}/result` accepts a JSON object with
+  `artifactDigest` and `probe` under the same live lease. `probe` contains the
+  executable StageResult's `findings`, `data` and `operator_details`; library
+  uploads and rescans instead require null. The body is limited to 16 MiB.
+  Successful probes require complete, unique wire schemas with matching
+  identities, signatures and manifest roles. Malformed or incomplete evidence
+  returns 400 without consuming the assignment. The service atomically consumes
+  the worker token before applying the shared integrity, manifest, doctor,
+  security and promotion policy; it never executes a probe on this path.
+  Concurrent or repeated results return 409, including after a timeout requeue.
+  A failure after consumption leaves a private processing lease to expire for
+  recovery rather than granting the old worker authority again.
 
-These endpoints accept no query parameters or request bodies and return
+These endpoints accept no query parameters; only result accepts a body. All return
 `Cache-Control: no-store`. They do not return database, object-store, cursor,
 signing or management credentials. Reads recheck the fence after retrieving
 bytes so an assignment expiring during resolution receives 409 instead of data.
 Input-store failures return retryable 503 without rejecting the candidate.
-These assignment endpoints do not submit
-verdicts or start/stop Machines, and do not replace the existing scanner command.
+These endpoints do not start/stop Machines or replace the existing scanner command.
 
 Probe and scanner limits use integer environment variables validated at
 startup. Invalid values stop the process with an error naming the variable.

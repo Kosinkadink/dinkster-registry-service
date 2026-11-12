@@ -6,7 +6,7 @@ import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -566,12 +566,38 @@ class AdmissionService:
             .where(ReleaseCandidateRecord.id == claim.id)
             .with_for_update()
         )
-        if candidate is None or candidate.lease_token != claim.lease_token:
-            raise LeaseLost(f"candidate {claim.id} lease was replaced")
+        expiry = candidate.lease_expires_at if candidate is not None else None
+        if expiry is not None and expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=UTC)
+        if (
+            candidate is None
+            or candidate.status != "scanning"
+            or candidate.lease_token != claim.lease_token
+            or expiry is None
+            or expiry <= datetime.now(UTC)
+        ):
+            raise LeaseLost(f"candidate {claim.id} lease is absent, expired or replaced")
         return candidate
 
-    def _record_stage(self, claim: CandidateClaim, stage: str, result: StageResult) -> bool:
+    def accept_probe_result(self, claim: CandidateClaim, result: StageResult | None) -> None:
+        # Consume the worker capability before recording any admission stage.
+        # A duplicate submission cannot race or resume this private processing lease.
+        token = uuid7()
         with self.database.session() as session, session.begin():
+            if not self.database.is_postgresql:
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            candidate = self._leased_candidate(session, claim)
+            candidate.lease_token = token
+            candidate.lease_owner = self.worker_id
+            candidate.lease_expires_at = datetime.now(UTC) + timedelta(seconds=self.lease_seconds)
+        self._process(replace(claim, lease_token=token), remote=True, probe_result=result)
+
+    def _record_stage(
+        self, claim: CandidateClaim, stage: str, result: StageResult, *, remote: bool = False
+    ) -> bool:
+        with self.database.session() as session, session.begin():
+            if not self.database.is_postgresql:
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             candidate = self._leased_candidate(session, claim)
             now = datetime.now(UTC)
             doctor = (
@@ -593,8 +619,11 @@ class AdmissionService:
             if stage == "executable_probe":
                 operator_details = {
                     **(operator_details or {}),
-                    "scannerHost": socket.gethostname(),
-                    "scannerWorker": self.worker_id,
+                    **(
+                        {"scannerTransport": "remote"}
+                        if remote
+                        else {"scannerHost": socket.gethostname(), "scannerWorker": self.worker_id}
+                    ),
                 }
             session.add(
                 ReleaseScanRunRecord(
@@ -697,6 +726,8 @@ class AdmissionService:
 
     def _mark_review(self, claim: CandidateClaim) -> None:
         with self.database.session() as session, session.begin():
+            if not self.database.is_postgresql:
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             candidate = self._leased_candidate(session, claim)
             finding = (
                 session.execute(
@@ -1177,6 +1208,8 @@ class AdmissionService:
 
     def _finish_rescan(self, claim: CandidateClaim, *, review: bool) -> None:
         with self.database.session() as session, session.begin():
+            if not self.database.is_postgresql:
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             candidate = self._leased_candidate(session, claim)
             if candidate.release_id is None:
                 raise AdmissionError("rescan candidate has no release")
@@ -1426,7 +1459,13 @@ class AdmissionService:
             development_runtime=self.settings.probe_runtime_mirror,
         )
 
-    def _process(self, claim: CandidateClaim) -> None:
+    def _process(
+        self,
+        claim: CandidateClaim,
+        *,
+        remote: bool = False,
+        probe_result: StageResult | None = None,
+    ) -> None:
         try:
             data = self.object_store.read(claim.object_key, max_size=MAX_ARTIFACT_SIZE)
         except (FileNotFoundError, ObjectStoreError) as exc:
@@ -1546,16 +1585,16 @@ class AdmissionService:
             if claim.kind == "upload" and wheel.library:
                 self._record_stage(claim, "executable_probe", StageResult(data={"schemas": []}))
             if claim.kind == "upload" and not wheel.library:
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(self._probe_with_dependencies, root, claim)
-                    while not wait((future,), timeout=self.lease_seconds / 3).done:
-                        with self.database.session() as session, session.begin():
-                            candidate = self._leased_candidate(session, claim)
-                            candidate.lease_expires_at = datetime.now(UTC) + timedelta(
-                                seconds=self.lease_seconds
-                            )
-                    probe = future.result()
-                if not self._record_stage(claim, "executable_probe", probe):
+                if remote:
+                    assert probe_result is not None
+                    probe = probe_result
+                else:
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(self._probe_with_dependencies, root, claim)
+                        while not wait((future,), timeout=self.lease_seconds / 3).done:
+                            self.leased_claim(claim.id, claim.lease_token, renew=True)
+                        probe = future.result()
+                if not self._record_stage(claim, "executable_probe", probe, remote=remote):
                     return
                 review |= probe.review
             security = run_wheel_security(data)
