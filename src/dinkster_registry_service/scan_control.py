@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import secrets
 from dataclasses import asdict
 from typing import Annotated
 from uuid import UUID
 
+from dinkster_registry.archive_admission import StageResult
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from starlette.responses import JSONResponse, Response
 
 from .admission import AdmissionService, CandidateClaim, LeaseLost
+from .artifacts import EXPANDED_LIMIT
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStoreError
+from .scan_execution import ProbeDependencies
+from .wheels import extracted_wheel, inspect_wheel, run_wheel_integrity
 
 NO_STORE = {"Cache-Control": "no-store"}
 
@@ -67,15 +72,60 @@ def scanner_router(service: AdmissionService, token_sha256: str | None) -> APIRo
             headers=NO_STORE,
         )
 
-    @router.get("/{candidate_id}/input")
-    def scan_input(candidate_id: UUID, x_scanner_lease: Annotated[UUID, Header()]) -> Response:
-        claimed = assignment(candidate_id, x_scanner_lease)
+    def input_bytes(claimed: CandidateClaim) -> bytes:
         try:
             data = service.object_store.read(claimed.object_key, max_size=MAX_ARTIFACT_SIZE)
         except (FileNotFoundError, ObjectStoreError) as exc:
             raise ScannerError(503, "Assigned scan input is unavailable.") from exc
+        return data
+
+    @router.get("/{candidate_id}/input")
+    def scan_input(candidate_id: UUID, x_scanner_lease: Annotated[UUID, Header()]) -> Response:
+        claimed = assignment(candidate_id, x_scanner_lease)
+        data = input_bytes(claimed)
         assignment(candidate_id, x_scanner_lease)
         return Response(data, media_type="application/octet-stream", headers=NO_STORE)
+
+    @router.get("/{candidate_id}/dependencies")
+    def dependencies(candidate_id: UUID, x_scanner_lease: Annotated[UUID, Header()]) -> Response:
+        claimed = assignment(candidate_id, x_scanner_lease)
+        data = input_bytes(claimed)
+        integrity = run_wheel_integrity(
+            data, claimed.declared_size, claimed.declared_digest, claimed.pack_name, claimed.version
+        )
+        if integrity.blocked:
+            raise ScannerError(422, "Assigned scan input failed integrity checks.")
+        try:
+            wheel = inspect_wheel(data, claimed.pack_name, claimed.version)
+            resolved: ProbeDependencies | StageResult
+            if wheel.library or claimed.kind == "rescan":
+                resolved = ProbeDependencies((), (), ())
+            else:
+                with extracted_wheel(data, wheel) as root:
+                    resolved = service.probe_dependencies(root)
+        except (ValueError, FileNotFoundError, ObjectStoreError) as exc:
+            raise ScannerError(503, "Assigned scan dependencies are unavailable.") from exc
+        assignment(candidate_id, x_scanner_lease)
+        if isinstance(resolved, StageResult):
+            return JSONResponse({"failure": asdict(resolved)}, headers=NO_STORE)
+        size = sum(len(value) for value in resolved.helper_wheels) + sum(
+            len(value) for _, value in resolved.library_wheels
+        )
+        if size > EXPANDED_LIMIT:
+            raise ScannerError(503, "Assigned scan dependencies exceed the transfer limit.")
+        return JSONResponse(
+            {
+                "helperWheels": [
+                    base64.b64encode(value).decode() for value in resolved.helper_wheels
+                ],
+                "libraryWheels": [
+                    {"filename": name, "data": base64.b64encode(value).decode()}
+                    for name, value in resolved.library_wheels
+                ],
+                "requirements": list(resolved.requirements),
+            },
+            headers=NO_STORE,
+        )
 
     @router.post("/{candidate_id}/heartbeat")
     def heartbeat(candidate_id: UUID, x_scanner_lease: Annotated[UUID, Header()]) -> Response:

@@ -92,9 +92,16 @@ def test_assignment_reads_require_a_live_fence_and_cannot_publish(
         response = client.get(f"{path}/input", headers=headers)
         assert response.status_code == 200 and response.content == archive
         assert response.headers["cache-control"] == "no-store"
+        response = client.get(f"{path}/dependencies", headers=headers)
+        assert response.status_code == 200
+        assert response.json() == {"helperWheels": [], "libraryWheels": [], "requirements": []}
+        assert response.headers["cache-control"] == "no-store"
+        assert client.get(f"{path}/dependencies").status_code == 401
+        assert client.get(f"{path}/dependencies?key=private", headers=headers).status_code == 400
         app.state.object_store.remove(quarantine_object_key(candidate_id))
         unavailable = client.get(f"{path}/input", headers=headers)
         assert unavailable.status_code == 503 and unavailable.json()["error"]["retryable"] is True
+        assert client.get(f"{path}/dependencies", headers=headers).status_code == 503
         assert service.status(candidate_id).status == "scanning"
         app.state.object_store.put(quarantine_object_key(candidate_id), archive)
         assert (
@@ -133,11 +140,13 @@ def test_assignment_reads_require_a_live_fence_and_cannot_publish(
             assert candidate is not None
             candidate.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
         assert client.get(f"{path}/input", headers=headers).status_code == 409
+        assert client.get(f"{path}/dependencies", headers=headers).status_code == 409
         assert client.post(f"{path}/heartbeat", headers=headers).status_code == 409
         recovered = client.post(f"{PREFIX}/claim", headers=HEADERS).json()
         assert recovered["candidateId"] == str(candidate_id) and recovered["attempt"] == 2
         assert recovered["leaseToken"] != claimed["leaseToken"]
         assert client.post(f"{path}/heartbeat", headers=headers).status_code == 409
+        assert client.get(f"{path}/dependencies", headers=headers).status_code == 409
         headers["X-Scanner-Lease"] = recovered["leaseToken"]
         assert client.get(f"{path}/input", headers=headers).content == archive
         with app.state.database.session() as session:

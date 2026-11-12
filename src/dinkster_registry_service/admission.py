@@ -1324,7 +1324,7 @@ class AdmissionService:
                 wheels.append((wheel.filename, data))
             return tuple(wheels)
 
-    def probe_dependencies(self, root: Path) -> ProbeDependencies:
+    def _resolve_probe_dependencies(self, root: Path) -> ProbeDependencies:
         manifest_path = root / "dinkster-pack.toml"
         manifest = load_manifest(manifest_path)
         pending = list(manifest.dependencies)
@@ -1372,11 +1372,9 @@ class AdmissionService:
             tuple(helpers), self._probe_library_wheels(requirements), tuple(sorted(requirements))
         )
 
-    def _probe_with_dependencies(
-        self, root: Path, scan_engine: dict[str, str] | None = None
-    ) -> StageResult:
+    def probe_dependencies(self, root: Path) -> ProbeDependencies | StageResult:
         try:
-            dependencies = self.probe_dependencies(root)
+            return self._resolve_probe_dependencies(root)
         except (ValueError, ObjectStoreError, FileNotFoundError) as exc:
             return StageResult(
                 (
@@ -1385,6 +1383,13 @@ class AdmissionService:
                     ),
                 )
             )
+
+    def _probe_with_dependencies(
+        self, root: Path, scan_engine: dict[str, str] | None = None
+    ) -> StageResult:
+        dependencies = self.probe_dependencies(root)
+        if isinstance(dependencies, StageResult):
+            return dependencies
         return run_prepared_probe(
             root,
             dependencies,

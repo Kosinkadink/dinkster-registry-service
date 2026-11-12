@@ -668,14 +668,27 @@ authorize publishing or public-index writes.
   settings, or 204 when no candidate is eligible. It does not run a scan.
 - `GET /internal/scanner/{candidate_id}/input` returns only that assignment's
   original bounded archive, without accepting object keys or URLs.
+- `GET /internal/scanner/{candidate_id}/dependencies` resolves the assignment's
+  active public helper/library wheels with the same catalog and digest checks
+  as local scanning. It returns `helperWheels` (base64 bytes), `libraryWheels`
+  (filename/data objects with base64 bytes), and sorted `requirements`. Library
+  uploads and rescans need no executable probe and return empty lists. Combined
+  wheel bytes are limited to 256 MiB before base64 encoding; an oversized set
+  returns retryable 503, not a candidate rejection. Resolution failures instead
+  return a `failure` object with the existing executable-probe stage findings,
+  preserving `probe.pack-dependencies-unavailable` blocking policy. The read
+  itself does not record that verdict or change the candidate's status.
+  Invalid assigned input returns 422. No submitted Python is run by this route.
 - `POST /internal/scanner/{candidate_id}/heartbeat` renews a live lease. Reads
   and heartbeats require `X-Scanner-Lease` with the assignment's token; expired
   or replaced tokens return 409 and cannot revive the old assignment.
 
 These endpoints accept no query parameters or request bodies and return
 `Cache-Control: no-store`. They do not return database, object-store, cursor,
-signing or management credentials. Input-store failures return retryable 503
-without rejecting the candidate. These assignment endpoints do not submit
+signing or management credentials. Reads recheck the fence after retrieving
+bytes so an assignment expiring during resolution receives 409 instead of data.
+Input-store failures return retryable 503 without rejecting the candidate.
+These assignment endpoints do not submit
 verdicts or start/stop Machines, and do not replace the existing scanner command.
 
 Probe and scanner limits use integer environment variables validated at
