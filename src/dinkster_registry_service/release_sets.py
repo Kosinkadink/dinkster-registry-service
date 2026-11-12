@@ -11,12 +11,13 @@ from uuid import UUID
 
 from dinkster_registry import TokenRecord
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
-from .database import AuditEventRecord, ReleaseCandidateRecord, ReleaseSetRecord
+from .database import AuditEventRecord, OutboxRecord, ReleaseCandidateRecord, ReleaseSetRecord
 from .digests import artifact_digest
 from .identifiers import require_canonical_pack_name
 from .ids import uuid7
-from .object_store import MAX_ARTIFACT_SIZE
+from .object_store import MAX_ARTIFACT_SIZE, ObjectStoreError
 from .pack_locks import MAX_LOCKS_SIZE, parse_pack_locks, quarantine_lock_key
 from .scan_engine import parse_scan_engine
 from .security_repository import SecurityRepository, lock_security
@@ -44,6 +45,121 @@ class SetUpload:
     archive: bytes
     locks: bytes | None = None
     engine: bytes | None = None
+
+
+def queue_set_cleanup(
+    session: Session, release_set: ReleaseSetRecord, candidates: list[ReleaseCandidateRecord]
+) -> None:
+    keys = []
+    for candidate in candidates:
+        keys.append(candidate.object_key)
+        keys.extend(
+            quarantine_lock_key(candidate.id, variant) for variant in candidate.install_locks
+        )
+    now = datetime.now(UTC)
+    session.add(
+        OutboxRecord(
+            id=uuid7(),
+            created_at=now,
+            available_at=now,
+            delivered_at=None,
+            topic="release_set.cleanup",
+            event_key=f"release_set.cleanup:{release_set.id}",
+            payload={"keys": keys},
+            state="pending",
+            attempts=0,
+        )
+    )
+
+
+def settle_one_set(service: AdmissionService) -> bool:
+    """Expire or reject a whole set, fencing scanners before releasing its bindings."""
+    now = datetime.now(UTC)
+    with service.database.session() as session, session.begin():
+        lock_security(session)
+        failed_member = (
+            select(ReleaseCandidateRecord.id)
+            .where(
+                ReleaseCandidateRecord.set_id == ReleaseSetRecord.id,
+                ReleaseCandidateRecord.status == "rejected",
+            )
+            .exists()
+        )
+        release_set = session.scalar(
+            select(ReleaseSetRecord)
+            .where(
+                ReleaseSetRecord.status == "queued",
+                (ReleaseSetRecord.expires_at <= now) | failed_member,
+            )
+            .order_by(ReleaseSetRecord.submitted_at, ReleaseSetRecord.id)
+            .with_for_update(skip_locked=True)
+            .limit(1)
+        )
+        if release_set is None:
+            return False
+        expired = release_set.expires_at.replace(tzinfo=UTC) <= now
+        release_set.status = "expired" if expired else "rejected"
+        reason = "set.expired" if expired else "set.member-rejected"
+        release_set.status_reason = reason
+        candidates = list(
+            session.scalars(
+                select(ReleaseCandidateRecord)
+                .where(ReleaseCandidateRecord.set_id == release_set.id)
+                .order_by(ReleaseCandidateRecord.id)
+                .with_for_update()
+            )
+        )
+        for candidate in candidates:
+            if candidate.status == "accepted" or candidate.release_id is not None:
+                raise ReleaseSetError("Unsettled set has public or prepared release state.")
+            if candidate.status != "rejected":
+                candidate.status = "rejected"
+                candidate.status_reason = reason
+            candidate.lease_owner = None
+            candidate.lease_token = None
+            candidate.lease_expires_at = None
+            candidate.lease_version += 1
+        queue_set_cleanup(session, release_set, candidates)
+        session.add(
+            AuditEventRecord(
+                id=uuid7(),
+                created_at=now,
+                event_type=f"release_set.{release_set.status}",
+                subject_type="release_set",
+                subject_id=str(release_set.id),
+                data={"reason": reason},
+            )
+        )
+    return True
+
+
+def clean_one_set(service: AdmissionService) -> bool:
+    """Retry private-object cleanup without extending a terminal set's lifetime."""
+    with service.database.session() as session, session.begin():
+        now = datetime.now(UTC)
+        event = session.scalar(
+            select(OutboxRecord)
+            .where(
+                OutboxRecord.topic == "release_set.cleanup",
+                OutboxRecord.state == "pending",
+                OutboxRecord.available_at <= now,
+            )
+            .order_by(OutboxRecord.created_at, OutboxRecord.id)
+            .with_for_update(skip_locked=True)
+            .limit(1)
+        )
+        if event is None:
+            return False
+        event.attempts += 1
+        try:
+            for key in event.payload["keys"]:
+                service.object_store.remove(key)
+        except (OSError, ObjectStoreError):
+            event.available_at = now + timedelta(seconds=5)
+        else:
+            event.state = "delivered"
+            event.delivered_at = now
+    return True
 
 
 def submit_set(service: AdmissionService, uploads: list[SetUpload], token: TokenRecord) -> UUID:

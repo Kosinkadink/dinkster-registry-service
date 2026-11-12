@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
@@ -16,7 +17,7 @@ from httpx2 import Response
 from runtime_fixture import RuntimeFixture
 from sqlalchemy import select
 
-from dinkster_registry_service.admission import AdmissionService
+from dinkster_registry_service.admission import AdmissionService, LeaseLost
 from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
 from dinkster_registry_service.cli import main
@@ -796,3 +797,370 @@ def test_publish_set_checks_every_scope_and_duplicate_before_persisting(tmp_path
         assert list(session.scalars(select(ReleaseSetRecord))) == []
         assert list(session.scalars(select(ReleaseCandidateRecord))) == []
     assert client.post("/v1/publish-sets", content=b"not authenticated").status_code == 401
+
+
+@pytest.mark.parametrize("terminal", ["expired", "rejected"])
+def test_publish_set_releases_all_members_but_preserves_immutable_bindings(
+    tmp_path: Path, database: Database, database_url: str, terminal: str
+) -> None:
+    client, app, token = _client(tmp_path, database_url)
+    members = [(name, _archive(tmp_path, name)) for name in ("set-first", "set-second")]
+    submitted = _publish_set(client, token, members).json()
+    set_id = UUID(submitted["setId"])
+    store = LocalFilesystemObjectStore(tmp_path / "objects")
+    admission = AdmissionService(app.state.database, store, require_isolation=False)
+    late_claim = admission.claim() if terminal == "expired" else None
+    with app.state.database.session() as session, session.begin():
+        release_set = session.get(ReleaseSetRecord, set_id)
+        assert release_set is not None
+        if terminal == "expired":
+            release_set.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        else:
+            candidate = session.get(ReleaseCandidateRecord, UUID(release_set.members[-1]))
+            assert candidate is not None
+            candidate.status = "rejected"
+            candidate.status_reason = "integrity.invalid"
+        old_keys = [
+            row.object_key
+            for row in session.scalars(
+                select(ReleaseCandidateRecord).where(ReleaseCandidateRecord.set_id == set_id)
+            )
+        ]
+    assert admission.run_once(deliver_indexes=False)
+    if late_claim is not None:
+        with pytest.raises(LeaseLost):
+            admission.process(late_claim)
+    status = client.get(
+        f"/v1/publish-sets/{set_id}", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert status["status"] == terminal
+    assert {member["status"] for member in status["members"]} == {"rejected"}
+    if terminal == "rejected":
+        assert {member["reason"] for member in status["members"]} == {
+            "set.member-rejected",
+            "integrity.invalid",
+        }
+    else:
+        assert {member["reason"] for member in status["members"]} == {"set.expired"}
+    for name, _ in members:
+        assert client.get(f"/v1/packs/{name}").status_code == 404
+    assert all(store.exists(key) for key in old_keys)
+
+    replay = _publish_set(client, token, list(reversed(members)))
+    assert replay.status_code == 202, replay.text
+    assert replay.json()["setId"] != str(set_id)
+    assert {member["status"] for member in replay.json()["members"]} == {"queued"}
+    changed = _publish_set(client, token, [(members[0][0], members[0][1] + b"changed")])
+    assert changed.status_code == 409
+    assert admission.run_once(deliver_indexes=False)
+    assert not any(store.exists(key) for key in old_keys)
+    with app.state.database.session() as session:
+        pending = list(
+            session.scalars(
+                select(ReleaseCandidateRecord).where(
+                    ReleaseCandidateRecord.set_id == UUID(replay.json()["setId"])
+                )
+            )
+        )
+        assert all(store.exists(row.object_key) for row in pending)
+        assert len(pending) == 2
+        assert not list(
+            session.scalars(select(OutboxRecord).where(OutboxRecord.topic == "indexes.rebuild"))
+        )
+
+
+def test_publish_set_expiry_cleanup_retries_without_blocking_resubmission(tmp_path: Path) -> None:
+    client, app, token = _client(tmp_path)
+    members = [("set-retry", _archive(tmp_path, "set-retry"))]
+    submitted = _publish_set(client, token, members).json()
+
+    class UnavailableCleanup(LocalFilesystemObjectStore):
+        unavailable = True
+
+        def remove(self, key: str) -> None:
+            if self.unavailable:
+                raise ObjectStoreError("synthetic cleanup outage")
+            super().remove(key)
+
+    store = UnavailableCleanup(tmp_path / "objects")
+    admission = AdmissionService(app.state.database, store, require_isolation=False)
+    with app.state.database.session() as session, session.begin():
+        release_set = session.get(ReleaseSetRecord, UUID(submitted["setId"]))
+        assert release_set is not None
+        release_set.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    assert admission.run_once(deliver_indexes=False)
+    assert admission.run_once(deliver_indexes=False)
+    replay = _publish_set(client, token, members)
+    assert replay.status_code == 202, replay.text
+    assert replay.json()["setId"] != submitted["setId"]
+    store.unavailable = False
+    with app.state.database.session() as session, session.begin():
+        cleanup = session.scalar(
+            select(OutboxRecord).where(OutboxRecord.topic == "release_set.cleanup")
+        )
+        assert cleanup is not None
+        cleanup.available_at = datetime.now(UTC) - timedelta(seconds=1)
+    assert admission.run_once(deliver_indexes=False)
+    status = client.get(
+        f"/v1/publish-sets/{submitted['setId']}", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert status.json()["status"] == "expired"
+
+
+@pytest.mark.parametrize("storage_failure", [False, True])
+def test_publish_set_keeps_scanned_members_private_until_one_activation_transaction(
+    tmp_path: Path, database: Database, database_url: str, storage_failure: bool
+) -> None:
+    client, app, token = _client(tmp_path, database_url)
+    members = [(name, _archive(tmp_path, name)) for name in ("set-alpha", "set-zeta")]
+    submitted = _publish_set(client, token, members).json()
+    auth = {"Authorization": f"Bearer {token}"}
+
+    class UnavailableSecondArtifact(LocalFilesystemObjectStore):
+        unavailable = storage_failure
+
+        def put(self, key: str, data: bytes) -> None:
+            if data == members[-1][1] and key.startswith("artifacts/") and self.unavailable:
+                raise ObjectStoreError("synthetic second artifact outage")
+            super().put(key, data)
+
+    store = UnavailableSecondArtifact(tmp_path / "objects")
+    admission = AdmissionService(app.state.database, store, require_isolation=False)
+    for _ in members:
+        assert admission.run_once(deliver_indexes=False)
+        for name, _ in members:
+            assert client.get(f"/v1/packs/{name}").status_code == 404
+    status = client.get(f"/v1/publish-sets/{submitted['setId']}", headers=auth).json()
+    assert status["status"] == "queued"
+    assert {row["status"] for row in status["members"]} == {"promoting"}
+    assert admission.run_once(deliver_indexes=False)
+    if storage_failure:
+        assert (
+            client.get(f"/v1/publish-sets/{submitted['setId']}", headers=auth).json()["status"]
+            == "queued"
+        )
+        for name, _ in members:
+            assert client.get(f"/v1/packs/{name}").status_code == 404
+        with app.state.database.session() as session, session.begin():
+            event = session.scalar(
+                select(OutboxRecord).where(OutboxRecord.topic == "release_set.promote")
+            )
+            assert event is not None
+            event.available_at = datetime.now(UTC) - timedelta(seconds=1)
+        store.unavailable = False
+        assert admission.run_once(deliver_indexes=False)
+    status = client.get(f"/v1/publish-sets/{submitted['setId']}", headers=auth).json()
+    assert status["status"] == "accepted"
+    assert {row["status"] for row in status["members"]} == {"accepted"}
+    for name, data in members:
+        detail = client.get(f"/v1/packs/{name}/versions/1.2.3")
+        assert detail.status_code == 200, detail.text
+        assert artifact_digest(data) in detail.text
+    with app.state.database.session() as session:
+        events = list(
+            session.scalars(select(OutboxRecord).where(OutboxRecord.topic == "indexes.rebuild"))
+        )
+        assert len(events) == 1
+        assert events[0].state == "pending"
+    replay = _publish_set(client, token, list(reversed(members)))
+    assert replay.status_code == 202
+    assert replay.json() == status
+
+
+@pytest.mark.parametrize("stop", ["expiry", "revocation"])
+def test_publish_set_rechecks_deadline_and_authority_before_activation(
+    tmp_path: Path, database: Database, database_url: str, stop: str
+) -> None:
+    client, app, token = _client(tmp_path, database_url)
+    members = [(name, _archive(tmp_path, name)) for name in ("set-earlier", "set-later")]
+    submitted = _publish_set(client, token, members).json()
+    admission = AdmissionService(
+        app.state.database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        require_isolation=False,
+    )
+    for _ in members:
+        assert admission.run_once(deliver_indexes=False)
+    if stop == "expiry":
+        with app.state.database.session() as session, session.begin():
+            release_set = session.get(ReleaseSetRecord, UUID(submitted["setId"]))
+            assert release_set is not None
+            release_set.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    else:
+        principals = PrincipalRepository(app.state.database)
+        now = datetime.now(UTC)
+        identity = principals.verify_token(token, now.isoformat())
+        principals.revoke_token(identity.token_id, "owner", now.isoformat(), "rotated")
+        token, _ = principals.mint_token(
+            "example-org", "owner", now.isoformat(), (now + timedelta(hours=1)).isoformat()
+        )
+    assert admission.deliver_one_set_promotion()
+    assert admission.run_once(deliver_indexes=False)
+    status = client.get(
+        f"/v1/publish-sets/{submitted['setId']}", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert status["status"] == ("expired" if stop == "expiry" else "rejected")
+    assert {row["status"] for row in status["members"]} == {"rejected"}
+    for name, _ in members:
+        assert client.get(f"/v1/packs/{name}").status_code == 404
+
+
+def test_publish_set_scan_failure_keeps_ready_sibling_private(tmp_path: Path) -> None:
+    client, app, token = _client(tmp_path)
+    members = [("set-valid", _archive(tmp_path, "set-valid")), ("set-broken", b"not a wheel")]
+    submitted = _publish_set(client, token, members).json()
+    admission = AdmissionService(
+        app.state.database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        require_isolation=False,
+    )
+    assert admission.run_once(deliver_indexes=False)
+    assert admission.run_once(deliver_indexes=False)
+    assert admission.run_once(deliver_indexes=False)
+    status = client.get(
+        f"/v1/publish-sets/{submitted['setId']}", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert status["status"] == "rejected"
+    assert {row["status"] for row in status["members"]} == {"rejected"}
+    broken = next(row for row in status["members"] if row["packName"] == "set-broken")
+    assert any(row["effect"] == "block" for row in broken["findings"])
+    assert client.get("/v1/packs/set-valid").status_code == 404
+    assert client.get("/v1/packs/set-broken").status_code == 404
+
+
+def test_publish_set_preserves_installation_locks_through_activation_and_cleanup(
+    tmp_path: Path, runtime: RuntimeFixture
+) -> None:
+    client, app, token = _client(tmp_path)
+    archive = _archive(tmp_path, "locked-pack")
+    submitted = client.post(
+        "/v1/publish-sets",
+        headers={"Authorization": f"Bearer {token}"},
+        files={"wheel": ("locked-pack.whl", archive)},
+        data={
+            "manifest": json.dumps(
+                {
+                    "members": [
+                        {
+                            "name": "locked-pack",
+                            "version": "1.2.3",
+                            "archive": "wheel",
+                            "locks": _locks(archive, runtime),
+                        }
+                    ]
+                }
+            ),
+        },
+    )
+    assert submitted.status_code == 202, submitted.text
+    admission = AdmissionService(
+        app.state.database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        settings=runtime.settings(tmp_path),
+        require_isolation=False,
+    )
+    for _ in range(3):
+        assert admission.run_once(deliver_indexes=False)
+    endpoint = "/v1/packs/locked-pack/versions/1.2.3"
+    detail = client.get(endpoint)
+    assert detail.status_code == 200, detail.text
+    for variant, binding in detail.json()["installLocks"].items():
+        response = client.get(endpoint + f"/locks/{variant}", params={"baseId": binding["baseId"]})
+        assert response.status_code == 200
+        assert artifact_digest(response.content) == binding["digest"]
+    with app.state.database.session() as session:
+        member = session.get(
+            ReleaseCandidateRecord, UUID(submitted.json()["members"][0]["candidateId"])
+        )
+        assert member is not None
+        assert not admission.object_store.exists(member.object_key)
+        for variant in member.install_locks:
+            assert not admission.object_store.exists(f"quarantine/locks/{member.id}/{variant}.json")
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+def test_publish_set_review_decision_never_activates_one_member_alone(
+    tmp_path: Path, accepted: bool
+) -> None:
+    client, app, token = _client(tmp_path)
+    members = [
+        ("set-clean", _archive(tmp_path, "set-clean")),
+        ("set-native", _archive(tmp_path, "set-native", native=True)),
+    ]
+    submitted = _publish_set(client, token, members).json()
+    admission = AdmissionService(
+        app.state.database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        require_isolation=False,
+    )
+    for _ in members:
+        assert admission.run_once(deliver_indexes=False)
+    status = client.get(
+        f"/v1/publish-sets/{submitted['setId']}", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    review = next(row for row in status["members"] if row["packName"] == "set-native")
+    assert review["status"] == "review"
+    decision = client.post(
+        f"/v1/reviews/{review['candidateId']}",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"decision": "accept" if accepted else "reject", "reason": "native inventory review"},
+    )
+    assert decision.status_code == 200, decision.text
+    assert decision.json()["status"] == ("promoting" if accepted else "rejected")
+    for name, _ in members:
+        assert client.get(f"/v1/packs/{name}").status_code == 404
+    assert admission.run_once(deliver_indexes=False)
+    status = client.get(
+        f"/v1/publish-sets/{submitted['setId']}", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert status["status"] == ("accepted" if accepted else "rejected")
+    assert {row["status"] for row in status["members"]} == {status["status"]}
+
+
+def test_publish_set_concurrent_workers_scan_distinct_members_and_activate_once(
+    tmp_path: Path, database: Database, database_url: str
+) -> None:
+    client, app, token = _client(tmp_path, database_url)
+    members = [(name, _archive(tmp_path, name)) for name in ("set-early", "set-late")]
+    submitted = _publish_set(client, token, members).json()
+    services = [
+        AdmissionService(
+            app.state.database,
+            LocalFilesystemObjectStore(tmp_path / "objects"),
+            require_isolation=False,
+            worker_id=f"worker-{index}",
+        )
+        for index in range(2)
+    ]
+    claims = [service.claim() for service in services]
+    assert all(claim is not None for claim in claims)
+    assert len({claim.id for claim in claims if claim is not None}) == 2
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        scans = [
+            executor.submit(service.process, claim)
+            for service, claim in zip(services, claims, strict=True)
+            if claim is not None
+        ]
+        for scan in scans:
+            scan.result(timeout=60)
+        for name, _ in members:
+            assert client.get(f"/v1/packs/{name}").status_code == 404
+        activations = [executor.submit(service.deliver_one_set_promotion) for service in services]
+        assert sum(activation.result(timeout=30) for activation in activations) == 1
+    status = client.get(
+        f"/v1/publish-sets/{submitted['setId']}", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert status["status"] == "accepted"
+    assert {row["status"] for row in status["members"]} == {"accepted"}
+    with app.state.database.session() as session:
+        activation_events = list(
+            session.scalars(
+                select(AuditEventRecord).where(
+                    AuditEventRecord.event_type == "release_set.activated"
+                )
+            )
+        )
+        assert len(activation_events) == 1
+        assert set(activation_events[0].data["members"]) == {
+            row["candidateId"] for row in status["members"]
+        }
