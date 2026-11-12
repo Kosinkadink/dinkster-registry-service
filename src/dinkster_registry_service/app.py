@@ -37,6 +37,7 @@ from .ownership import transfer_ownership
 from .pack_locks import MAX_LOCKS_SIZE, PackLocksError, lock_object_key
 from .principals import PrincipalRepository
 from .repository import CatalogDataError, CatalogRepository
+from .scan_engine import ScanEngineError
 from .security_repository import (
     NoticeChange,
     OwnershipChange,
@@ -512,6 +513,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         except RegistryError as exc:
             raise ProtocolError(403, "forbidden", str(exc)) from None
         locks = None
+        engine = None
         limit = MAX_ARTIFACT_SIZE
         multipart = (
             request.headers.get("content-type", "").split(";", 1)[0] == "multipart/form-data"
@@ -532,19 +534,25 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
 
             bounded = Request(request.scope, receive=receive_body)
             async with bounded.form(
-                max_files=1, max_fields=1, max_part_size=MAX_LOCKS_SIZE
+                max_files=1, max_fields=2, max_part_size=MAX_LOCKS_SIZE
             ) as form:
-                if [key for key, _ in form.multi_items()].count("archive") != 1 or (
-                    len(form.multi_items()) != 2 or "locks" not in form
-                ):
+                fields = [key for key, _ in form.multi_items()]
+                if sorted(fields) not in (["archive", "locks"], ["archive", "engine", "locks"]):
                     raise ProtocolError(
-                        400, "invalid_request", "Expected one archive and one locks part."
+                        400,
+                        "invalid_request",
+                        "Expected one archive, one locks and optionally one engine part.",
                     )
                 upload, raw_locks = form["archive"], form["locks"]
                 if not isinstance(upload, UploadFile) or not isinstance(raw_locks, str):
                     raise ProtocolError(400, "invalid_request", "Invalid archive or locks part.")
                 archive = await upload.read()
                 locks = raw_locks.encode("utf-8")
+                if "engine" in form:
+                    raw_engine = form["engine"]
+                    if not isinstance(raw_engine, str):
+                        raise ProtocolError(400, "invalid_request", "Invalid engine part.")
+                    engine = raw_engine.encode("utf-8")
         else:
             archive = bytes(chunks)
         if not 1 <= len(archive) <= MAX_ARTIFACT_SIZE:
@@ -560,6 +568,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
                 version=version,
                 authorization=authorization,
                 locks=locks,
+                engine=engine,
             )
             principals.record(
                 authorization.actor,
@@ -568,7 +577,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
                 datetime.now(UTC).isoformat(),
                 f"{name} {version}",
             )
-        except PackLocksError as exc:
+        except (PackLocksError, ScanEngineError) as exc:
             raise ProtocolError(400, "invalid_request", str(exc)) from None
         except (AdmissionError, RegistryError) as exc:
             raise ProtocolError(409, "publish_in_progress", str(exc)) from None

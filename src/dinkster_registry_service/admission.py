@@ -60,7 +60,7 @@ from .indexes import StaticIndexes, queue_index_rebuild
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStore, ObjectStoreError
 from .pack_locks import lock_object_key, parse_pack_locks, quarantine_lock_key
 from .principals import PrincipalRepository
-from .scan_engine import parse_scan_engine
+from .scan_engine import parse_scan_engine, stage_scan_api
 from .security_publication import SecurityPublication
 from .security_repository import (
     SecurityRepository,
@@ -1310,7 +1310,9 @@ class AdmissionService:
                 paths.append(path)
             return tuple(paths)
 
-    def _probe_with_dependencies(self, root: Path) -> StageResult:
+    def _probe_with_dependencies(
+        self, root: Path, scan_engine: dict[str, str] | None = None
+    ) -> StageResult:
         manifest_path = root / "dinkster-pack.toml"
         original = manifest_path.read_bytes()
         manifest = load_manifest(manifest_path)
@@ -1374,6 +1376,31 @@ class AdmissionService:
                 manifest_path.write_text(tomli_w.dumps(document))
             with tempfile.TemporaryDirectory(prefix="registry-library-wheels-") as directory:
                 wheels = self._probe_library_wheels(requirements, Path(directory))
+                if scan_engine is not None:
+                    try:
+                        api_wheel, engine_version = stage_scan_api(
+                            scan_engine,
+                            Path(directory),
+                            development_release=self.settings.probe_engine_release,
+                        )
+                        if manifest.compatibility is None:
+                            raise ValueError("selected engine requires pack compatibility")
+                        manifest.compatibility.require_engine(manifest.name, engine_version)
+                    except (ValueError, OSError) as exc:
+                        return StageResult(
+                            (
+                                AdmissionFinding(
+                                    "probe.engine-unavailable", "error", "block", str(exc)
+                                ),
+                            )
+                        )
+                    return run_executable_probe(
+                        root,
+                        settings=self.settings,
+                        require_isolation=self.require_isolation,
+                        dependency_wheels=wheels,
+                        api_wheel=api_wheel,
+                    )
                 if wheels:
                     return run_executable_probe(
                         root,
@@ -1516,7 +1543,7 @@ class AdmissionService:
                 self._record_stage(claim, "executable_probe", StageResult(data={"schemas": []}))
             if claim.kind == "upload" and not wheel.library:
                 with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(self._probe_with_dependencies, root)
+                    future = executor.submit(self._probe_with_dependencies, root, claim.scan_engine)
                     while not wait((future,), timeout=self.lease_seconds / 3).done:
                         with self.database.session() as session, session.begin():
                             candidate = self._leased_candidate(session, claim)
