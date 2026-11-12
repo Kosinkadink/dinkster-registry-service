@@ -827,6 +827,18 @@ CI runs these checks against PostgreSQL 16, starts the HTTP conformance runner,
 builds the container without dependency credentials, inspects image contents,
 runs the isolated probe under bubblewrap, and runs conformance against the image.
 
+`scripts/check-split-scanner.py <image>` also runs in container CI. It starts
+a disposable HTTPS control plane with a trap against web probe execution,
+then invokes the production `dinkster-scanner` entry point in a separate
+nonroot container. Only its assignment credential, HTTPS origin and temporary
+public test certificate are supplied; the web database, object store and TLS
+private key are not mounted. It asserts accepted fixture schemas, permanent
+legacy-ZIP rejection, web-side public-index delivery and successful empty-queue
+exit. OpenSSL and Docker are required. As with the existing container jail
+checks, Docker needs privileged mode for nested namespaces; this is a local
+transport/jail check, not deployed Fly credential or Machine lifecycle proof.
+Its temporary database, keys, capability file and container are removed on exit.
+
 The container also admits the unchanged first-party wheel in `fixtures/wheels`,
 pinned by source commit, size and SHA-256 in `scripts/release-packs.lock`.
 It checks wheel identity, submits through the authenticated HTTP publisher route,
