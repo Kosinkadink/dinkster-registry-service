@@ -708,7 +708,34 @@ These endpoints accept no query parameters; only result accepts a body. All retu
 signing or management credentials. Reads recheck the fence after retrieving
 bytes so an assignment expiring during resolution receives 409 instead of data.
 Input-store failures return retryable 503 without rejecting the candidate.
-These endpoints do not start/stop Machines or replace the existing scanner command.
+These endpoints do not start/stop Machines.
+
+`dinkster-scanner` is the remote worker entry point. It reads only
+`DINKSTER_SCANNER_ORIGIN` (an HTTPS origin), `DINKSTER_SCANNER_TOKEN` (the worker
+bearer capability) and optional `DINKSTER_SCANNER_RUNTIME_STORE` (default
+`/tmp/dinkster-scan-runtime`). It does not load ServerSettings or the service's
+database, object-store, admission or web modules. The shared engine package
+imports SQLAlchemy for asset record types; the worker does not construct a
+database engine or hold a database credential. Startup refuses known web,
+storage, GitHub and Fly management credentials in its environment and requires
+full user/PID namespace probe isolation before claiming work. Local HTTP and
+runtime mirrors are available only through the explicit development Python API,
+not the production command.
+
+The worker downloads only its assigned bounded inputs, renews the live lease
+during input preparation and execution, and submits one fenced result. HTTP
+redirects and ambient proxies are disabled so neither can receive its bearer
+capability. Transport failures stop the worker without inventing a rejection;
+the lost assignment recovers after expiry. It drains eligible work and exits
+successfully on an empty queue; `--once` processes at most one assignment.
+
+`scripts/start-service.sh` supervises only the HTTP service and
+`dinkster-registry deliver`. Delivery drains promotion, security and index
+outboxes without claiming candidates or running probes. The web startup does
+not need a probe jail. The existing `dinkster-registry scanner` command retains
+the combined database-backed operator/development behavior and must not be used
+as the remote worker or the web startup. Machine lifecycle provisioning and
+restart policy are separate from these process entry points.
 
 Probe and scanner limits use integer environment variables validated at
 startup. Invalid values stop the process with an error naming the variable.

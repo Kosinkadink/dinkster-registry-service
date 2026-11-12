@@ -13,16 +13,11 @@ SCRIPT = Path(__file__).parents[1] / "scripts" / "start-service.sh"
 
 @pytest.mark.parametrize(
     ("failed_child", "exit_status"),
-    (("scanner", 23), ("serve", 23), ("scanner", 0), ("preflight", 23)),
+    (("deliver", 23), ("serve", 23), ("deliver", 0)),
 )
 def test_production_supervisor_fails_closed_and_stops_sibling(
     tmp_path: Path, failed_child: str, exit_status: int
 ) -> None:
-    python = tmp_path / "python"
-    python.write_text(
-        "#!/bin/sh\ncat >/dev/null\n" + ("exit 23\n" if failed_child == "preflight" else "exit 0\n")
-    )
-    python.chmod(0o700)
     command = tmp_path / "dinkster-registry"
     command.write_text(
         "#!/usr/bin/env python3\n"
@@ -30,9 +25,10 @@ def test_production_supervisor_fails_closed_and_stops_sibling(
         "root = pathlib.Path(os.environ['SUPERVISOR_TEST_ROOT'])\n"
         "name = sys.argv[1]\n"
         "root.joinpath(name + '.started').touch()\n"
+        "if name not in {'serve', 'deliver'}: sys.exit(77)\n"
         "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
         "if name == os.environ['FAILED_CHILD']:\n"
-        " sibling = 'serve' if name == 'scanner' else 'scanner'\n"
+        " sibling = 'serve' if name == 'deliver' else 'deliver'\n"
         " while not root.joinpath(sibling + '.started').exists():\n"
         "  time.sleep(0.01)\n"
         " sys.exit(int(os.environ['CHILD_EXIT_STATUS']))\n"
@@ -55,8 +51,6 @@ def test_production_supervisor_fails_closed_and_stops_sibling(
         check=False,
     )
     assert result.returncode == (exit_status or 1)
-    if failed_child == "preflight":
-        assert not list(tmp_path.glob("*.started"))
-    else:
-        sibling = "serve" if failed_child == "scanner" else "scanner"
-        assert tmp_path.joinpath(sibling + ".stopped").exists()
+    assert {path.stem for path in tmp_path.glob("*.started")} == {"serve", "deliver"}
+    sibling = "serve" if failed_child == "deliver" else "deliver"
+    assert tmp_path.joinpath(sibling + ".stopped").exists()

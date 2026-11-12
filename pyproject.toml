@@ -28,6 +28,7 @@ dependencies = [
 
 [project.scripts]
 dinkster-registry = "dinkster_registry_service.cli:main"
+dinkster-scanner = "dinkster_registry_service.scanner_worker:main"
 
 [dependency-groups]
 dev = [

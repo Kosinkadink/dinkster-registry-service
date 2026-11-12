@@ -1634,7 +1634,7 @@ class AdmissionService:
                 ),
             )
 
-    def run_once(self, *, deliver_indexes: bool = True) -> bool:
+    def deliver_once(self, *, deliver_indexes: bool = True) -> bool:
         if SecurityPublication(
             self.database,
             self.object_store,
@@ -1643,6 +1643,18 @@ class AdmissionService:
         ).deliver_one():
             return True
         if self.deliver_one_promotion():
+            return True
+        return self.indexes.deliver_one() if deliver_indexes else False
+
+    def run_delivery(self, *, poll_seconds: float = 1.0) -> None:
+        if poll_seconds <= 0:
+            raise ValueError("poll_seconds must be positive")
+        while True:
+            if not self.deliver_once():
+                time.sleep(poll_seconds)
+
+    def run_once(self, *, deliver_indexes: bool = True) -> bool:
+        if self.deliver_once(deliver_indexes=False):
             return True
         claim = self.claim()
         if claim is None:
