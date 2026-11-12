@@ -31,7 +31,9 @@ from dinkster_schema import (
     claims_conflict,
     reserved_root,
 )
+from dinkster_store import object_path, readable_label
 from dinkster_supervisor.environment_artifacts import acquire
+from dinkster_supervisor.environment_downloads import fetch_artifact
 from dinkster_supervisor.environment_generations import prepare_engine_interpreter
 from dinkster_supervisor.environment_state import writer_lock
 from dinkster_workers.manifest import load_manifest
@@ -1340,9 +1342,8 @@ class AdmissionService:
             claim.scan_engine, claim.install_locks, mirror=self.settings.probe_runtime_mirror
         )
         manifest = load_manifest(root / "dinkster-pack.toml")
-        if manifest.compatibility is None:
-            raise ValueError("selected engine requires pack compatibility")
-        manifest.compatibility.require_engine(manifest.name, catalog.channel.engine_version)
+        if manifest.compatibility is not None:
+            manifest.compatibility.require_engine(manifest.name, catalog.channel.engine_version)
         lock = locks[variant]
         if missing := {normalize_requirement(value) for value in requirements} - set(
             lock.requirements
@@ -1361,6 +1362,16 @@ class AdmissionService:
         store = self.settings.object_store_root / ".probe-runtime"
         store.mkdir(parents=True, exist_ok=True)
         with writer_lock(store):
+            for wheel in wheels:
+                sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
+                fetch_artifact(
+                    (str(wheel.parent),),
+                    wheel.name,
+                    object_path(store / "wheels", "sha256:" + sha, label=readable_label(wheel.stem))
+                    / wheel.name,
+                    sha,
+                    wheel.stat().st_size,
+                )
             constraints = acquire(catalog, variant, store)
             with tempfile.TemporaryDirectory(prefix=".probe-", dir=store) as directory:
                 scratch = Path(directory)

@@ -8,9 +8,12 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
+from dinkster_workers.pack_lock import GenerationPackages, PackLock, plan_pack
+from dinkster_workers.provision import ProvisionError
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx2 import Response
+from runtime_fixture import RuntimeFixture
 from sqlalchemy import select
 
 from dinkster_registry_service.admission import AdmissionService
@@ -93,10 +96,10 @@ def test_publish_api_authenticates_and_attributes_a_sqlite_submission(tmp_path: 
     assert principals.audit()[-1].action == "submit-release"
 
 
-def _locks(archive: bytes) -> dict[str, object]:
+def _locks(archive: bytes, runtime: RuntimeFixture | None = None) -> dict[str, object]:
     return {
         variant: {
-            "baseId": "sha256:" + digit * 64,
+            "baseId": runtime.base_ids[variant] if runtime else "sha256:" + digit * 64,
             "artifactDigest": artifact_digest(archive),
             "lock": {
                 "format": "dinkster.pack-lock/1",
@@ -150,6 +153,75 @@ def test_published_pack_refuses_a_missing_bound_base(
     assert client.get("/v1/packs/locked-pack/versions/1.2.3").status_code == 404
 
 
+def test_service_refuses_incompatible_lock_with_the_user_install_reason(
+    tmp_path: Path, runtime: RuntimeFixture
+) -> None:
+    client, app, token = _client(tmp_path)
+    archive = _archive(tmp_path, "locked-pack")
+    bindings = json.loads(json.dumps(_locks(archive, runtime)))
+    lock = bindings["linux-cpu"]["lock"]
+    lock.update(format="dinkster.pack-lock/2", engine=">=999")
+    expected = (
+        "pack locked-pack: dinkster-api: generation has 0.0.3, engine needs >=999. "
+        "Use an own environment (0 bytes)."
+    )
+    with pytest.raises(ProvisionError) as refusal:
+        plan_pack(
+            PackLock.from_json(json.dumps(lock)),
+            GenerationPackages.inspect(Path(sys.executable)),
+            variant="linux-cpu",
+            own_environment_size=0,
+        ).require_layering()
+    assert str(refusal.value) == expected
+    headers = {"Authorization": f"Bearer {token}"}
+    submitted = client.post(
+        "/v1/publish/locked-pack/versions/1.2.3",
+        headers=headers,
+        files={"archive": ("pack.whl", archive, "application/zip")},
+        data={"locks": json.dumps(bindings)},
+    )
+    assert submitted.status_code == 202, submitted.text
+    admission = AdmissionService(
+        app.state.database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        settings=runtime.settings(tmp_path),
+        require_isolation=False,
+    )
+    assert admission.run_once()
+    status = client.get(f"/v1/publish/{submitted.json()['candidateId']}", headers=headers).json()
+    assert status["status"] == "rejected"
+    assert any(
+        finding["code"] == "probe.dependencies-incompatible" and finding["message"] == expected
+        for finding in status["findings"]
+    )
+    assert client.get("/v1/packs/locked-pack/versions/1.2.3").status_code == 404
+
+
+def test_selected_engine_submission_refuses_missing_dependency_lock(
+    tmp_path: Path, runtime: RuntimeFixture
+) -> None:
+    client, app, token = _client(tmp_path)
+    archive = _archive(tmp_path, "locked-pack")
+    release = json.loads((runtime.mirror / "engine/index.json").read_bytes())[0]
+    headers = {"Authorization": f"Bearer {token}"}
+    submitted = client.post(
+        "/v1/publish/locked-pack/versions/1.2.3",
+        headers=headers,
+        files={"archive": ("pack.whl", archive, "application/zip")},
+        data={
+            "engine": json.dumps(
+                {
+                    "commit": release["commit"],
+                    "manifestDigest": "sha256:" + release["sha256"],
+                }
+            )
+        },
+    )
+    assert submitted.status_code == 400, submitted.text
+    assert "one locks" in submitted.json()["error"]["message"]
+    assert not (tmp_path / "objects").exists()
+
+
 def test_publish_api_binds_exact_engine_and_rejects_changed_or_malformed_binding(
     tmp_path: Path,
 ) -> None:
@@ -185,14 +257,14 @@ def test_publish_api_binds_exact_engine_and_rejects_changed_or_malformed_binding
 
 
 def test_locked_publication_recovers_rejected_dependency_without_reset(
-    tmp_path: Path, database: Database, database_url: str
+    tmp_path: Path, database: Database, database_url: str, runtime: RuntimeFixture
 ) -> None:
     client, app, token = _client(tmp_path, database_url)
     _archive(tmp_path, "locked-pack")
     manifest = tmp_path / "locked-pack" / "dinkster-pack.toml"
     manifest.write_text(manifest.read_text() + '\n[pack.dependencies]\nhelper-pack = ">=1,<2"\n')
     archive = build_registry_fixture_archive(manifest.parent)
-    locks = _locks(archive)
+    locks = _locks(archive, runtime)
     headers = {"Authorization": f"Bearer {token}"}
     endpoint = "/v1/publish/locked-pack/versions/1.2.3"
 
@@ -208,6 +280,7 @@ def test_locked_publication_recovers_rejected_dependency_without_reset(
         app.state.database,
         LocalFilesystemObjectStore(tmp_path / "objects"),
         require_isolation=False,
+        settings=runtime.settings(tmp_path),
     )
     first = publish(locks)
     assert first.status_code == 202
@@ -258,30 +331,23 @@ def test_locked_publication_recovers_rejected_dependency_without_reset(
 
 
 def test_published_locks_bind_archive_base_and_visibility(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runtime: RuntimeFixture
 ) -> None:
     client, app, token = _client(tmp_path)
     archive = _archive(tmp_path, "locked-pack")
-    locks = json.loads(json.dumps(_locks(archive)))
+    locks = json.loads(json.dumps(_locks(archive, runtime)))
     locks["linux-cpu"]["lock"]["packages"] = [
         {
             "name": "fixture",
             "version": "1.0",
-            "wheels": [
-                {
-                    "filename": "fixture-1.0-py3-none-any.whl",
-                    "size": 7,
-                    "sha256": "a" * 64,
-                    "url": "https://example.test/fixture-1.0-py3-none-any.whl",
-                }
-            ],
+            "wheels": [runtime.wheel_record("fixture", "1.0")],
         }
     ]
     locks["linux-cpu"]["lock"].update(
         format="dinkster.pack-lock/2",
         engine=">=0.0.2,<0.1",
         requirements=["dinkster-api<0.1,>=0.0.2", "fixture==1.0"],
-        indexes=["https://example.test/simple"],
+        indexes=[runtime.wheel_origin + "/simple"],
     )
     endpoint = "/v1/publish/locked-pack/versions/1.2.3"
     headers = {"Authorization": f"Bearer {token}"}
@@ -298,12 +364,13 @@ def test_published_locks_bind_archive_base_and_visibility(
     assert submitted.status_code == 202, submitted.text
     assert publish(locks).json()["candidateId"] == submitted.json()["candidateId"]
     lock_url = "/v1/packs/locked-pack/versions/1.2.3/locks/linux-cpu"
-    query = {"baseId": "sha256:" + "1" * 64}
+    query = {"baseId": runtime.base_ids["linux-cpu"]}
     assert client.get(lock_url, params=query).status_code == 404
     admission = AdmissionService(
         app.state.database,
         LocalFilesystemObjectStore(tmp_path / "objects"),
         require_isolation=False,
+        settings=runtime.settings(tmp_path),
     )
     assert admission.run_once()
     assert admission.status(UUID(submitted.json()["candidateId"])).status == "accepted"
@@ -317,7 +384,7 @@ def test_published_locks_bind_archive_base_and_visibility(
     ).encode("ascii")
     windows = client.get(
         lock_url.replace("linux-cpu", "win-cpu"),
-        params={"baseId": "sha256:" + "2" * 64},
+        params={"baseId": runtime.base_ids["win-cpu"]},
     )
     assert windows.status_code == 200
     assert windows.json() == locks["win-cpu"]["lock"]
@@ -330,7 +397,7 @@ def test_published_locks_bind_archive_base_and_visibility(
     assert facts["digest"] == artifact_digest(download.content)
     assert facts["size"] == len(download.content)
     assert facts["baseId"] == query["baseId"]
-    assert client.get(lock_url, params={"baseId": "sha256:" + "2" * 64}).status_code == 409
+    assert client.get(lock_url, params={"baseId": runtime.base_ids["win-cpu"]}).status_code == 409
     assert (
         client.get(
             lock_url, params=query, headers={"If-None-Match": download.headers["etag"]}
@@ -381,23 +448,18 @@ def test_published_locks_bind_archive_base_and_visibility(
     assert client.get(lock_url, params=query).status_code == 500
 
 
-def test_format2_lock_validation_preserves_legacy_exact_locks(tmp_path: Path) -> None:
+def test_format2_lock_validation_preserves_legacy_exact_locks(
+    tmp_path: Path, runtime: RuntimeFixture
+) -> None:
     client, app, token = _client(tmp_path)
     archive = _archive(tmp_path, "locked-pack")
-    locks = json.loads(json.dumps(_locks(archive)))
+    locks = json.loads(json.dumps(_locks(archive, runtime)))
     lock = locks["linux-cpu"]["lock"]
     lock.update(format="dinkster.pack-lock/2", engine=">=0.0.2,<0.1")
     api = {
         "name": "dinkster-api",
-        "version": "0.0.2",
-        "wheels": [
-            {
-                "filename": "dinkster_api-0.0.2-py3-none-any.whl",
-                "size": 17,
-                "sha256": "a" * 64,
-                "url": "https://example.test/dinkster_api-0.0.2-py3-none-any.whl",
-            }
-        ],
+        "version": "0.0.3",
+        "wheels": [runtime.wheel_record("dinkster-api", "0.0.3")],
     }
     locks["win-cpu"]["lock"]["packages"] = [api]
 
@@ -428,6 +490,7 @@ def test_format2_lock_validation_preserves_legacy_exact_locks(tmp_path: Path) ->
         app.state.database,
         LocalFilesystemObjectStore(tmp_path / "objects"),
         require_isolation=False,
+        settings=runtime.settings(tmp_path),
     )
     assert admission.run_once()
     assert admission.status(UUID(submitted.json()["candidateId"])).status == "accepted"
@@ -530,6 +593,7 @@ def test_invalid_published_locks_refuse_before_submission(tmp_path: Path, mutati
 
 def test_installation_lock_storage_failure_keeps_release_private_until_retry(
     tmp_path: Path,
+    runtime: RuntimeFixture,
 ) -> None:
     client, app, token = _client(tmp_path)
     archive = _archive(tmp_path, "locked-pack")
@@ -537,7 +601,7 @@ def test_installation_lock_storage_failure_keeps_release_private_until_retry(
         "/v1/publish/locked-pack/versions/1.2.3",
         headers={"Authorization": f"Bearer {token}"},
         files={"archive": ("pack.zip", archive, "application/zip")},
-        data={"locks": json.dumps(_locks(archive))},
+        data={"locks": json.dumps(_locks(archive, runtime))},
     )
     assert submitted.status_code == 202
 
@@ -550,7 +614,9 @@ def test_installation_lock_storage_failure_keeps_release_private_until_retry(
             super().put(key, data)
 
     store = UnavailableLockStorage(tmp_path / "objects")
-    admission = AdmissionService(app.state.database, store, require_isolation=False)
+    admission = AdmissionService(
+        app.state.database, store, require_isolation=False, settings=runtime.settings(tmp_path)
+    )
     candidate = UUID(submitted.json()["candidateId"])
     assert admission.run_once()
     assert admission.status(candidate).status == "promoting"
@@ -558,7 +624,7 @@ def test_installation_lock_storage_failure_keeps_release_private_until_retry(
     assert client.get(endpoint).status_code == 404
     assert (
         client.get(
-            endpoint + "/locks/linux-cpu", params={"baseId": "sha256:" + "1" * 64}
+            endpoint + "/locks/linux-cpu", params={"baseId": runtime.base_ids["linux-cpu"]}
         ).status_code
         == 404
     )
@@ -570,10 +636,11 @@ def test_installation_lock_storage_failure_keeps_release_private_until_retry(
     assert admission.run_once()
     assert admission.status(candidate).status == "accepted"
     detail = client.get(endpoint).json()
-    for variant, digit in (("linux-cpu", "1"), ("win-cpu", "2")):
-        response = client.get(
-            endpoint + f"/locks/{variant}", params={"baseId": "sha256:" + digit * 64}
-        )
+    for variant, base_id in (
+        ("linux-cpu", runtime.base_ids["linux-cpu"]),
+        ("win-cpu", runtime.base_ids["win-cpu"]),
+    ):
+        response = client.get(endpoint + f"/locks/{variant}", params={"baseId": base_id})
         assert response.status_code == 200
         assert artifact_digest(response.content) == detail["installLocks"][variant]["digest"]
 

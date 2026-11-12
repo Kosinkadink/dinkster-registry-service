@@ -1,19 +1,39 @@
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Iterator
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
+from runtime_fixture import RuntimeFixture, build_runtime
 
 from dinkster_registry_service.app import create_app
 from dinkster_registry_service.database import Database
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore
 from dinkster_registry_service.seed import seed_fixtures
 from dinkster_registry_service.settings import ServerSettings
+
+
+@pytest.fixture(scope="session")
+def runtime(tmp_path_factory: pytest.TempPathFactory) -> Iterator[RuntimeFixture]:
+    root = tmp_path_factory.mktemp("verified-runtimes")
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0), partial(SimpleHTTPRequestHandler, directory=str(root))
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield build_runtime(root / "runtime", "0.0.3", f"http://127.0.0.1:{server.server_port}")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 @pytest.fixture(scope="session")

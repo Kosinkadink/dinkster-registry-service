@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from runtime_fixture import RuntimeFixture
 from sqlalchemy import select
 
 from dinkster_registry_service.admission import AdmissionService
@@ -324,6 +325,7 @@ def test_manifest_publisher_matches_authenticated_publisher(
 
 def test_static_only_pinned_install_imports_library_and_refuses_pack_requirement(
     tmp_path: Path,
+    runtime: RuntimeFixture,
 ) -> None:
     database = Database(f"sqlite:///{tmp_path / 'catalog.db'}")
     store = LocalFilesystemObjectStore(tmp_path / "objects")
@@ -345,7 +347,7 @@ def test_static_only_pinned_install_imports_library_and_refuses_pack_requirement
         database,
         store,
         require_isolation=False,
-        settings=ServerSettings(probe_package_index_url=f"{origin}/static/cpu/simple"),
+        settings=runtime.settings(tmp_path, probe_package_index_url=f"{origin}/static/cpu/simple"),
     )
     try:
         principals = PrincipalRepository(database)
@@ -367,7 +369,7 @@ def test_static_only_pinned_install_imports_library_and_refuses_pack_requirement
         library_wheel = inspect_wheel(library, "demo-core", "1.2.3")
         locks = {
             variant: {
-                "baseId": "sha256:" + "1" * 64,
+                "baseId": runtime.base_ids[variant],
                 "artifactDigest": artifact_digest(pack),
                 "lock": {
                     "format": "dinkster.pack-lock/1",
