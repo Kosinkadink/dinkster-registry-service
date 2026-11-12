@@ -73,13 +73,17 @@ cannot change on replay, including after rejection or expiry.
 
 Each member receives the regular admission stages and retains its own scanner
 lease, timeout retries and operator-review findings. Scanned members remain
-private while any sibling is unfinished or awaiting review. Once every member
-is ready, the service verifies current publishing authority and stored bytes,
-then activates all releases in one database transaction. An artifact-storage
-failure rolls back every catalog change and retries promotion after five
-seconds. Atomicity covers database and API activation, not static index reads:
-activation queues one durable index rebuild for the set, delivered using the
-existing eventual, retryable static writer.
+private while any sibling is unfinished or awaiting review. Pack helpers and
+transitive registry libraries resolve against active public releases and this
+set's siblings, never another pending set. Quarantined dependencies are verified
+before staging them in the disposable probe root; they are not published first.
+Once every member is ready, the service rechecks dependency eligibility and the
+exact bytes used by successful probes, current publishing authority and stored
+member bytes, then activates all releases in one database transaction. An
+artifact-storage failure rolls back every catalog change and retries promotion
+after five seconds. Atomicity covers database and API activation, not static
+index reads: activation queues one durable index rebuild for the set, delivered
+using the existing eventual, retryable static writer.
 
 A set expires 24 hours after submission. A rejected member rejects the whole
 set; expiry or rejection fences outstanding scanner leases and releases every

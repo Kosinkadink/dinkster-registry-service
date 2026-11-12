@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from httpx2 import Response
 from runtime_fixture import RuntimeFixture
 from sqlalchemy import select
+from test_wheels import wheel_bytes
 
 from dinkster_registry_service.admission import AdmissionService, LeaseLost
 from dinkster_registry_service.app import create_app
@@ -28,6 +29,7 @@ from dinkster_registry_service.database import (
     OutboxRecord,
     PackRecord,
     ReleaseCandidateRecord,
+    ReleaseRecord,
     ReleaseSetRecord,
 )
 from dinkster_registry_service.digests import artifact_digest
@@ -1164,3 +1166,126 @@ def test_publish_set_concurrent_workers_scan_distinct_members_and_activate_once(
         assert set(activation_events[0].data["members"]) == {
             row["candidateId"] for row in status["members"]
         }
+
+
+@pytest.mark.parametrize("failure", [None, "range", "cycle", "other-set"])
+def test_publish_set_resolves_transitive_pack_and_library_siblings_without_publication(
+    tmp_path: Path, failure: str | None
+) -> None:
+    client, app, token = _client(tmp_path)
+    consumer = "set-consumer"
+    helper = "set-helper"
+    for name in (consumer, helper):
+        _archive(tmp_path, name)
+    manifest = tmp_path / consumer / "dinkster-pack.toml"
+    manifest.write_text(manifest.read_text() + '\n[pack.dependencies]\nset-helper = ">=1,<2"\n')
+    nodes = tmp_path / consumer / "nodes.py"
+    nodes.write_text(
+        "from set_helper.helpers import VALUE\nassert VALUE == 43\n"
+        + nodes.read_text().replace("version=2,", "version=VALUE,")
+    )
+    manifest = tmp_path / helper / "dinkster-pack.toml"
+    manifest.write_text(
+        manifest.read_text().replace("[pack]\n", '[pack]\nrequires = ["set-library==1.2.3"]\n')
+        + ('\n[pack.dependencies]\nset-consumer = ">=1,<2"\n' if failure == "cycle" else "")
+    )
+    (tmp_path / helper / "helpers.py").write_text(
+        "from set_library import ANSWER\nVALUE = ANSWER + 2\n"
+    )
+    library = wheel_bytes(
+        name="set-library",
+        package="set_library",
+        library=True,
+        requirements=("set-leaf>=2" if failure == "range" else "set-leaf==1.2.3",),
+        extra={
+            "set_library/__init__.py": b"from set_leaf import ANSWER as LEAF\nANSWER = LEAF + 4\n"
+        },
+    )
+    leaf = wheel_bytes(
+        name="set-leaf",
+        package="set_leaf",
+        library=True,
+        requirements=(),
+        extra={"set_leaf/__init__.py": b"ANSWER = 37\n"},
+    )
+    members = [
+        (consumer, build_registry_fixture_archive(tmp_path / consumer)),
+        (helper, build_registry_fixture_archive(tmp_path / helper)),
+        ("set-library", library),
+        ("set-leaf", leaf),
+    ]
+    submitted = _publish_set(
+        client, token, members[:1] if failure == "other-set" else members
+    ).json()
+    if failure == "other-set":
+        assert _publish_set(client, token, members[1:]).status_code == 202
+    store = LocalFilesystemObjectStore(tmp_path / "objects")
+    admission = AdmissionService(app.state.database, store, require_isolation=False)
+    auth = {"Authorization": f"Bearer {token}"}
+    for _ in range(8):
+        assert admission.run_once(deliver_indexes=False)
+        status = client.get(f"/v1/publish-sets/{submitted['setId']}", headers=auth).json()
+        if status["status"] != "queued":
+            break
+        assert client.get(f"/v1/packs/{consumer}").status_code == 404
+    assert status["status"] == ("rejected" if failure else "accepted"), status
+    if failure:
+        assert client.get(f"/v1/packs/{consumer}").status_code == 404
+        assert any(row["findings"] for row in status["members"])
+    else:
+        assert {row["status"] for row in status["members"]} == {"accepted"}
+        with app.state.database.session() as session:
+            release = session.scalar(
+                select(ReleaseRecord).join(PackRecord).where(PackRecord.name == consumer)
+            )
+            assert release is not None
+            assert release.manifest["pythonRequirements"] == []
+        assert admission.run_once(deliver_indexes=False)
+        assert admission.run_once()
+        schemas = json.loads(store.read(f"static/packs/{consumer}/1.2.3/schemas.json"))["schemas"]
+        assert (
+            next(row for row in schemas if row["nodeType"] == consumer + ".resize")["schema"][
+                "version"
+            ]
+            == 43
+        )
+
+
+def test_publish_set_refuses_dependency_withdrawn_after_its_successful_probe(
+    tmp_path: Path,
+) -> None:
+    client, app, token = _client(tmp_path)
+    library = wheel_bytes(name="set-lib", package="set_lib", library=True, requirements=())
+    admission = AdmissionService(
+        app.state.database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        require_isolation=False,
+    )
+    candidate = admission.submit(library, pack_name="set-lib", version="1.2.3")
+    assert admission.run_once()
+    assert admission.status(candidate).status == "accepted"
+    name = "set-dependent"
+    _archive(tmp_path, name)
+    manifest = tmp_path / name / "dinkster-pack.toml"
+    manifest.write_text(
+        manifest.read_text().replace("[pack]\n", '[pack]\nrequires = ["set-lib==1.2.3"]\n')
+    )
+    nodes = tmp_path / name / "nodes.py"
+    nodes.write_text("from set_lib import ANSWER\nassert ANSWER == 42\n" + nodes.read_text())
+    submitted = _publish_set(
+        client, token, [(name, build_registry_fixture_archive(tmp_path / name))]
+    ).json()
+    assert admission.run_once(deliver_indexes=False)
+    admission.yank("set-lib", "1.2.3", reason="withdrawn after probe")
+    assert admission.run_once(deliver_indexes=False)
+    assert admission.run_once(deliver_indexes=False)
+    status = client.get(
+        f"/v1/publish-sets/{submitted['setId']}", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert status["status"] == "rejected", status
+    assert any(
+        "no longer eligible" in finding["message"]
+        for row in status["members"]
+        for finding in row["findings"]
+    )
+    assert client.get(f"/v1/packs/{name}").status_code == 404
