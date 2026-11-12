@@ -144,12 +144,13 @@ class ScannerWorker:
                     for item in resolved["libraryWheels"]
                 ),
                 tuple(resolved["requirements"]),
+                tuple(resolved["bindings"]),
             )
             locks = json.loads(
                 self._request("GET", path + "/locks", lease=lease, limit=48 * 1024 * 1024)
                 or b"null"
             )
-            return run_prepared_probe(
+            probe = run_prepared_probe(
                 root,
                 dependencies,
                 settings=ProbeSettings(**claim["probeSettings"]),
@@ -162,6 +163,13 @@ class ScannerWorker:
                 runtime_store=self.runtime_store,
                 development_release=self.development_release,
                 development_runtime=self.development_runtime,
+            )
+            return replace(
+                probe,
+                operator_details={
+                    **(probe.operator_details or {}),
+                    "dependencyBindings": list(dependencies.bindings),
+                },
             )
 
     def run_once(self) -> bool:

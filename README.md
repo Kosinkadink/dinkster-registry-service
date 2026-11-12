@@ -52,6 +52,46 @@ the submitted wheel and published manifest remain unchanged. Missing, conflictin
 or corrupt helper dependencies fail with `probe.pack-dependencies-unavailable`.
 Doctor still rejects private imports, and unrelated packs are not staged.
 
+## Wheel-set submission
+
+`POST /v1/publish-sets` accepts an authenticated multipart request with one
+`manifest` JSON field and one named wheel file per member. The manifest has
+`members`, each containing `name`, `version`, and `archive` (the file field name),
+plus optional `locks` and `engine` objects using the single-wheel bindings.
+File field names and pack names must be distinct. The server authenticates before
+reading the body and checks token scope for every member before persisting any.
+The authenticated `dinkster` publisher can submit up to 64 members; every other
+publisher can submit up to 8. Request fields and operator status do not increase
+these limits. The aggregate HTTP body is limited to 128 MiB, with existing
+64 MiB wheel and 8 MiB member lock bounds.
+
+The response and authenticated `GET /v1/publish-sets/{setId}` include set status,
+expiry and the existing per-candidate status and findings for every member.
+Exact replay, independent of member order, returns the existing pending or
+accepted set without extending its deadline. Archive, lock and engine bindings
+cannot change on replay, including after rejection or expiry.
+
+Each member receives the regular admission stages and retains its own scanner
+lease, timeout retries and operator-review findings. Scanned members remain
+private while any sibling is unfinished or awaiting review. Pack helpers and
+transitive registry libraries resolve against active public releases and this
+set's siblings, never another pending set. Quarantined dependencies are verified
+before staging them in the disposable probe root; they are not published first.
+Once every member is ready, the service rechecks dependency eligibility and the
+exact bytes used by successful probes, current publishing authority and stored
+member bytes, then activates all releases in one database transaction. An
+artifact-storage failure rolls back every catalog change and retries promotion
+after five seconds. Atomicity covers database and API activation, not static
+index reads: activation queues one durable index rebuild for the set, delivered
+using the existing eventual, retryable static writer.
+
+A set expires 24 hours after submission. A rejected member rejects the whole
+set; expiry or rejection fences outstanding scanner leases and releases every
+member for a new exact-byte admission attempt. Private wheel and lock cleanup
+is durable and retried separately, so a storage cleanup outage does not retain
+the submission reservation. A rejected or expired set never activates releases
+or queues a public index rebuild.
+
 ## Static public indexes
 
 All installer reads use `/static/`. The registry writes PEP 503 pages at

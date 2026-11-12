@@ -7,6 +7,7 @@ import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -33,7 +34,12 @@ from packaging.version import Version
 from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.orm import Session
 
-from .admission_checks import check_wheel_catalog, run_manifest_admission
+from .admission_checks import (
+    DependencyRelease,
+    check_wheel_catalog,
+    dependency_releases,
+    run_manifest_admission,
+)
 from .database import (
     ArtifactRecord,
     AuditEventRecord,
@@ -49,6 +55,7 @@ from .database import (
     ReleaseNodeRecord,
     ReleaseRecord,
     ReleaseScanRunRecord,
+    ReleaseSetRecord,
 )
 from .digests import artifact_digest, artifact_object_key
 from .identifiers import require_canonical_pack_name
@@ -57,6 +64,7 @@ from .indexes import StaticIndexes, queue_index_rebuild
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStore, ObjectStoreError
 from .pack_locks import MAX_LOCK_SIZE, lock_object_key, parse_pack_locks, quarantine_lock_key
 from .principals import PrincipalRepository
+from .release_sets import clean_one_set, queue_set_cleanup, settle_one_set
 from .scan_engine import parse_scan_engine
 from .scan_execution import ProbeDependencies, run_prepared_probe
 from .scanner_lifecycle import MachineUnavailable, ScannerLifecycle, ScannerMachines
@@ -109,6 +117,7 @@ class CandidateClaim:
     attempt: int
     scan_engine: dict[str, str] | None = None
     install_locks: dict[str, dict[str, Any]] = field(default_factory=dict)
+    set_id: UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -270,6 +279,8 @@ class AdmissionService:
         locks: bytes | None = None,
         engine: bytes | None = None,
         authorization: UploadAuthorization | None = None,
+        session: Session | None = None,
+        set_id: UUID | None = None,
     ) -> UUID:
         require_canonical_pack_name(pack_name)
         require_public_version(version)
@@ -303,8 +314,13 @@ class AdmissionService:
         try:
             for lock in prepared:
                 self.object_store.put(quarantine_lock_key(candidate_id, lock.variant), lock.data)
-            with self.database.session() as session, session.begin():
-                lock_security(session)
+            own_transaction = session is None
+            with (
+                self.database.session() if session is None else nullcontext(session) as session,
+                session.begin() if own_transaction else nullcontext(),
+            ):
+                if own_transaction:
+                    lock_security(session)
                 if authorization is not None:
                     SecurityRepository.require_authorization(session, authorization, pack_name)
                 SecurityRepository.require_uploads(session, pack_name, publisher)
@@ -327,6 +343,8 @@ class AdmissionService:
                 if (
                     prepared
                     or scan_engine is not None
+                    or set_id is not None
+                    or any(item.set_id is not None for item in previous_candidates)
                     or any(item.scan_engine is not None for item in previous_candidates)
                 ):
                     for recorded in previous_candidates:
@@ -343,6 +361,8 @@ class AdmissionService:
                         (item for item in previous_candidates if item.status != "rejected"), None
                     )
                     if previous is not None:
+                        if previous.set_id != set_id:
+                            raise AdmissionError("release belongs to another pending submission")
                         if previous.status not in {"queued", "retrying", "scanning", "accepted"}:
                             raise AdmissionError(f"release candidate is {previous.status}")
                         self.object_store.remove(object_key)
@@ -358,6 +378,7 @@ class AdmissionService:
                     ReleaseCandidateRecord(
                         id=candidate_id,
                         kind="upload",
+                        set_id=set_id,
                         release_id=None,
                         publisher_id=publisher,
                         pack_name=pack_name,
@@ -484,7 +505,17 @@ class AdmissionService:
                             ReleaseCandidateRecord.status == "scanning",
                             ReleaseCandidateRecord.lease_expires_at <= now,
                         ),
-                    )
+                    ),
+                    or_(
+                        ReleaseCandidateRecord.set_id.is_(None),
+                        select(ReleaseSetRecord.id)
+                        .where(
+                            ReleaseSetRecord.id == ReleaseCandidateRecord.set_id,
+                            ReleaseSetRecord.status == "queued",
+                            ReleaseSetRecord.expires_at > now,
+                        )
+                        .exists(),
+                    ),
                 )
                 .order_by(ReleaseCandidateRecord.submitted_at, ReleaseCandidateRecord.id)
                 .with_for_update(skip_locked=True)
@@ -523,6 +554,7 @@ class AdmissionService:
                 attempt=candidate.attempt_count,
                 scan_engine=candidate.scan_engine,
                 install_locks=candidate.install_locks,
+                set_id=candidate.set_id,
             )
 
     def leased_claim(
@@ -559,10 +591,13 @@ class AdmissionService:
                 attempt=candidate.attempt_count,
                 scan_engine=candidate.scan_engine,
                 install_locks=candidate.install_locks,
+                set_id=candidate.set_id,
             )
 
     @staticmethod
-    def _leased_candidate(session: Session, claim: CandidateClaim) -> ReleaseCandidateRecord:
+    def _leased_candidate(
+        session: Session, claim: CandidateClaim, *, promoting: bool = False
+    ) -> ReleaseCandidateRecord:
         candidate = session.scalar(
             select(ReleaseCandidateRecord)
             .where(ReleaseCandidateRecord.id == claim.id)
@@ -573,10 +608,9 @@ class AdmissionService:
             expiry = expiry.replace(tzinfo=UTC)
         if (
             candidate is None
-            or candidate.status != "scanning"
+            or candidate.status != ("promoting" if promoting else "scanning")
             or candidate.lease_token != claim.lease_token
-            or expiry is None
-            or expiry <= datetime.now(UTC)
+            or (not promoting and (expiry is None or expiry <= datetime.now(UTC)))
         ):
             raise LeaseLost(f"candidate {claim.id} lease is absent, expired or replaced")
         return candidate
@@ -595,12 +629,18 @@ class AdmissionService:
         self._process(replace(claim, lease_token=token), remote=True, probe_result=result)
 
     def _record_stage(
-        self, claim: CandidateClaim, stage: str, result: StageResult, *, remote: bool = False
+        self,
+        claim: CandidateClaim,
+        stage: str,
+        result: StageResult,
+        *,
+        remote: bool = False,
+        promoting: bool = False,
     ) -> bool:
         with self.database.session() as session, session.begin():
             if not self.database.is_postgresql:
                 session.connection().exec_driver_sql("BEGIN IMMEDIATE")
-            candidate = self._leased_candidate(session, claim)
+            candidate = self._leased_candidate(session, claim, promoting=promoting)
             now = datetime.now(UTC)
             doctor = (
                 cast("dict[str, object]", result.data)
@@ -803,12 +843,22 @@ class AdmissionService:
             ),
         )
 
-    def _prepare_promotion(self, claim: CandidateClaim, data: bytes) -> None:
+    def _prepare_promotion(
+        self, claim: CandidateClaim, data: bytes, *, session: Session | None = None
+    ) -> None:
+        own_transaction = session is None
+        if own_transaction and claim.set_id is not None:
+            self._ready_set_member(claim, claim.set_id)
+            return
         try:
             wheel = inspect_wheel(data, claim.pack_name, claim.version)
-            with self.database.session() as session, session.begin():
-                lock_security(session)
-                candidate = self._leased_candidate(session, claim)
+            with (
+                self.database.session() if session is None else nullcontext(session) as session,
+                session.begin() if own_transaction else nullcontext(),
+            ):
+                if own_transaction:
+                    lock_security(session)
+                candidate = self._leased_candidate(session, claim, promoting=not own_transaction)
                 authorization = SecurityRepository.require_candidate_upload(session, candidate)
                 if self.database.is_postgresql:
                     session.execute(
@@ -1043,27 +1093,30 @@ class AdmissionService:
                         },
                     )
                 )
-                session.add(
-                    OutboxRecord(
-                        id=uuid7(),
-                        created_at=now,
-                        available_at=now,
-                        delivered_at=None,
-                        topic="artifact.promote",
-                        event_key=f"artifact.promote:{candidate.id}",
-                        payload={
-                            "candidateId": str(candidate.id),
-                            "releaseId": str(release_id),
-                            "sourceKey": candidate.object_key,
-                            "destinationKey": final_key,
-                        },
-                        state="pending",
-                        attempts=0,
+                if own_transaction:
+                    session.add(
+                        OutboxRecord(
+                            id=uuid7(),
+                            created_at=now,
+                            available_at=now,
+                            delivered_at=None,
+                            topic="artifact.promote",
+                            event_key=f"artifact.promote:{candidate.id}",
+                            payload={
+                                "candidateId": str(candidate.id),
+                                "releaseId": str(release_id),
+                                "sourceKey": candidate.object_key,
+                                "destinationKey": final_key,
+                            },
+                            state="pending",
+                            attempts=0,
+                        )
                     )
-                )
                 candidate.status = "promoting"
                 candidate.status_reason = None
         except WheelError as exc:
+            if not own_transaction:
+                raise
             self._record_stage(
                 claim,
                 "commit",
@@ -1071,9 +1124,263 @@ class AdmissionService:
             )
             return
         except (PromotionConflict, RegistryError) as exc:
+            if not own_transaction:
+                raise
             self._record_promotion_conflict(claim, str(exc))
             return
-        self.deliver_one_promotion()
+        if own_transaction:
+            self.deliver_one_promotion()
+
+    def _ready_set_member(self, claim: CandidateClaim, set_id: UUID) -> None:
+        with self.database.session() as session, session.begin():
+            lock_security(session)
+            release_set = session.get(ReleaseSetRecord, set_id, with_for_update=True)
+            if (
+                release_set is None
+                or release_set.status != "queued"
+                or release_set.expires_at.replace(tzinfo=UTC) <= datetime.now(UTC)
+            ):
+                raise LeaseLost("set is no longer eligible for activation")
+            candidate = self._leased_candidate(session, claim)
+            candidate.status = "promoting"
+            candidate.status_reason = None
+            session.flush()
+            unfinished = session.scalar(
+                select(ReleaseCandidateRecord.id).where(
+                    ReleaseCandidateRecord.set_id == set_id,
+                    ReleaseCandidateRecord.status != "promoting",
+                )
+            )
+            if unfinished is None:
+                now = datetime.now(UTC)
+                session.add(
+                    OutboxRecord(
+                        id=uuid7(),
+                        created_at=now,
+                        available_at=now,
+                        delivered_at=None,
+                        topic="release_set.promote",
+                        event_key=f"release_set.promote:{set_id}",
+                        payload={"setId": str(set_id)},
+                        state="pending",
+                        attempts=0,
+                    )
+                )
+
+    def deliver_one_set_promotion(self) -> bool:
+        event_id: UUID | None = None
+        claim: CandidateClaim | None = None
+        try:
+            with self.database.session() as session, session.begin():
+                lock_security(session)
+                event = session.scalar(
+                    select(OutboxRecord)
+                    .where(
+                        OutboxRecord.topic == "release_set.promote",
+                        OutboxRecord.state == "pending",
+                        OutboxRecord.available_at <= datetime.now(UTC),
+                    )
+                    .order_by(OutboxRecord.created_at, OutboxRecord.id)
+                    .with_for_update(skip_locked=True)
+                    .limit(1)
+                )
+                if event is None:
+                    return False
+                event_id = event.id
+                release_set = session.get(
+                    ReleaseSetRecord, UUID(event.payload["setId"]), with_for_update=True
+                )
+                assert release_set is not None
+                now = datetime.now(UTC)
+                if (
+                    release_set.status != "queued"
+                    or release_set.expires_at.replace(tzinfo=UTC) <= now
+                ):
+                    event.state = "delivered"
+                    event.delivered_at = now
+                    return True
+                candidates = list(
+                    session.scalars(
+                        select(ReleaseCandidateRecord)
+                        .where(ReleaseCandidateRecord.set_id == release_set.id)
+                        .order_by(ReleaseCandidateRecord.pack_name)
+                        .with_for_update()
+                    )
+                )
+                catalog = dependency_releases(session, release_set.id)
+                prepared: list[tuple[CandidateClaim, Wheel]] = []
+                for candidate in candidates:
+                    if candidate.status != "promoting" or candidate.lease_token is None:
+                        raise PromotionConflict("set member is not ready for activation")
+                    claim = CandidateClaim(
+                        id=candidate.id,
+                        kind=candidate.kind,
+                        release_id=None,
+                        pack_name=candidate.pack_name,
+                        version=candidate.version,
+                        declared_digest=candidate.declared_digest,
+                        declared_size=candidate.declared_size,
+                        object_key=candidate.object_key,
+                        lease_token=candidate.lease_token,
+                        attempt=candidate.attempt_count,
+                        scan_engine=candidate.scan_engine,
+                        install_locks=candidate.install_locks,
+                        set_id=release_set.id,
+                    )
+                    SecurityRepository.require_candidate_upload(session, candidate)
+                    data = self.object_store.read(candidate.object_key, max_size=MAX_ARTIFACT_SIZE)
+                    integrity = run_wheel_integrity(
+                        data,
+                        candidate.declared_size,
+                        candidate.declared_digest,
+                        candidate.pack_name,
+                        candidate.version,
+                    )
+                    if integrity.blocked:
+                        raise PromotionConflict("quarantine object changed before set activation")
+                    wheel = inspect_wheel(data, candidate.pack_name, candidate.version)
+                    with extracted_wheel(data, wheel) as root:
+                        if not wheel.library:
+                            manifest = run_manifest_admission(
+                                root,
+                                candidate.pack_name,
+                                candidate.version,
+                                session,
+                                publisher=candidate.publisher_id,
+                                dependencies=catalog,
+                                object_store=self.object_store,
+                            )
+                            if manifest.blocked:
+                                raise PromotionConflict(manifest.findings[0].message)
+                            probe = session.scalar(
+                                select(ReleaseScanRunRecord)
+                                .where(
+                                    ReleaseScanRunRecord.candidate_id == candidate.id,
+                                    ReleaseScanRunRecord.attempt == candidate.attempt_count,
+                                    ReleaseScanRunRecord.stage == "executable_probe",
+                                )
+                                .order_by(
+                                    ReleaseScanRunRecord.created_at.desc(),
+                                    ReleaseScanRunRecord.id.desc(),
+                                )
+                                .limit(1)
+                            )
+                            if probe is None or "dependencyBindings" not in (
+                                probe.operator_details or {}
+                            ):
+                                raise PromotionConflict("probe dependency evidence is incomplete")
+                            available = {item.binding: item for item in catalog if item.available}
+                            for binding in (probe.operator_details or {})["dependencyBindings"]:
+                                if binding not in available:
+                                    raise PromotionConflict(
+                                        "a scanned dependency is no longer eligible"
+                                    )
+                                available[binding].read(self.object_store)
+                        else:
+                            self._probe_library_wheels(set(wheel.requirements), catalog)
+                    self.object_store.put(artifact_object_key(candidate.declared_digest), data)
+                    for variant, binding in candidate.install_locks.items():
+                        stored = self.object_store.open(
+                            quarantine_lock_key(candidate.id, variant),
+                            expected_size=binding["size"],
+                            expected_digest=binding["digest"],
+                        )
+                        self.object_store.put(lock_object_key(binding["digest"]), b"".join(stored))
+                    self._prepare_promotion(claim, data, session=session)
+                    prepared.append((claim, wheel))
+                for prepared_claim, wheel in prepared:
+                    claim = prepared_claim
+                    check_wheel_catalog(wheel, session)
+                now = datetime.now(UTC)
+                if release_set.expires_at.replace(tzinfo=UTC) <= now:
+                    raise LeaseLost("set expired during artifact promotion")
+                for candidate in candidates:
+                    assert candidate.release_id is not None
+                    release = session.get(ReleaseRecord, candidate.release_id)
+                    assert release is not None
+                    self._activate_release(session, candidate, release, now)
+                release_set.status = "accepted"
+                release_set.status_reason = None
+                event.state = "delivered"
+                event.delivered_at = now
+                event.attempts += 1
+                queue_index_rebuild(session)
+                queue_set_cleanup(session, release_set, candidates)
+                session.add(
+                    AuditEventRecord(
+                        id=uuid7(),
+                        created_at=now,
+                        event_type="release_set.activated",
+                        subject_type="release_set",
+                        subject_id=str(release_set.id),
+                        data={"members": release_set.members},
+                    )
+                )
+        except (UploadStopped, OSError, ObjectStoreError) as exc:
+            assert event_id is not None
+            with self.database.session() as session, session.begin():
+                event = session.get(OutboxRecord, event_id, with_for_update=True)
+                assert event is not None
+                if event.state == "pending":
+                    event.attempts += 1
+                    event.available_at = datetime.now(UTC) + timedelta(
+                        seconds=60 if isinstance(exc, UploadStopped) else 5
+                    )
+        except (ValueError, PromotionConflict, RegistryError) as exc:
+            assert claim is not None
+            self._record_stage(
+                claim,
+                "commit",
+                StageResult(
+                    (
+                        AdmissionFinding(
+                            exc.code
+                            if isinstance(exc, WheelError)
+                            else "manifest.version-conflict",
+                            "error",
+                            "block",
+                            str(exc),
+                        ),
+                    )
+                ),
+                promoting=True,
+            )
+        return True
+
+    @staticmethod
+    def _activate_release(
+        session: Session, candidate: ReleaseCandidateRecord, release: ReleaseRecord, now: datetime
+    ) -> None:
+        pack = session.get(PackRecord, release.pack_id, with_for_update=True)
+        if pack is None:
+            raise AdmissionError("promotion release references absent pack")
+        release.state = "active"
+        release.state_reason = None
+        release.state_changed_at = now
+        current = session.scalar(
+            select(ReleaseRecord).where(
+                ReleaseRecord.pack_id == pack.id,
+                ReleaseRecord.version == pack.latest_version,
+            )
+        )
+        if current is None or Version(release.version) >= Version(current.version):
+            pack.latest_version = release.version
+        pack.updated_at = now
+        candidate.status = "accepted"
+        candidate.status_reason = None
+        candidate.lease_owner = None
+        candidate.lease_token = None
+        candidate.lease_expires_at = None
+        session.add(
+            AuditEventRecord(
+                id=uuid7(),
+                created_at=now,
+                event_type="release.activated",
+                subject_type="release",
+                subject_id=str(release.id),
+                data={"candidateId": str(candidate.id)},
+            )
+        )
 
     def deliver_one_promotion(self) -> bool:
         failure: BaseException | None = None
@@ -1167,40 +1474,11 @@ class AdmissionService:
                 candidate.status_reason = "artifact-promotion-retry"
             if failure is None:
                 now = datetime.now(UTC)
-                pack = session.get(PackRecord, release.pack_id, with_for_update=True)
-                if pack is None:
-                    raise AdmissionError("promotion release references absent pack")
-                release.state = "active"
-                release.state_reason = None
-                release.state_changed_at = now
-                current = session.scalar(
-                    select(ReleaseRecord).where(
-                        ReleaseRecord.pack_id == pack.id,
-                        ReleaseRecord.version == pack.latest_version,
-                    )
-                )
-                if current is None or Version(release.version) >= Version(current.version):
-                    pack.latest_version = release.version
-                pack.updated_at = now
-                candidate.status = "accepted"
-                candidate.status_reason = None
-                candidate.lease_owner = None
-                candidate.lease_token = None
-                candidate.lease_expires_at = None
+                self._activate_release(session, candidate, release, now)
                 outbox.state = "delivered"
                 outbox.delivered_at = now
                 outbox.attempts += 1
                 queue_index_rebuild(session)
-                session.add(
-                    AuditEventRecord(
-                        id=uuid7(),
-                        created_at=now,
-                        event_type="release.activated",
-                        subject_type="release",
-                        subject_id=str(release.id),
-                        data={"candidateId": str(candidate.id)},
-                    )
-                )
         if failure is not None:
             return True
         self.object_store.remove(source_key)
@@ -1267,49 +1545,40 @@ class AdmissionService:
                 )
             )
 
-    def _probe_library_wheels(self, requirements: set[str]) -> tuple[tuple[str, bytes], ...]:
+    def _probe_library_wheels(
+        self,
+        requirements: set[str],
+        dependencies: list[DependencyRelease] | None = None,
+    ) -> tuple[tuple[tuple[str, bytes], ...], set[str]]:
         with self.database.session() as session:
-            rows = session.execute(
-                select(PackRecord, ReleaseRecord).join(
-                    ReleaseRecord, ReleaseRecord.pack_id == PackRecord.id
-                )
-            ).all()
-            libraries = {
-                canonicalize_name(pack.name)
-                for pack, release in rows
-                if release.manifest.get("kind") == "library"
-            }
-            available: dict[str, list[ReleaseRecord]] = {name: [] for name in libraries}
-            for pack, release in rows:
-                name = canonicalize_name(pack.name)
-                if name in libraries and pack.visibility == "public" and release.state == "active":
+            catalog = dependency_releases(session) if dependencies is None else dependencies
+            libraries = {canonicalize_name(release.name) for release in catalog}
+            available: dict[str, list[DependencyRelease]] = {name: [] for name in libraries}
+            for release in catalog:
+                name = canonicalize_name(release.name)
+                if release.available:
                     available[name].append(release)
             for releases in available.values():
                 releases.sort(key=lambda release: Version(release.version), reverse=True)
-            artifacts: dict[UUID, tuple[Wheel, bytes]] = {}
+            artifacts: dict[str, tuple[Wheel, bytes]] = {}
 
-            def read(release: ReleaseRecord, name: str) -> tuple[Wheel, bytes]:
-                if release.id not in artifacts:
-                    artifact = session.get(ArtifactRecord, release.artifact_digest)
-                    assert artifact is not None
-                    data = self.object_store.read(artifact.object_key, max_size=MAX_ARTIFACT_SIZE)
-                    if artifact_digest(data) != artifact.digest or len(data) != artifact.size:
-                        raise ValueError(f"Library artifact changed for {name!r}.")
-                    wheel = inspect_wheel(data, name, release.version)
+            def read(release: DependencyRelease, name: str) -> tuple[Wheel, bytes]:
+                if release.digest not in artifacts:
+                    wheel, data = release.read(self.object_store)
                     if not wheel.library:
                         raise ValueError(f"Requirement {name!r} names a pack, not a library.")
                     if any(Requirement(value).url is not None for value in wheel.requirements):
                         raise ValueError(
                             f"Library {name!r} dependencies must use the package index."
                         )
-                    artifacts[release.id] = wheel, data
-                return artifacts[release.id]
+                    artifacts[release.digest] = wheel, data
+                return artifacts[release.digest]
 
             def resolve(
                 pending: list[tuple[Requirement, frozenset[str]]],
-                selected: dict[str, ReleaseRecord],
+                selected: dict[str, DependencyRelease],
                 expanded: frozenset[tuple[str, frozenset[str]]],
-            ) -> dict[str, ReleaseRecord]:
+            ) -> dict[str, DependencyRelease]:
                 while pending:
                     requirement, parent_extras = pending.pop(0)
                     if requirement.marker is not None and not any(
@@ -1326,7 +1595,7 @@ class AdmissionService:
                         )
                     candidates = [selected[name]] if name in selected else available[name]
                     failure = ValueError(
-                        f"No active public library {name!r} satisfies "
+                        f"No eligible registry library {name!r} satisfies "
                         f"{str(requirement.specifier)!r}."
                     )
                     for release in candidates:
@@ -1360,45 +1629,42 @@ class AdmissionService:
             for library_name, release in sorted(selected.items()):
                 wheel, data = read(release, library_name)
                 wheels.append((wheel.filename, data))
-            return tuple(wheels)
+            return tuple(wheels), {release.binding for release in selected.values()}
 
-    def _resolve_probe_dependencies(self, root: Path) -> ProbeDependencies:
+    def _resolve_probe_dependencies(
+        self, root: Path, set_id: UUID | None = None
+    ) -> ProbeDependencies:
         manifest_path = root / "dinkster-pack.toml"
         manifest = load_manifest(manifest_path)
         pending = list(manifest.dependencies)
         selected: dict[str, str] = {}
+        bindings: set[str] = set()
         requirements = set(manifest.requires_for("cpu"))
         helpers = []
         with self.database.session() as session:
+            catalog = dependency_releases(session, set_id)
             while pending:
                 dependency = pending.pop(0)
                 if dependency.pack in selected:
                     if not dependency.accepts(selected[dependency.pack]):
                         raise ValueError(f"Conflicting helper dependency {dependency.pack!r}.")
                     continue
-                releases = session.scalars(
-                    select(ReleaseRecord)
-                    .join(PackRecord, PackRecord.id == ReleaseRecord.pack_id)
-                    .where(
-                        PackRecord.name == dependency.pack,
-                        PackRecord.visibility == "public",
-                        ReleaseRecord.state == "active",
-                    )
-                )
                 release = max(
-                    (item for item in releases if dependency.accepts(item.version)),
+                    (
+                        item
+                        for item in catalog
+                        if item.name == dependency.pack
+                        and item.available
+                        and dependency.accepts(item.version)
+                    ),
                     key=lambda item: Version(item.version),
                     default=None,
                 )
                 if release is None:
                     raise ValueError(f"No active helper dependency {dependency.pack!r}.")
                 selected[dependency.pack] = release.version
-                artifact = session.get(ArtifactRecord, release.artifact_digest)
-                assert artifact is not None
-                data = self.object_store.read(artifact.object_key, max_size=MAX_ARTIFACT_SIZE)
-                if artifact_digest(data) != artifact.digest or len(data) != artifact.size:
-                    raise ValueError(f"Helper artifact changed for {dependency.pack!r}.")
-                wheel = inspect_wheel(data, dependency.pack, release.version)
+                bindings.add(release.binding)
+                wheel, data = release.read(self.object_store)
                 if wheel.library:
                     raise ValueError("Pack dependencies must name packs, not libraries.")
                 with extracted_wheel(data, wheel) as dependency_root:
@@ -1406,13 +1672,19 @@ class AdmissionService:
                     pending.extend(helper.dependencies)
                     requirements.update(helper.requires_for("cpu"))
                 helpers.append(data)
+        wheels, library_bindings = self._probe_library_wheels(requirements, catalog)
         return ProbeDependencies(
-            tuple(helpers), self._probe_library_wheels(requirements), tuple(sorted(requirements))
+            tuple(helpers),
+            wheels,
+            tuple(sorted(requirements)),
+            tuple(sorted(bindings | library_bindings)),
         )
 
-    def probe_dependencies(self, root: Path) -> ProbeDependencies | StageResult:
+    def probe_dependencies(
+        self, root: Path, set_id: UUID | None = None
+    ) -> ProbeDependencies | StageResult:
         try:
-            return self._resolve_probe_dependencies(root)
+            return self._resolve_probe_dependencies(root, set_id)
         except (ValueError, ObjectStoreError, FileNotFoundError) as exc:
             return StageResult(
                 (
@@ -1434,7 +1706,7 @@ class AdmissionService:
         return locks
 
     def _probe_with_dependencies(self, root: Path, claim: CandidateClaim) -> StageResult:
-        dependencies = self.probe_dependencies(root)
+        dependencies = self.probe_dependencies(root, claim.set_id)
         if isinstance(dependencies, StageResult):
             return dependencies
         try:
@@ -1447,7 +1719,7 @@ class AdmissionService:
                     ),
                 )
             )
-        return run_prepared_probe(
+        probe = run_prepared_probe(
             root,
             dependencies,
             settings=self.settings.probe_settings(),
@@ -1459,6 +1731,13 @@ class AdmissionService:
             artifact_digest=claim.declared_digest,
             runtime_store=self.settings.object_store_root / ".probe-runtime",
             development_runtime=self.settings.probe_runtime_mirror,
+        )
+        return replace(
+            probe,
+            operator_details={
+                **(probe.operator_details or {}),
+                "dependencyBindings": list(dependencies.bindings),
+            },
         )
 
     def _process(
@@ -1524,6 +1803,8 @@ class AdmissionService:
                             claim.version,
                             session,
                             publisher=candidate.publisher_id,
+                            dependencies=dependency_releases(session, claim.set_id),
+                            object_store=self.object_store,
                         )
                     )
                     if (
@@ -1637,6 +1918,8 @@ class AdmissionService:
             )
 
     def deliver_once(self, *, deliver_indexes: bool = True) -> bool:
+        if settle_one_set(self) or clean_one_set(self):
+            return True
         if SecurityPublication(
             self.database,
             self.object_store,
@@ -1645,6 +1928,8 @@ class AdmissionService:
         ).deliver_one():
             return True
         if self.deliver_one_promotion():
+            return True
+        if self.deliver_one_set_promotion():
             return True
         return self.indexes.deliver_one() if deliver_indexes else False
 
@@ -1728,12 +2013,21 @@ class AdmissionService:
             raise AdmissionError("review resolution requires an actor and reason")
         claim: CandidateClaim | None = None
         with self.database.session() as session, session.begin():
+            lock_security(session)
             candidate = session.get(ReleaseCandidateRecord, candidate_id, with_for_update=True)
             if candidate is None:
                 raise AdmissionError(f"candidate {candidate_id} was not found")
             if candidate.status != "review":
                 raise AdmissionError("only a candidate awaiting review can be resolved")
             now = datetime.now(UTC)
+            if candidate.set_id is not None:
+                release_set = session.get(ReleaseSetRecord, candidate.set_id)
+                if (
+                    release_set is None
+                    or release_set.status != "queued"
+                    or release_set.expires_at.replace(tzinfo=UTC) <= now
+                ):
+                    raise AdmissionError("set is no longer eligible for review")
             session.add(
                 AuditEventRecord(
                     id=uuid7(),
@@ -1775,14 +2069,17 @@ class AdmissionService:
                     object_key=candidate.object_key,
                     lease_token=token,
                     attempt=candidate.attempt_count,
+                    scan_engine=candidate.scan_engine,
+                    install_locks=candidate.install_locks,
+                    set_id=candidate.set_id,
                 )
         if claim is not None:
             data = self.object_store.read(claim.object_key, max_size=MAX_ARTIFACT_SIZE)
             self._prepare_promotion(claim, data)
         return self.status(candidate_id)
 
-    def status(self, candidate_id: UUID) -> CandidateStatus:
-        with self.database.session() as session:
+    def status(self, candidate_id: UUID, *, session: Session | None = None) -> CandidateStatus:
+        with self.database.session() if session is None else nullcontext(session) as session:
             candidate = session.get(ReleaseCandidateRecord, candidate_id)
             if candidate is None:
                 raise AdmissionError(f"candidate {candidate_id} was not found")

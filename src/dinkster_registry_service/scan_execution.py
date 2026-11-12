@@ -36,6 +36,7 @@ class ProbeDependencies:
     helper_wheels: tuple[bytes, ...]
     library_wheels: tuple[tuple[str, bytes], ...]
     requirements: tuple[str, ...]
+    bindings: tuple[str, ...] = ()
 
 
 def run_prepared_probe(

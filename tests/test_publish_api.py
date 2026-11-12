@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import pytest
+from dinkster_registry.archive_admission import AdmissionFinding, StageResult, run_executable_probe
 from dinkster_workers.pack_lock import GenerationPackages, PackLock, plan_pack
 from dinkster_workers.provision import ProvisionError
 from fastapi import FastAPI
@@ -15,8 +19,11 @@ from fastapi.testclient import TestClient
 from httpx2 import Response
 from runtime_fixture import RuntimeFixture
 from sqlalchemy import select
+from test_wheels import wheel_bytes
 
-from dinkster_registry_service.admission import AdmissionService
+import dinkster_registry_service.scan_execution as scan_execution
+import dinkster_registry_service.scanner_worker as scanner_worker
+from dinkster_registry_service.admission import AdmissionService, LeaseLost
 from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
 from dinkster_registry_service.cli import main
@@ -26,6 +33,9 @@ from dinkster_registry_service.database import (
     NamespaceGrantRecord,
     OutboxRecord,
     PackRecord,
+    ReleaseCandidateRecord,
+    ReleaseRecord,
+    ReleaseSetRecord,
 )
 from dinkster_registry_service.digests import artifact_digest
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore, ObjectStoreError
@@ -51,13 +61,18 @@ def _archive(tmp_path: Path, name: str, *, native: bool = False) -> bytes:
     return build_registry_fixture_archive(source)
 
 
-def _client(tmp_path: Path, database_url: str | None = None) -> tuple[TestClient, FastAPI, str]:
+def _client(
+    tmp_path: Path, database_url: str | None = None, *, scanner_token: str | None = None
+) -> tuple[TestClient, FastAPI, str]:
     app = create_app(
         ServerSettings(
             database_url=database_url or f"sqlite:///{tmp_path / 'registry.db'}",
             object_store_root=tmp_path / "objects",
             public_base_url="http://testserver",
             cursor_secret=b"publish-api-test-cursor-secret",
+            scanner_token_sha256=hashlib.sha256(scanner_token.encode()).hexdigest()
+            if scanner_token is not None
+            else None,
         )
     )
     principals = PrincipalRepository(app.state.database)
@@ -681,3 +696,765 @@ def test_operator_resolves_review_and_publisher_owns_catalog_grants(tmp_path: Pa
         )
         assert pack.publisher_id == "example-org"
         assert grants and {grant.publisher_id for grant in grants} == {"example-org"}
+
+
+def _publish_set(
+    client: TestClient,
+    token: str,
+    members: list[tuple[str, bytes]],
+) -> Response:
+    return client.post(
+        "/v1/publish-sets",
+        headers={"Authorization": f"Bearer {token}"},
+        data={
+            "manifest": json.dumps(
+                {
+                    "members": [
+                        {"name": name, "version": "1.2.3", "archive": f"wheel{index}"}
+                        for index, (name, _) in enumerate(members)
+                    ]
+                }
+            )
+        },
+        files={
+            f"wheel{index}": (f"{name}.whl", data) for index, (name, data) in enumerate(members)
+        },
+    )
+
+
+def test_publish_set_persists_all_members_and_replays_without_changing_expiry(
+    tmp_path: Path,
+    database: Database,
+    database_url: str,
+) -> None:
+    client, app, token = _client(tmp_path, database_url)
+    members = [(name, _archive(tmp_path, name)) for name in ("set-alpha", "set-beta")]
+    response = _publish_set(client, token, members)
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["status"] == "queued"
+    assert {row["packName"] for row in body["members"]} == {"set-alpha", "set-beta"}
+    assert {row["status"] for row in body["members"]} == {"queued"}
+    assert {row["artifactDigest"] for row in body["members"]} == {
+        artifact_digest(data) for _, data in members
+    }
+    replay = _publish_set(client, token, list(reversed(members)))
+    assert replay.status_code == 202, replay.text
+    assert replay.json() == body
+    with app.state.database.session() as session:
+        assert len(list(session.scalars(select(ReleaseSetRecord)))) == 1
+        assert len(list(session.scalars(select(ReleaseCandidateRecord)))) == 2
+    status = client.get(
+        f"/v1/publish-sets/{body['setId']}", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert status.status_code == 200
+    assert status.json() == body
+
+    changed = _publish_set(
+        client,
+        token,
+        [
+            ("set-rolled-back", _archive(tmp_path, "set-rolled-back")),
+            ("set-alpha", members[0][1] + b"changed"),
+        ],
+    )
+    assert changed.status_code == 409
+    with app.state.database.session() as session:
+        assert len(list(session.scalars(select(ReleaseSetRecord)))) == 1
+        assert len(list(session.scalars(select(ReleaseCandidateRecord)))) == 2
+
+
+@pytest.mark.parametrize("publisher,limit", [("example-org", 8), ("dinkster", 64)])
+def test_publish_set_enforces_authenticated_tier_boundaries(
+    tmp_path: Path,
+    publisher: str,
+    limit: int,
+) -> None:
+    client, app, token = _client(tmp_path)
+    if publisher == "dinkster":
+        principals = PrincipalRepository(app.state.database)
+        now = datetime.now(UTC)
+        principals.register_publisher(publisher, "owner", now.isoformat())
+        token, _ = principals.mint_token(
+            publisher, "owner", now.isoformat(), (now + timedelta(hours=1)).isoformat()
+        )
+    members = [
+        (f"tier-pack-{index}", b"queued for full scanner validation") for index in range(limit + 1)
+    ]
+    refused = _publish_set(client, token, members)
+    assert refused.status_code == 400, refused.text
+    assert f"Requested {limit + 1} members; publisher limit is {limit}" in refused.text
+    accepted = _publish_set(client, token, members[:-1])
+    assert accepted.status_code == 202, accepted.text
+    assert len(accepted.json()["members"]) == limit
+
+
+def test_publish_set_checks_every_scope_and_duplicate_before_persisting(tmp_path: Path) -> None:
+    client, app, token = _client(tmp_path)
+    principals = PrincipalRepository(app.state.database)
+    now = datetime.now(UTC)
+    scoped, _ = principals.mint_token(
+        "example-org",
+        "owner",
+        now.isoformat(),
+        (now + timedelta(hours=1)).isoformat(),
+        pack="set-allowed",
+    )
+    members = [("set-allowed", b"first"), ("set-forbidden", b"second")]
+    assert _publish_set(client, scoped, members).status_code == 409
+    duplicate = _publish_set(client, token, [members[0], members[0]])
+    assert duplicate.status_code == 400
+    assert "duplicate pack identity" in duplicate.text
+    with app.state.database.session() as session:
+        assert list(session.scalars(select(ReleaseSetRecord))) == []
+        assert list(session.scalars(select(ReleaseCandidateRecord))) == []
+    assert client.post("/v1/publish-sets", content=b"not authenticated").status_code == 401
+
+
+@pytest.mark.parametrize("terminal", ["expired", "rejected"])
+def test_publish_set_releases_all_members_but_preserves_immutable_bindings(
+    tmp_path: Path, database: Database, database_url: str, terminal: str
+) -> None:
+    client, app, token = _client(tmp_path, database_url)
+    members = [(name, _archive(tmp_path, name)) for name in ("set-first", "set-second")]
+    submitted = _publish_set(client, token, members).json()
+    set_id = UUID(submitted["setId"])
+    store = LocalFilesystemObjectStore(tmp_path / "objects")
+    admission = AdmissionService(app.state.database, store, require_isolation=False)
+    late_claim = admission.claim() if terminal == "expired" else None
+    with app.state.database.session() as session, session.begin():
+        release_set = session.get(ReleaseSetRecord, set_id)
+        assert release_set is not None
+        if terminal == "expired":
+            release_set.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        else:
+            candidate = session.get(ReleaseCandidateRecord, UUID(release_set.members[-1]))
+            assert candidate is not None
+            candidate.status = "rejected"
+            candidate.status_reason = "integrity.invalid"
+        old_keys = [
+            row.object_key
+            for row in session.scalars(
+                select(ReleaseCandidateRecord).where(ReleaseCandidateRecord.set_id == set_id)
+            )
+        ]
+    assert admission.run_once(deliver_indexes=False)
+    if late_claim is not None:
+        with pytest.raises(LeaseLost):
+            admission.process(late_claim)
+    status = client.get(
+        f"/v1/publish-sets/{set_id}", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert status["status"] == terminal
+    assert {member["status"] for member in status["members"]} == {"rejected"}
+    if terminal == "rejected":
+        assert {member["reason"] for member in status["members"]} == {
+            "set.member-rejected",
+            "integrity.invalid",
+        }
+    else:
+        assert {member["reason"] for member in status["members"]} == {"set.expired"}
+    for name, _ in members:
+        assert client.get(f"/v1/packs/{name}").status_code == 404
+    assert all(store.exists(key) for key in old_keys)
+
+    replay = _publish_set(client, token, list(reversed(members)))
+    assert replay.status_code == 202, replay.text
+    assert replay.json()["setId"] != str(set_id)
+    assert {member["status"] for member in replay.json()["members"]} == {"queued"}
+    changed = _publish_set(client, token, [(members[0][0], members[0][1] + b"changed")])
+    assert changed.status_code == 409
+    assert admission.run_once(deliver_indexes=False)
+    assert not any(store.exists(key) for key in old_keys)
+    with app.state.database.session() as session:
+        pending = list(
+            session.scalars(
+                select(ReleaseCandidateRecord).where(
+                    ReleaseCandidateRecord.set_id == UUID(replay.json()["setId"])
+                )
+            )
+        )
+        assert all(store.exists(row.object_key) for row in pending)
+        assert len(pending) == 2
+        assert not list(
+            session.scalars(select(OutboxRecord).where(OutboxRecord.topic == "indexes.rebuild"))
+        )
+
+
+def test_publish_set_expiry_cleanup_retries_without_blocking_resubmission(tmp_path: Path) -> None:
+    client, app, token = _client(tmp_path)
+    members = [("set-retry", _archive(tmp_path, "set-retry"))]
+    submitted = _publish_set(client, token, members).json()
+
+    class UnavailableCleanup(LocalFilesystemObjectStore):
+        unavailable = True
+
+        def remove(self, key: str) -> None:
+            if self.unavailable:
+                raise ObjectStoreError("synthetic cleanup outage")
+            super().remove(key)
+
+    store = UnavailableCleanup(tmp_path / "objects")
+    admission = AdmissionService(app.state.database, store, require_isolation=False)
+    with app.state.database.session() as session, session.begin():
+        release_set = session.get(ReleaseSetRecord, UUID(submitted["setId"]))
+        assert release_set is not None
+        release_set.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    assert admission.run_once(deliver_indexes=False)
+    assert admission.run_once(deliver_indexes=False)
+    replay = _publish_set(client, token, members)
+    assert replay.status_code == 202, replay.text
+    assert replay.json()["setId"] != submitted["setId"]
+    store.unavailable = False
+    with app.state.database.session() as session, session.begin():
+        cleanup = session.scalar(
+            select(OutboxRecord).where(OutboxRecord.topic == "release_set.cleanup")
+        )
+        assert cleanup is not None
+        cleanup.available_at = datetime.now(UTC) - timedelta(seconds=1)
+    assert admission.run_once(deliver_indexes=False)
+    status = client.get(
+        f"/v1/publish-sets/{submitted['setId']}", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert status.json()["status"] == "expired"
+
+
+@pytest.mark.parametrize("storage_failure", [False, True])
+def test_publish_set_keeps_scanned_members_private_until_one_activation_transaction(
+    tmp_path: Path, database: Database, database_url: str, storage_failure: bool
+) -> None:
+    client, app, token = _client(tmp_path, database_url)
+    members = [(name, _archive(tmp_path, name)) for name in ("set-alpha", "set-zeta")]
+    submitted = _publish_set(client, token, members).json()
+    auth = {"Authorization": f"Bearer {token}"}
+
+    class UnavailableSecondArtifact(LocalFilesystemObjectStore):
+        unavailable = storage_failure
+
+        def put(self, key: str, data: bytes) -> None:
+            if data == members[-1][1] and key.startswith("artifacts/") and self.unavailable:
+                raise ObjectStoreError("synthetic second artifact outage")
+            super().put(key, data)
+
+    store = UnavailableSecondArtifact(tmp_path / "objects")
+    admission = AdmissionService(app.state.database, store, require_isolation=False)
+    for _ in members:
+        assert admission.run_once(deliver_indexes=False)
+        for name, _ in members:
+            assert client.get(f"/v1/packs/{name}").status_code == 404
+    status = client.get(f"/v1/publish-sets/{submitted['setId']}", headers=auth).json()
+    assert status["status"] == "queued"
+    assert {row["status"] for row in status["members"]} == {"promoting"}
+    assert admission.run_once(deliver_indexes=False)
+    if storage_failure:
+        assert (
+            client.get(f"/v1/publish-sets/{submitted['setId']}", headers=auth).json()["status"]
+            == "queued"
+        )
+        for name, _ in members:
+            assert client.get(f"/v1/packs/{name}").status_code == 404
+        with app.state.database.session() as session, session.begin():
+            event = session.scalar(
+                select(OutboxRecord).where(OutboxRecord.topic == "release_set.promote")
+            )
+            assert event is not None
+            event.available_at = datetime.now(UTC) - timedelta(seconds=1)
+        store.unavailable = False
+        assert admission.run_once(deliver_indexes=False)
+    status = client.get(f"/v1/publish-sets/{submitted['setId']}", headers=auth).json()
+    assert status["status"] == "accepted"
+    assert {row["status"] for row in status["members"]} == {"accepted"}
+    for name, data in members:
+        detail = client.get(f"/v1/packs/{name}/versions/1.2.3")
+        assert detail.status_code == 200, detail.text
+        assert artifact_digest(data) in detail.text
+    with app.state.database.session() as session:
+        events = list(
+            session.scalars(select(OutboxRecord).where(OutboxRecord.topic == "indexes.rebuild"))
+        )
+        assert len(events) == 1
+        assert events[0].state == "pending"
+    replay = _publish_set(client, token, list(reversed(members)))
+    assert replay.status_code == 202
+    assert replay.json() == status
+
+
+@pytest.mark.parametrize("stop", ["expiry", "revocation"])
+def test_publish_set_rechecks_deadline_and_authority_before_activation(
+    tmp_path: Path, database: Database, database_url: str, stop: str
+) -> None:
+    client, app, token = _client(tmp_path, database_url)
+    members = [(name, _archive(tmp_path, name)) for name in ("set-earlier", "set-later")]
+    submitted = _publish_set(client, token, members).json()
+    admission = AdmissionService(
+        app.state.database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        require_isolation=False,
+    )
+    for _ in members:
+        assert admission.run_once(deliver_indexes=False)
+    if stop == "expiry":
+        with app.state.database.session() as session, session.begin():
+            release_set = session.get(ReleaseSetRecord, UUID(submitted["setId"]))
+            assert release_set is not None
+            release_set.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    else:
+        principals = PrincipalRepository(app.state.database)
+        now = datetime.now(UTC)
+        identity = principals.verify_token(token, now.isoformat())
+        principals.revoke_token(identity.token_id, "owner", now.isoformat(), "rotated")
+        token, _ = principals.mint_token(
+            "example-org", "owner", now.isoformat(), (now + timedelta(hours=1)).isoformat()
+        )
+    assert admission.deliver_one_set_promotion()
+    assert admission.run_once(deliver_indexes=False)
+    status = client.get(
+        f"/v1/publish-sets/{submitted['setId']}", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert status["status"] == ("expired" if stop == "expiry" else "rejected")
+    assert {row["status"] for row in status["members"]} == {"rejected"}
+    for name, _ in members:
+        assert client.get(f"/v1/packs/{name}").status_code == 404
+
+
+def test_publish_set_scan_failure_keeps_ready_sibling_private(tmp_path: Path) -> None:
+    client, app, token = _client(tmp_path)
+    members = [("set-valid", _archive(tmp_path, "set-valid")), ("set-broken", b"not a wheel")]
+    submitted = _publish_set(client, token, members).json()
+    admission = AdmissionService(
+        app.state.database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        require_isolation=False,
+    )
+    assert admission.run_once(deliver_indexes=False)
+    assert admission.run_once(deliver_indexes=False)
+    assert admission.run_once(deliver_indexes=False)
+    status = client.get(
+        f"/v1/publish-sets/{submitted['setId']}", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert status["status"] == "rejected"
+    assert {row["status"] for row in status["members"]} == {"rejected"}
+    broken = next(row for row in status["members"] if row["packName"] == "set-broken")
+    assert any(row["effect"] == "block" for row in broken["findings"])
+    assert client.get("/v1/packs/set-valid").status_code == 404
+    assert client.get("/v1/packs/set-broken").status_code == 404
+
+
+def test_publish_set_preserves_installation_locks_through_activation_and_cleanup(
+    tmp_path: Path, runtime: RuntimeFixture
+) -> None:
+    client, app, token = _client(tmp_path)
+    archive = _archive(tmp_path, "locked-pack")
+    submitted = client.post(
+        "/v1/publish-sets",
+        headers={"Authorization": f"Bearer {token}"},
+        files={"wheel": ("locked-pack.whl", archive)},
+        data={
+            "manifest": json.dumps(
+                {
+                    "members": [
+                        {
+                            "name": "locked-pack",
+                            "version": "1.2.3",
+                            "archive": "wheel",
+                            "locks": _locks(archive, runtime),
+                        }
+                    ]
+                }
+            ),
+        },
+    )
+    assert submitted.status_code == 202, submitted.text
+    admission = AdmissionService(
+        app.state.database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        settings=runtime.settings(tmp_path),
+        require_isolation=False,
+    )
+    for _ in range(3):
+        assert admission.run_once(deliver_indexes=False)
+    endpoint = "/v1/packs/locked-pack/versions/1.2.3"
+    detail = client.get(endpoint)
+    assert detail.status_code == 200, detail.text
+    for variant, binding in detail.json()["installLocks"].items():
+        response = client.get(endpoint + f"/locks/{variant}", params={"baseId": binding["baseId"]})
+        assert response.status_code == 200
+        assert artifact_digest(response.content) == binding["digest"]
+    with app.state.database.session() as session:
+        member = session.get(
+            ReleaseCandidateRecord, UUID(submitted.json()["members"][0]["candidateId"])
+        )
+        assert member is not None
+        assert not admission.object_store.exists(member.object_key)
+        for variant in member.install_locks:
+            assert not admission.object_store.exists(f"quarantine/locks/{member.id}/{variant}.json")
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+def test_publish_set_review_decision_never_activates_one_member_alone(
+    tmp_path: Path, accepted: bool
+) -> None:
+    client, app, token = _client(tmp_path)
+    members = [
+        ("set-clean", _archive(tmp_path, "set-clean")),
+        ("set-native", _archive(tmp_path, "set-native", native=True)),
+    ]
+    submitted = _publish_set(client, token, members).json()
+    admission = AdmissionService(
+        app.state.database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        require_isolation=False,
+    )
+    for _ in members:
+        assert admission.run_once(deliver_indexes=False)
+    status = client.get(
+        f"/v1/publish-sets/{submitted['setId']}", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    review = next(row for row in status["members"] if row["packName"] == "set-native")
+    assert review["status"] == "review"
+    decision = client.post(
+        f"/v1/reviews/{review['candidateId']}",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"decision": "accept" if accepted else "reject", "reason": "native inventory review"},
+    )
+    assert decision.status_code == 200, decision.text
+    assert decision.json()["status"] == ("promoting" if accepted else "rejected")
+    for name, _ in members:
+        assert client.get(f"/v1/packs/{name}").status_code == 404
+    assert admission.run_once(deliver_indexes=False)
+    status = client.get(
+        f"/v1/publish-sets/{submitted['setId']}", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert status["status"] == ("accepted" if accepted else "rejected")
+    assert {row["status"] for row in status["members"]} == {status["status"]}
+
+
+def test_publish_set_concurrent_workers_scan_distinct_members_and_activate_once(
+    tmp_path: Path, database: Database, database_url: str
+) -> None:
+    client, app, token = _client(tmp_path, database_url)
+    members = [(name, _archive(tmp_path, name)) for name in ("set-early", "set-late")]
+    submitted = _publish_set(client, token, members).json()
+    services = [
+        AdmissionService(
+            app.state.database,
+            LocalFilesystemObjectStore(tmp_path / "objects"),
+            require_isolation=False,
+            worker_id=f"worker-{index}",
+        )
+        for index in range(2)
+    ]
+    claims = [service.claim() for service in services]
+    assert all(claim is not None for claim in claims)
+    assert len({claim.id for claim in claims if claim is not None}) == 2
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        scans = [
+            executor.submit(service.process, claim)
+            for service, claim in zip(services, claims, strict=True)
+            if claim is not None
+        ]
+        for scan in scans:
+            scan.result(timeout=60)
+        for name, _ in members:
+            assert client.get(f"/v1/packs/{name}").status_code == 404
+        activations = [executor.submit(service.deliver_one_set_promotion) for service in services]
+        assert sum(activation.result(timeout=30) for activation in activations) == 1
+    status = client.get(
+        f"/v1/publish-sets/{submitted['setId']}", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert status["status"] == "accepted"
+    assert {row["status"] for row in status["members"]} == {"accepted"}
+    with app.state.database.session() as session:
+        activation_events = list(
+            session.scalars(
+                select(AuditEventRecord).where(
+                    AuditEventRecord.event_type == "release_set.activated"
+                )
+            )
+        )
+        assert len(activation_events) == 1
+        assert set(activation_events[0].data["members"]) == {
+            row["candidateId"] for row in status["members"]
+        }
+
+
+@pytest.mark.parametrize("failure", [None, "range", "cycle", "other-set"])
+@pytest.mark.parametrize("remote", [False, True])
+def test_publish_set_resolves_transitive_pack_and_library_siblings_without_publication(
+    tmp_path: Path, failure: str | None, remote: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, app, token = _client(tmp_path, scanner_token="set-scanner-capability")
+    worker = scanner_worker.ScannerWorker(
+        "http://testserver", "set-scanner-capability", tmp_path / "worker-runtime", development=True
+    )
+    if remote:
+
+        def request(
+            method: str,
+            path: str,
+            *,
+            lease: str | None = None,
+            payload: dict[str, Any] | None = None,
+            limit: int = 1024 * 1024,
+        ) -> bytes | None:
+            headers = {"Authorization": "Bearer set-scanner-capability"}
+            if lease is not None:
+                headers["X-Scanner-Lease"] = lease
+            response = client.request(
+                method, "/internal/scanner" + path, headers=headers, json=payload
+            )
+            assert response.status_code in {200, 204}, response.text
+            return None if response.status_code == 204 else response.content
+
+        def probe(*args: Any, **kwargs: Any) -> StageResult:
+            return scan_execution.run_prepared_probe(*args, **kwargs, require_isolation=False)
+
+        monkeypatch.setattr(worker, "_request", request)
+        monkeypatch.setattr(scanner_worker, "run_prepared_probe", probe)
+    consumer = "set-consumer"
+    helper = "set-helper"
+    for name in (consumer, helper):
+        _archive(tmp_path, name)
+    manifest = tmp_path / consumer / "dinkster-pack.toml"
+    manifest.write_text(manifest.read_text() + '\n[pack.dependencies]\nset-helper = ">=1,<2"\n')
+    nodes = tmp_path / consumer / "nodes.py"
+    nodes.write_text(
+        "from set_helper.helpers import VALUE\nassert VALUE == 43\n"
+        + nodes.read_text().replace("version=2,", "version=VALUE,")
+    )
+    manifest = tmp_path / helper / "dinkster-pack.toml"
+    manifest.write_text(
+        manifest.read_text().replace("[pack]\n", '[pack]\nrequires = ["set-library==1.2.3"]\n')
+        + ('\n[pack.dependencies]\nset-consumer = ">=1,<2"\n' if failure == "cycle" else "")
+    )
+    (tmp_path / helper / "helpers.py").write_text(
+        "from set_library import ANSWER\nVALUE = ANSWER + 2\n"
+    )
+    library = wheel_bytes(
+        name="set-library",
+        package="set_library",
+        library=True,
+        requirements=("set-leaf>=2" if failure == "range" else "set-leaf==1.2.3",),
+        extra={
+            "set_library/__init__.py": b"from set_leaf import ANSWER as LEAF\nANSWER = LEAF + 4\n"
+        },
+    )
+    leaf = wheel_bytes(
+        name="set-leaf",
+        package="set_leaf",
+        library=True,
+        requirements=(),
+        extra={"set_leaf/__init__.py": b"ANSWER = 37\n"},
+    )
+    members = [
+        (consumer, build_registry_fixture_archive(tmp_path / consumer)),
+        (helper, build_registry_fixture_archive(tmp_path / helper)),
+        ("set-library", library),
+        ("set-leaf", leaf),
+    ]
+    submitted = _publish_set(
+        client, token, members[:1] if failure == "other-set" else members
+    ).json()
+    if failure == "other-set":
+        assert _publish_set(client, token, members[1:]).status_code == 202
+    store = LocalFilesystemObjectStore(tmp_path / "objects")
+    admission = AdmissionService(app.state.database, store, require_isolation=False)
+    auth = {"Authorization": f"Bearer {token}"}
+    for _ in range(8):
+        assert (
+            admission.deliver_once(deliver_indexes=False) or worker.run_once()
+            if remote
+            else admission.run_once(deliver_indexes=False)
+        )
+        status = client.get(f"/v1/publish-sets/{submitted['setId']}", headers=auth).json()
+        if status["status"] != "queued":
+            break
+        assert client.get(f"/v1/packs/{consumer}").status_code == 404
+    assert status["status"] == ("rejected" if failure else "accepted"), status
+    if failure:
+        assert client.get(f"/v1/packs/{consumer}").status_code == 404
+        assert any(row["findings"] for row in status["members"])
+    else:
+        assert {row["status"] for row in status["members"]} == {"accepted"}
+        with app.state.database.session() as session:
+            release = session.scalar(
+                select(ReleaseRecord).join(PackRecord).where(PackRecord.name == consumer)
+            )
+            assert release is not None
+            assert release.manifest["pythonRequirements"] == []
+        assert admission.run_once(deliver_indexes=False)
+        assert admission.run_once()
+        schemas = json.loads(store.read(f"static/packs/{consumer}/1.2.3/schemas.json"))["schemas"]
+        assert (
+            next(row for row in schemas if row["nodeType"] == consumer + ".resize")["schema"][
+                "version"
+            ]
+            == 43
+        )
+
+
+def test_publish_set_refuses_dependency_withdrawn_after_its_successful_probe(
+    tmp_path: Path,
+) -> None:
+    client, app, token = _client(tmp_path)
+    library = wheel_bytes(name="set-lib", package="set_lib", library=True, requirements=())
+    admission = AdmissionService(
+        app.state.database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        require_isolation=False,
+    )
+    candidate = admission.submit(library, pack_name="set-lib", version="1.2.3")
+    assert admission.run_once()
+    assert admission.status(candidate).status == "accepted"
+    name = "set-dependent"
+    _archive(tmp_path, name)
+    manifest = tmp_path / name / "dinkster-pack.toml"
+    manifest.write_text(
+        manifest.read_text().replace("[pack]\n", '[pack]\nrequires = ["set-lib==1.2.3"]\n')
+    )
+    nodes = tmp_path / name / "nodes.py"
+    nodes.write_text("from set_lib import ANSWER\nassert ANSWER == 42\n" + nodes.read_text())
+    submitted = _publish_set(
+        client, token, [(name, build_registry_fixture_archive(tmp_path / name))]
+    ).json()
+    assert admission.run_once(deliver_indexes=False)
+    admission.yank("set-lib", "1.2.3", reason="withdrawn after probe")
+    assert admission.run_once(deliver_indexes=False)
+    assert admission.run_once(deliver_indexes=False)
+    status = client.get(
+        f"/v1/publish-sets/{submitted['setId']}", headers={"Authorization": f"Bearer {token}"}
+    ).json()
+    assert status["status"] == "rejected", status
+    assert any(
+        "no longer eligible" in finding["message"]
+        for row in status["members"]
+        for finding in row["findings"]
+    )
+    assert client.get(f"/v1/packs/{name}").status_code == 404
+
+
+def test_publish_set_cannot_spoof_publisher_or_read_another_publishers_status(
+    tmp_path: Path,
+) -> None:
+    client, app, token = _client(tmp_path)
+    principals = PrincipalRepository(app.state.database)
+    now = datetime.now(UTC)
+    principals.register_user("outsider")
+    principals.register_publisher("outsider", "outsider", now.isoformat())
+    outsider, _ = principals.mint_token(
+        "outsider", "outsider", now.isoformat(), (now + timedelta(hours=1)).isoformat()
+    )
+    manifest = {
+        "publisher": "dinkster",
+        "members": [
+            {"name": "set-spoofed", "version": "1.2.3", "archive": "wheel", "tier": "first-party"}
+        ],
+    }
+    refused = client.post(
+        "/v1/publish-sets",
+        headers={"Authorization": f"Bearer {outsider}"},
+        data={"manifest": json.dumps(manifest)},
+        files={"wheel": ("pack.whl", b"unscanned")},
+    )
+    assert refused.status_code == 400, refused.text
+    with app.state.database.session() as session:
+        assert list(session.scalars(select(ReleaseSetRecord))) == []
+    submitted = _publish_set(client, token, [("set-private", b"unscanned")]).json()
+    status = client.get(
+        f"/v1/publish-sets/{submitted['setId']}",
+        headers={"Authorization": f"Bearer {outsider}"},
+    )
+    assert status.status_code == 403, status.text
+    assert "set-private" not in status.text
+
+
+@pytest.mark.parametrize("name,version", [("Not-Canonical", "1.2.3"), ("set-invalid", "garbage")])
+def test_publish_set_refuses_invalid_member_identity_without_persistence(
+    tmp_path: Path, name: str, version: str
+) -> None:
+    client, app, token = _client(tmp_path)
+    response = client.post(
+        "/v1/publish-sets",
+        headers={"Authorization": f"Bearer {token}"},
+        data={
+            "manifest": json.dumps(
+                {"members": [{"name": name, "version": version, "archive": "wheel"}]}
+            )
+        },
+        files={"wheel": ("pack.whl", b"unscanned")},
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "invalid_request"
+    with app.state.database.session() as session:
+        assert list(session.scalars(select(ReleaseSetRecord))) == []
+        assert list(session.scalars(select(ReleaseCandidateRecord))) == []
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_publish_set_concurrent_requests_replay_or_refuse_overlapping_reservations(
+    tmp_path: Path, database: Database, database_url: str, overlap: bool
+) -> None:
+    client, app, token = _client(tmp_path, database_url)
+    first = [("set-common", b"common"), ("set-first", b"first")]
+    second = [("set-second", b"second"), first[0]] if overlap else list(reversed(first))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(
+            executor.map(lambda rows: _publish_set(client, token, rows), (first, second))
+        )
+    assert sorted(row.status_code for row in responses) == ([202, 409] if overlap else [202, 202])
+    if not overlap:
+        assert responses[0].json() == responses[1].json()
+    with app.state.database.session() as session:
+        sets = list(session.scalars(select(ReleaseSetRecord)))
+        candidates = list(session.scalars(select(ReleaseCandidateRecord)))
+        assert len(sets) == 1
+        assert len(candidates) == 2
+        assert {str(row.id) for row in candidates} == set(sets[0].members)
+
+
+@pytest.mark.parametrize("recovers", [False, True])
+def test_publish_set_timeout_retries_preserve_private_siblings_and_full_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recovers: bool
+) -> None:
+    client, app, token = _client(tmp_path)
+    members = [(name, _archive(tmp_path, name)) for name in ("set-ready", "set-timeout")]
+    submitted = _publish_set(client, token, members).json()
+    failures = 2 if recovers else 3
+
+    def probe(root: Path, **kwargs: Any) -> StageResult:
+        nonlocal failures
+        if 'name = "set-timeout"' in (root / "dinkster-pack.toml").read_text() and failures:
+            failures -= 1
+            return StageResult(
+                (AdmissionFinding("probe.timeout", "error", "block", "Stage exceeded 30s."),),
+                operator_details={"timedOut": True, "returnCode": -9},
+            )
+        return run_executable_probe(root, **kwargs)
+
+    monkeypatch.setattr(scan_execution, "run_executable_probe", probe)
+    admission = AdmissionService(
+        app.state.database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        require_isolation=False,
+    )
+    observed_retry = False
+    for _ in range(10):
+        assert admission.run_once(deliver_indexes=False)
+        status = client.get(
+            f"/v1/publish-sets/{submitted['setId']}",
+            headers={"Authorization": f"Bearer {token}"},
+        ).json()
+        assert {row["candidateId"] for row in status["members"]} == {
+            row["candidateId"] for row in submitted["members"]
+        }
+        observed_retry |= any(row["status"] == "retrying" for row in status["members"])
+        if status["status"] != "queued":
+            break
+        for name, _ in members:
+            assert client.get(f"/v1/packs/{name}").status_code == 404
+    assert observed_retry
+    assert status["status"] == ("accepted" if recovers else "rejected"), status
+    timed = next(row for row in status["members"] if row["packName"] == "set-timeout")
+    assert timed["attempts"] == 3
+    for name, _ in members:
+        assert client.get(f"/v1/packs/{name}").status_code == (200 if recovers else 404)

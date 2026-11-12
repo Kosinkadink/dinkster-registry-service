@@ -9,7 +9,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 
 from sqlalchemy import and_, func, or_, select, text
 
-from .database import AuditEventRecord, Database, ReleaseCandidateRecord
+from .database import AuditEventRecord, Database, ReleaseCandidateRecord, ReleaseSetRecord
 from .ids import uuid7
 
 START_GRACE_SECONDS = 120
@@ -98,7 +98,17 @@ class ScannerLifecycle:
                         ReleaseCandidateRecord.status == "scanning",
                         ReleaseCandidateRecord.lease_expires_at <= now,
                     ),
-                )
+                ),
+                or_(
+                    ReleaseCandidateRecord.set_id.is_(None),
+                    select(ReleaseSetRecord.id)
+                    .where(
+                        ReleaseSetRecord.id == ReleaseCandidateRecord.set_id,
+                        ReleaseSetRecord.status == "queued",
+                        ReleaseSetRecord.expires_at > now,
+                    )
+                    .exists(),
+                ),
             )
         )
         with self.database.session() as session:

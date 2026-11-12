@@ -149,7 +149,12 @@ def test_assignment_reads_require_a_live_fence_and_cannot_publish(
         assert response.headers["cache-control"] == "no-store"
         response = client.get(f"{path}/dependencies", headers=headers)
         assert response.status_code == 200
-        assert response.json() == {"helperWheels": [], "libraryWheels": [], "requirements": []}
+        assert response.json() == {
+            "helperWheels": [],
+            "libraryWheels": [],
+            "requirements": [],
+            "bindings": [],
+        }
         assert response.headers["cache-control"] == "no-store"
         assert client.get(f"{path}/dependencies").status_code == 401
         assert client.get(f"{path}/dependencies?key=private", headers=headers).status_code == 400

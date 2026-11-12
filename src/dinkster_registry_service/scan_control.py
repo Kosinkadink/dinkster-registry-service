@@ -191,7 +191,7 @@ def scanner_router(service: AdmissionService, token_sha256: str | None) -> APIRo
                 resolved = ProbeDependencies((), (), ())
             else:
                 with extracted_wheel(data, wheel) as root:
-                    resolved = service.probe_dependencies(root)
+                    resolved = service.probe_dependencies(root, claimed.set_id)
         except (ValueError, FileNotFoundError, ObjectStoreError) as exc:
             raise ScannerError(503, "Assigned scan dependencies are unavailable.") from exc
         assignment(candidate_id, x_scanner_lease)
@@ -212,6 +212,7 @@ def scanner_router(service: AdmissionService, token_sha256: str | None) -> APIRo
                     for name, value in resolved.library_wheels
                 ],
                 "requirements": list(resolved.requirements),
+                "bindings": list(resolved.bindings),
             },
             headers=NO_STORE,
         )

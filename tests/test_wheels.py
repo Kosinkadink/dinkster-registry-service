@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 from dinkster_registry.archive_admission import StageResult
@@ -180,7 +181,7 @@ def test_scanner_dependency_transfer_uses_verified_public_bytes_and_live_assignm
                 "code": "probe.pack-dependencies-unavailable",
                 "severity": "error",
                 "effect": "block",
-                "message": "Helper artifact changed for 'example-pack'.",
+                "message": "Dependency artifact changed for 'example-pack'.",
             }
         ]
         store.remove(helper_key)
@@ -217,8 +218,10 @@ def test_scanner_dependency_transfer_uses_verified_public_bytes_and_live_assignm
         # A fence can expire during catalog resolution, not just before the request.
         original = AdmissionService.probe_dependencies
 
-        def expire(self: AdmissionService, root: Path) -> ProbeDependencies | StageResult:
-            result = original(self, root)
+        def expire(
+            self: AdmissionService, root: Path, set_id: UUID | None = None
+        ) -> ProbeDependencies | StageResult:
+            result = original(self, root, set_id)
             with database.session() as session, session.begin():
                 candidate = session.get(ReleaseCandidateRecord, candidate_id)
                 assert candidate is not None
