@@ -344,7 +344,7 @@ class Proof:
         self.wait(lambda: self.machine_state()["state"] == "stopped")
         self.record("scanner-stopped", self.machine_state())
 
-    def run(self, *, measurements_only: bool = False) -> None:
+    def run(self, *, measurements_only: bool = False, samples: int = 3) -> None:
         initial = self.request("GET", "/proof/state")
         assert initial["database"] == "postgresql" and initial["databaseRole"] == "scanner_writer"
         assert not initial["canCreateSchemaObjects"]
@@ -366,13 +366,13 @@ class Proof:
                 error.close()
             else:
                 raise AssertionError("Worker gained control-plane write/read authority")
-        samples: list[float] = []
-        for _ in range(3):
+        timings: list[float] = []
+        for _ in range(samples):
             started = time.monotonic()
             candidate = self.request("POST", "/proof/queue/accepted")["candidateId"]
             row = self.wait(lambda candidate=candidate: self.accepted(candidate))
             assert any(run["jail"] == "user-pid-namespace" for run in row["runs"])
-            samples.append(time.monotonic() - started)
+            timings.append(time.monotonic() - started)
             self.record("accepted-fixture", row)
             schemas = self.request(
                 "GET", f"/v1/packs/example-pack/versions/{row['version']}/schemas"
@@ -389,8 +389,8 @@ class Proof:
         self.record(
             "fixture-end-to-end-seconds",
             {
-                "samples": samples,
-                "median": statistics.median(samples),
+                "samples": timings,
+                "median": statistics.median(timings),
                 "includesQueueAndStartup": True,
             },
         )
@@ -464,6 +464,7 @@ def main() -> None:
     parser.add_argument("--evidence", type=Path)
     parser.add_argument("--expires-at", type=float, help="Original experiment UNIX deadline")
     parser.add_argument("--measurements-only", action="store_true")
+    parser.add_argument("--samples", type=int, choices=(1, 3), default=3)
     args = parser.parse_args()
     if args.serve:
         import uvicorn
@@ -497,7 +498,7 @@ def main() -> None:
             parser.error("--check requires origin, scanner-app, machine, evidence and expires-at")
         proof = Proof(args.origin, args.scanner_app, args.machine, args.evidence, args.expires_at)
         try:
-            proof.run(measurements_only=args.measurements_only)
+            proof.run(measurements_only=args.measurements_only, samples=args.samples)
         finally:
             proof.output.close()
 
