@@ -4,7 +4,9 @@ Provisioning is separate: create the priced PostgreSQL/bucket/apps first and
 install this file only on the disposable web Machine. The worker runs the
 unmodified dinkster-scanner entry point. --serve adds authenticated fixture
 controls to the real web app; --check drives those controls and the real
-Machines API. Fixture submission bypasses publisher authentication; fixture
+Machines API. The checker needs a scanner-app deploy token valid for the whole
+experiment, not the short-lived token printed by flyctl auth token.
+Fixture submission bypasses publisher authentication; fixture
 timings are not representative official-pack benchmarks. Provisioning must
 enforce the cumulative spend/runtime cap and teardown in its own finally block,
 including when this checker fails. Save evidence before destroying resources.
@@ -252,9 +254,16 @@ class Proof:
             data=json.dumps(data).encode() if data is not None else None,
             headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
         )
-        with self.opener.open(request, timeout=30) as response:
-            body = response.read(4 * 1024 * 1024)
-            return json.loads(body) if body else None
+        try:
+            with self.opener.open(request, timeout=30) as response:
+                body = response.read(4 * 1024 * 1024)
+                return json.loads(body) if body else None
+        except HTTPError as error:
+            self.record(
+                "request-refused",
+                {"method": method, "path": path, "provider": provider, "status": error.code},
+            )
+            raise
 
     def machine_state(self) -> dict[str, Any]:
         value = self.request("GET", "/machines/" + self.machine, provider=True)
@@ -499,6 +508,17 @@ def main() -> None:
         proof = Proof(args.origin, args.scanner_app, args.machine, args.evidence, args.expires_at)
         try:
             proof.run(measurements_only=args.measurements_only, samples=args.samples)
+        except Exception as error:
+            # Never print exception strings or tracebacks: URLs and headers can
+            # contain capabilities. Keep enough identity to diagnose a failed run.
+            proof.record(
+                "proof-failed",
+                {
+                    "errorType": type(error).__name__,
+                    "httpStatus": error.code if isinstance(error, HTTPError) else None,
+                },
+            )
+            raise SystemExit(1) from None
         finally:
             proof.output.close()
 
