@@ -34,6 +34,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 import dinkster_registry_service.admission as admission_module
+import dinkster_registry_service.scan_execution as execution_module
 from dinkster_registry_service.accounts import PublisherIdentity
 from dinkster_registry_service.admission import (
     AdmissionError,
@@ -388,7 +389,7 @@ def test_scan_timeouts_retry_same_candidate_until_success_or_exhaustion(
             )
         return run_executable_probe(root, **kwargs)
 
-    monkeypatch.setattr(admission_module, "run_executable_probe", probe)
+    monkeypatch.setattr(execution_module, "run_executable_probe", probe)
     with _client(database_url, tmp_path / "objects") as client:
         for attempt in range(1, 4):
             if attempt == 2:
@@ -447,7 +448,7 @@ def test_pack_failures_reject_without_retry(
         (source / "nodes.py").write_text('raise RuntimeError("broken pack")\n')
     else:
         monkeypatch.setattr(
-            admission_module,
+            execution_module,
             "run_executable_probe",
             lambda *args, **kwargs: StageResult(
                 (
@@ -1580,7 +1581,7 @@ def test_running_probe_renews_lease(
         assert release.wait(10)
         return run_executable_probe(root, **kwargs)
 
-    monkeypatch.setattr(admission_module, "run_executable_probe", held_probe)
+    monkeypatch.setattr(execution_module, "run_executable_probe", held_probe)
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(service.run_once)
         try:
@@ -1622,6 +1623,7 @@ def test_expired_lease_is_taken_over_after_scanner_sigkill(
     code = f"""
 import time
 import dinkster_registry_service.admission as admission
+import dinkster_registry_service.scan_execution as execution
 from dinkster_registry_service.database import Database
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore
 
@@ -1629,7 +1631,7 @@ def wait_probe(root, *, settings=None, require_isolation=True):
     time.sleep(30)
     raise AssertionError("scanner should have been killed")
 
-admission.run_executable_probe = wait_probe
+execution.run_executable_probe = wait_probe
 database = Database({database_url!r})
 service = admission.AdmissionService(
     database,

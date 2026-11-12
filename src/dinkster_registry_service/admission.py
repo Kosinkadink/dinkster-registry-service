@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import io
 import socket
-import tempfile
 import threading
 import time
-import tomllib
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -14,14 +12,13 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
-import tomli_w
 from dinkster_registry import RegistryError, TokenRecord
 from dinkster_registry.archive_admission import (
     SCAN_POLICY_VERSION,
     AdmissionFinding,
+    ProbeSettings,
     StageResult,
     run_doctor_static,
-    run_executable_probe,
 )
 from dinkster_schema import (
     canonical_claim,
@@ -60,7 +57,8 @@ from .indexes import StaticIndexes, queue_index_rebuild
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStore, ObjectStoreError
 from .pack_locks import lock_object_key, parse_pack_locks, quarantine_lock_key
 from .principals import PrincipalRepository
-from .scan_engine import parse_scan_engine, stage_scan_api
+from .scan_engine import parse_scan_engine
+from .scan_execution import ProbeDependencies, run_prepared_probe
 from .security_publication import SecurityPublication
 from .security_repository import (
     SecurityRepository,
@@ -1195,7 +1193,7 @@ class AdmissionService:
                 )
             )
 
-    def _probe_library_wheels(self, requirements: set[str], directory: Path) -> tuple[Path, ...]:
+    def _probe_library_wheels(self, requirements: set[str]) -> tuple[tuple[str, bytes], ...]:
         with self.database.session() as session:
             rows = session.execute(
                 select(PackRecord, ReleaseRecord).join(
@@ -1284,115 +1282,65 @@ class AdmissionService:
                 {},
                 frozenset(),
             )
-            paths = []
+            wheels = []
             for library_name, release in sorted(selected.items()):
                 wheel, data = read(release, library_name)
-                path = directory / wheel.filename
-                path.write_bytes(data)
-                paths.append(path)
-            return tuple(paths)
+                wheels.append((wheel.filename, data))
+            return tuple(wheels)
 
-    def _probe_with_dependencies(
-        self, root: Path, scan_engine: dict[str, str] | None = None
-    ) -> StageResult:
+    def probe_dependencies(self, root: Path) -> ProbeDependencies:
         manifest_path = root / "dinkster-pack.toml"
-        original = manifest_path.read_bytes()
         manifest = load_manifest(manifest_path)
         pending = list(manifest.dependencies)
         selected: dict[str, str] = {}
         requirements = set(manifest.requires_for("cpu"))
-        try:
-            with self.database.session() as session:
-                while pending:
-                    dependency = pending.pop(0)
-                    if dependency.pack in selected:
-                        if not dependency.accepts(selected[dependency.pack]):
-                            raise ValueError(f"Conflicting helper dependency {dependency.pack!r}.")
-                        continue
-                    releases = session.scalars(
-                        select(ReleaseRecord)
-                        .join(PackRecord, PackRecord.id == ReleaseRecord.pack_id)
-                        .where(
-                            PackRecord.name == dependency.pack,
-                            PackRecord.visibility == "public",
-                            ReleaseRecord.state == "active",
-                        )
+        helpers = []
+        with self.database.session() as session:
+            while pending:
+                dependency = pending.pop(0)
+                if dependency.pack in selected:
+                    if not dependency.accepts(selected[dependency.pack]):
+                        raise ValueError(f"Conflicting helper dependency {dependency.pack!r}.")
+                    continue
+                releases = session.scalars(
+                    select(ReleaseRecord)
+                    .join(PackRecord, PackRecord.id == ReleaseRecord.pack_id)
+                    .where(
+                        PackRecord.name == dependency.pack,
+                        PackRecord.visibility == "public",
+                        ReleaseRecord.state == "active",
                     )
-                    release = max(
-                        (item for item in releases if dependency.accepts(item.version)),
-                        key=lambda item: Version(item.version),
-                        default=None,
-                    )
-                    if release is None:
-                        raise ValueError(f"No active helper dependency {dependency.pack!r}.")
-                    selected[dependency.pack] = release.version
-                    artifact = session.get(ArtifactRecord, release.artifact_digest)
-                    assert artifact is not None
-                    data = self.object_store.read(artifact.object_key, max_size=MAX_ARTIFACT_SIZE)
-                    if artifact_digest(data) != artifact.digest or len(data) != artifact.size:
-                        raise ValueError(f"Helper artifact changed for {dependency.pack!r}.")
-                    wheel = inspect_wheel(data, dependency.pack, release.version)
-                    if wheel.library:
-                        raise ValueError("Pack dependencies must name packs, not libraries.")
-                    with extracted_wheel(data, wheel) as dependency_root:
-                        helper = load_manifest(dependency_root / "dinkster-pack.toml")
-                        pending.extend(helper.dependencies)
-                        requirements.update(helper.requires_for("cpu"))
-                    # Stage only the installed wheel layout, not the dependency's
-                    # relocated probe assets. The submitted pack keeps its root assets.
-                    with zipfile.ZipFile(io.BytesIO(data)) as archive:
-                        for member in archive.infolist():
-                            if member.is_dir():
-                                continue
-                            destination = root / member.filename
-                            if destination.exists():
-                                raise ValueError("Helper wheel overlaps the submitted pack.")
-                            destination.parent.mkdir(parents=True, exist_ok=True)
-                            destination.write_bytes(archive.read(member))
-            if selected:
-                # Only the disposable probe view receives the combined CPU
-                # requirements. Published metadata and the wheel remain unchanged.
-                document = tomllib.loads(original.decode())
-                document["pack"]["requires"] = sorted(requirements)
-                document["pack"].pop("extra-requires", None)
-                manifest_path.write_text(tomli_w.dumps(document))
-            with tempfile.TemporaryDirectory(prefix="registry-library-wheels-") as directory:
-                wheels = self._probe_library_wheels(requirements, Path(directory))
-                if scan_engine is not None:
-                    try:
-                        api_wheel, engine_version = stage_scan_api(
-                            scan_engine,
-                            Path(directory),
-                            development_release=self.settings.probe_engine_release,
-                        )
-                        if manifest.compatibility is None:
-                            raise ValueError("selected engine requires pack compatibility")
-                        manifest.compatibility.require_engine(manifest.name, engine_version)
-                    except (ValueError, OSError) as exc:
-                        return StageResult(
-                            (
-                                AdmissionFinding(
-                                    "probe.engine-unavailable", "error", "block", str(exc)
-                                ),
-                            )
-                        )
-                    return run_executable_probe(
-                        root,
-                        settings=self.settings,
-                        require_isolation=self.require_isolation,
-                        dependency_wheels=wheels,
-                        api_wheel=api_wheel,
-                    )
-                if wheels:
-                    return run_executable_probe(
-                        root,
-                        settings=self.settings,
-                        require_isolation=self.require_isolation,
-                        dependency_wheels=wheels,
-                    )
-                return run_executable_probe(
-                    root, settings=self.settings, require_isolation=self.require_isolation
                 )
+                release = max(
+                    (item for item in releases if dependency.accepts(item.version)),
+                    key=lambda item: Version(item.version),
+                    default=None,
+                )
+                if release is None:
+                    raise ValueError(f"No active helper dependency {dependency.pack!r}.")
+                selected[dependency.pack] = release.version
+                artifact = session.get(ArtifactRecord, release.artifact_digest)
+                assert artifact is not None
+                data = self.object_store.read(artifact.object_key, max_size=MAX_ARTIFACT_SIZE)
+                if artifact_digest(data) != artifact.digest or len(data) != artifact.size:
+                    raise ValueError(f"Helper artifact changed for {dependency.pack!r}.")
+                wheel = inspect_wheel(data, dependency.pack, release.version)
+                if wheel.library:
+                    raise ValueError("Pack dependencies must name packs, not libraries.")
+                with extracted_wheel(data, wheel) as dependency_root:
+                    helper = load_manifest(dependency_root / "dinkster-pack.toml")
+                    pending.extend(helper.dependencies)
+                    requirements.update(helper.requires_for("cpu"))
+                helpers.append(data)
+        return ProbeDependencies(
+            tuple(helpers), self._probe_library_wheels(requirements), tuple(sorted(requirements))
+        )
+
+    def _probe_with_dependencies(
+        self, root: Path, scan_engine: dict[str, str] | None = None
+    ) -> StageResult:
+        try:
+            dependencies = self.probe_dependencies(root)
         except (ValueError, ObjectStoreError, FileNotFoundError) as exc:
             return StageResult(
                 (
@@ -1401,8 +1349,21 @@ class AdmissionService:
                     ),
                 )
             )
-        finally:
-            manifest_path.write_bytes(original)
+        return run_prepared_probe(
+            root,
+            dependencies,
+            settings=ProbeSettings(
+                probe_timeout_seconds=self.settings.probe_timeout_seconds,
+                probe_dependency_timeout_seconds=self.settings.probe_dependency_timeout_seconds,
+                probe_package_index_url=self.settings.probe_package_index_url,
+                probe_dependency_source=self.settings.probe_dependency_source,
+                probe_output_limit_bytes=self.settings.probe_output_limit_bytes,
+                probe_operator_tail_bytes=self.settings.probe_operator_tail_bytes,
+            ),
+            require_isolation=self.require_isolation,
+            scan_engine=scan_engine,
+            development_release=self.settings.probe_engine_release,
+        )
 
     def _process(self, claim: CandidateClaim) -> None:
         try:
