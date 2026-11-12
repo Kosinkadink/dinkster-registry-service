@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore, S3ObjectStore
@@ -14,6 +16,16 @@ PROBE_ENVIRONMENT_VARIABLES = (
     "DINKSTER_SCANNER_MAX_ATTEMPTS",
     "DINKSTER_SCANNER_TOKEN_SHA256",
 )
+
+
+def test_runtime_metadata_mirror_is_development_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DINKSTER_PROBE_RUNTIME_MIRROR", str(tmp_path))
+    assert ServerSettings.from_environment().probe_runtime_mirror == tmp_path
+    for environment in ("staging", "production"):
+        with pytest.raises(ValueError, match="only in development"):
+            ServerSettings(environment=environment, probe_runtime_mirror=tmp_path)
 
 
 def test_probe_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:

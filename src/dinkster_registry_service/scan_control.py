@@ -67,6 +67,7 @@ def scanner_router(service: AdmissionService, token_sha256: str | None) -> APIRo
                 "artifactSize": claimed.declared_size,
                 "attempt": claimed.attempt,
                 "scanEngine": claimed.scan_engine,
+                "installLocks": claimed.install_locks,
                 "probeSettings": asdict(service.settings.probe_settings()),
             },
             headers=NO_STORE,
@@ -85,6 +86,19 @@ def scanner_router(service: AdmissionService, token_sha256: str | None) -> APIRo
         data = input_bytes(claimed)
         assignment(candidate_id, x_scanner_lease)
         return Response(data, media_type="application/octet-stream", headers=NO_STORE)
+
+    @router.get("/{candidate_id}/locks")
+    def locks(candidate_id: UUID, x_scanner_lease: Annotated[UUID, Header()]) -> Response:
+        claimed = assignment(candidate_id, x_scanner_lease)
+        try:
+            resolved = service.probe_install_locks(claimed)
+        except (ValueError, OSError, ObjectStoreError) as exc:
+            raise ScannerError(503, "Assigned dependency locks are unavailable.") from exc
+        assignment(candidate_id, x_scanner_lease)
+        return JSONResponse(
+            {variant: base64.b64encode(data).decode() for variant, data in resolved.items()},
+            headers=NO_STORE,
+        )
 
     @router.get("/{candidate_id}/dependencies")
     def dependencies(candidate_id: UUID, x_scanner_lease: Annotated[UUID, Header()]) -> Response:

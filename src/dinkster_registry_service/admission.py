@@ -6,7 +6,7 @@ import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -54,7 +54,7 @@ from .identifiers import require_canonical_pack_name
 from .ids import uuid7
 from .indexes import StaticIndexes, queue_index_rebuild
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStore, ObjectStoreError
-from .pack_locks import lock_object_key, parse_pack_locks, quarantine_lock_key
+from .pack_locks import MAX_LOCK_SIZE, lock_object_key, parse_pack_locks, quarantine_lock_key
 from .principals import PrincipalRepository
 from .scan_engine import parse_scan_engine
 from .scan_execution import ProbeDependencies, run_prepared_probe
@@ -106,6 +106,7 @@ class CandidateClaim:
     lease_token: UUID
     attempt: int
     scan_engine: dict[str, str] | None = None
+    install_locks: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -519,6 +520,7 @@ class AdmissionService:
                 lease_token=token,
                 attempt=candidate.attempt_count,
                 scan_engine=candidate.scan_engine,
+                install_locks=candidate.install_locks,
             )
 
     def leased_claim(
@@ -554,6 +556,7 @@ class AdmissionService:
                 lease_token=lease_token,
                 attempt=candidate.attempt_count,
                 scan_engine=candidate.scan_engine,
+                install_locks=candidate.install_locks,
             )
 
     @staticmethod
@@ -1384,19 +1387,43 @@ class AdmissionService:
                 )
             )
 
-    def _probe_with_dependencies(
-        self, root: Path, scan_engine: dict[str, str] | None = None
-    ) -> StageResult:
+    def probe_install_locks(self, claim: CandidateClaim) -> dict[str, bytes]:
+        locks = {}
+        for variant, binding in claim.install_locks.items():
+            data = self.object_store.read(
+                quarantine_lock_key(claim.id, variant), max_size=MAX_LOCK_SIZE
+            )
+            if len(data) != binding["size"] or artifact_digest(data) != binding["digest"]:
+                raise ValueError(f"{variant}: submitted dependency lock bytes changed")
+            locks[variant] = data
+        return locks
+
+    def _probe_with_dependencies(self, root: Path, claim: CandidateClaim) -> StageResult:
         dependencies = self.probe_dependencies(root)
         if isinstance(dependencies, StageResult):
             return dependencies
+        try:
+            locks = self.probe_install_locks(claim)
+        except (ValueError, ObjectStoreError, OSError) as exc:
+            return StageResult(
+                (
+                    AdmissionFinding(
+                        "probe.pack-dependencies-unavailable", "error", "block", str(exc)
+                    ),
+                )
+            )
         return run_prepared_probe(
             root,
             dependencies,
             settings=self.settings.probe_settings(),
             require_isolation=self.require_isolation,
-            scan_engine=scan_engine,
+            scan_engine=claim.scan_engine,
             development_release=self.settings.probe_engine_release,
+            install_locks=claim.install_locks,
+            lock_bytes=locks,
+            artifact_digest=claim.declared_digest,
+            runtime_store=self.settings.object_store_root / ".probe-runtime",
+            development_runtime=self.settings.probe_runtime_mirror,
         )
 
     def _process(self, claim: CandidateClaim) -> None:
@@ -1520,7 +1547,7 @@ class AdmissionService:
                 self._record_stage(claim, "executable_probe", StageResult(data={"schemas": []}))
             if claim.kind == "upload" and not wheel.library:
                 with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(self._probe_with_dependencies, root, claim.scan_engine)
+                    future = executor.submit(self._probe_with_dependencies, root, claim)
                     while not wait((future,), timeout=self.lease_seconds / 3).done:
                         with self.database.session() as session, session.begin():
                             candidate = self._leased_candidate(session, claim)

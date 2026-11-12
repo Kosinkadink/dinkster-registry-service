@@ -665,9 +665,17 @@ tokens do not authenticate as scanners, and the scanner capability does not
 authorize publishing or public-index writes.
 
 - `POST /internal/scanner/claim` returns a fenced assignment and nonsecret probe
-  settings, or 204 when no candidate is eligible. It does not run a scan.
+  settings, or 204 when no candidate is eligible. `installLocks` retains the
+  submitted base, archive and lock identities and byte sizes. It does not run a scan.
 - `GET /internal/scanner/{candidate_id}/input` returns only that assignment's
   original bounded archive, without accepting object keys or URLs.
+- `GET /internal/scanner/{candidate_id}/locks` returns the assignment's native
+  dependency locks as a variant-to-base64 map, after verifying each stored size
+  and digest. Each lock is bounded at 1 MiB and submissions contain at most 32
+  variants. Missing or changed stored bytes return retryable 503. The prepared
+  executor verifies these bytes against the claim again and uses the trusted
+  base/runtime catalog and locked probe path, without catalog or object-store
+  authority. Development runtime mirrors remain forbidden in production.
 - `GET /internal/scanner/{candidate_id}/dependencies` resolves the assignment's
   active public helper/library wheels with the same catalog and digest checks
   as local scanning. It returns `helperWheels` (base64 bytes), `libraryWheels`
