@@ -112,6 +112,44 @@ def _locks(archive: bytes) -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize(
+    "variant,digit", [("linux-cpu", "1"), ("win-cpu", "2"), ("cpu", "1"), ("cuda", "1")]
+)
+def test_published_pack_refuses_a_missing_bound_base(
+    tmp_path: Path, variant: str, digit: str
+) -> None:
+    client, app, token = _client(tmp_path)
+    archive = _archive(tmp_path, "locked-pack")
+    binding = json.loads(json.dumps(_locks(archive)))["linux-cpu"]
+    binding["baseId"] = "sha256:" + digit * 64
+    binding["lock"]["variant"] = variant
+    headers = {"Authorization": f"Bearer {token}"}
+    submitted = client.post(
+        "/v1/publish/locked-pack/versions/1.2.3",
+        headers=headers,
+        files={"archive": ("pack.whl", archive, "application/zip")},
+        data={"locks": json.dumps({variant: binding})},
+    )
+    assert submitted.status_code == 202, submitted.text
+    admission = AdmissionService(
+        app.state.database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        settings=ServerSettings(
+            object_store_root=tmp_path / "objects",
+            probe_runtime_mirror=tmp_path / "absent-runtime",
+        ),
+        require_isolation=False,
+    )
+    assert admission.run_once()
+    status = client.get(f"/v1/publish/{submitted.json()['candidateId']}", headers=headers).json()
+    assert status["status"] == "rejected"
+    assert any(
+        f"missing matching base {binding['baseId']} for {variant}" in finding["message"]
+        for finding in status["findings"]
+    )
+    assert client.get("/v1/packs/locked-pack/versions/1.2.3").status_code == 404
+
+
 def test_publish_api_binds_exact_engine_and_rejects_changed_or_malformed_binding(
     tmp_path: Path,
 ) -> None:

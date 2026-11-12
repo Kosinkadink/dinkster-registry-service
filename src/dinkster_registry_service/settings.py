@@ -49,9 +49,12 @@ class ServerSettings(ProbeSettings):
     identity_audience: str = "dinkster-registry"
     security_signing_key_path: Path | None = field(default=None, repr=False)
     probe_engine_release: Path | None = None
+    probe_runtime_mirror: Path | None = None
 
     def __post_init__(self) -> None:
-        if self.probe_engine_release is not None and self.environment != "development":
+        if (
+            self.probe_engine_release is not None or self.probe_runtime_mirror is not None
+        ) and self.environment != "development":
             raise ValueError("local probe engine inputs are allowed only in development")
         if self.probe_dependency_source not in {"cpu", "index"}:
             raise ValueError("DINKSTER_PROBE_DEPENDENCY_SOURCE must be cpu or index")
@@ -97,6 +100,9 @@ class ServerSettings(ProbeSettings):
             environment=os.getenv("DINKSTER_ENV", defaults.environment),
             probe_engine_release=Path(os.environ["DINKSTER_PROBE_ENGINE_RELEASE"])
             if os.getenv("DINKSTER_PROBE_ENGINE_RELEASE")
+            else None,
+            probe_runtime_mirror=Path(os.environ["DINKSTER_PROBE_RUNTIME_MIRROR"])
+            if os.getenv("DINKSTER_PROBE_RUNTIME_MIRROR")
             else None,
             identity_issuer=os.getenv("DINKSTER_IDENTITY_ISSUER", defaults.identity_issuer).rstrip(
                 "/"

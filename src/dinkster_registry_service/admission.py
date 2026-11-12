@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import socket
 import tempfile
@@ -8,7 +9,7 @@ import time
 import tomllib
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -22,6 +23,7 @@ from dinkster_registry.archive_admission import (
     StageResult,
     run_doctor_static,
     run_executable_probe,
+    run_locked_probe,
 )
 from dinkster_schema import (
     canonical_claim,
@@ -29,7 +31,12 @@ from dinkster_schema import (
     claims_conflict,
     reserved_root,
 )
+from dinkster_supervisor.environment_artifacts import acquire
+from dinkster_supervisor.environment_generations import prepare_engine_interpreter
+from dinkster_supervisor.environment_state import writer_lock
 from dinkster_workers.manifest import load_manifest
+from dinkster_workers.pack_lock import PackLock, normalize_requirement
+from dinkster_workers.provision import ProvisionError
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
@@ -58,9 +65,10 @@ from .identifiers import require_canonical_pack_name
 from .ids import uuid7
 from .indexes import StaticIndexes, queue_index_rebuild
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStore, ObjectStoreError
-from .pack_locks import lock_object_key, parse_pack_locks, quarantine_lock_key
+from .pack_locks import MAX_LOCK_SIZE, lock_object_key, parse_pack_locks, quarantine_lock_key
 from .principals import PrincipalRepository
 from .scan_engine import parse_scan_engine, stage_scan_api
+from .scan_runtime import scan_catalog
 from .security_publication import SecurityPublication
 from .security_repository import (
     SecurityRepository,
@@ -109,6 +117,7 @@ class CandidateClaim:
     lease_token: UUID
     attempt: int
     scan_engine: dict[str, str] | None = None
+    install_locks: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -558,6 +567,7 @@ class AdmissionService:
                 lease_token=token,
                 attempt=candidate.attempt_count,
                 scan_engine=candidate.scan_engine,
+                install_locks=candidate.install_locks,
             )
 
     @staticmethod
@@ -1310,9 +1320,70 @@ class AdmissionService:
                 paths.append(path)
             return tuple(paths)
 
-    def _probe_with_dependencies(
-        self, root: Path, scan_engine: dict[str, str] | None = None
+    def _probe_locked(
+        self, root: Path, claim: CandidateClaim, wheels: tuple[Path, ...], requirements: set[str]
     ) -> StageResult:
+        locks: dict[str, PackLock] = {}
+        for variant, binding in claim.install_locks.items():
+            if binding["artifactDigest"] != claim.declared_digest:
+                raise ValueError(f"{variant}: lock artifact digest differs from archive")
+            data = self.object_store.read(
+                quarantine_lock_key(claim.id, variant), max_size=MAX_LOCK_SIZE
+            )
+            if len(data) != binding["size"] or artifact_digest(data) != binding["digest"]:
+                raise ValueError(f"{variant}: submitted dependency lock bytes changed")
+            lock = PackLock.from_json(data)
+            if lock.pack != claim.pack_name or lock.variant != variant:
+                raise ValueError(f"{variant}: dependency lock pack or variant differs")
+            locks[variant] = lock
+        catalog, variant = scan_catalog(
+            claim.scan_engine, claim.install_locks, mirror=self.settings.probe_runtime_mirror
+        )
+        manifest = load_manifest(root / "dinkster-pack.toml")
+        if manifest.compatibility is None:
+            raise ValueError("selected engine requires pack compatibility")
+        manifest.compatibility.require_engine(manifest.name, catalog.channel.engine_version)
+        lock = locks[variant]
+        if missing := {normalize_requirement(value) for value in requirements} - set(
+            lock.requirements
+        ):
+            raise ValueError(f"{variant}: dependency lock omits requirements {sorted(missing)}")
+        for wheel in wheels:
+            sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
+            if not any(
+                item.filename == wheel.name and item.sha256 == sha
+                for package in lock.packages
+                for item in package.wheels
+            ):
+                raise ValueError(
+                    f"{variant}: dependency lock differs from verified library {wheel.name}"
+                )
+        store = self.settings.object_store_root / ".probe-runtime"
+        store.mkdir(parents=True, exist_ok=True)
+        with writer_lock(store):
+            constraints = acquire(catalog, variant, store)
+            with tempfile.TemporaryDirectory(prefix=".probe-", dir=store) as directory:
+                scratch = Path(directory)
+                python = prepare_engine_interpreter(
+                    scratch / "engine",
+                    store=store,
+                    base=catalog.channel.base_for(variant),
+                    constraints=constraints,
+                )
+                return run_locked_probe(
+                    root,
+                    lock,
+                    generation_python=python,
+                    packs=scratch / "packs",
+                    wheel_store=store / "wheels",
+                    uv_cache=store / "uv-cache",
+                    variant=variant,
+                    settings=self.settings,
+                    require_isolation=self.require_isolation,
+                    source_roots=(root,),
+                )
+
+    def _probe_with_dependencies(self, root: Path, claim: CandidateClaim) -> StageResult:
         manifest_path = root / "dinkster-pack.toml"
         original = manifest_path.read_bytes()
         manifest = load_manifest(manifest_path)
@@ -1376,6 +1447,9 @@ class AdmissionService:
                 manifest_path.write_text(tomli_w.dumps(document))
             with tempfile.TemporaryDirectory(prefix="registry-library-wheels-") as directory:
                 wheels = self._probe_library_wheels(requirements, Path(directory))
+                if claim.install_locks:
+                    return self._probe_locked(root, claim, wheels, requirements)
+                scan_engine = claim.scan_engine
                 if scan_engine is not None:
                     try:
                         api_wheel, engine_version = stage_scan_api(
@@ -1411,7 +1485,7 @@ class AdmissionService:
                 return run_executable_probe(
                     root, settings=self.settings, require_isolation=self.require_isolation
                 )
-        except (ValueError, ObjectStoreError, FileNotFoundError) as exc:
+        except (ValueError, ObjectStoreError, OSError, ProvisionError) as exc:
             return StageResult(
                 (
                     AdmissionFinding(
@@ -1543,7 +1617,7 @@ class AdmissionService:
                 self._record_stage(claim, "executable_probe", StageResult(data={"schemas": []}))
             if claim.kind == "upload" and not wheel.library:
                 with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(self._probe_with_dependencies, root, claim.scan_engine)
+                    future = executor.submit(self._probe_with_dependencies, root, claim)
                     while not wait((future,), timeout=self.lease_seconds / 3).done:
                         with self.database.session() as session, session.begin():
                             candidate = self._leased_candidate(session, claim)
