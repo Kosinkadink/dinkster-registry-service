@@ -6,9 +6,11 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import pytest
+from dinkster_registry.archive_admission import AdmissionFinding, StageResult, run_executable_probe
 from dinkster_workers.pack_lock import GenerationPackages, PackLock, plan_pack
 from dinkster_workers.provision import ProvisionError
 from fastapi import FastAPI
@@ -18,6 +20,7 @@ from runtime_fixture import RuntimeFixture
 from sqlalchemy import select
 from test_wheels import wheel_bytes
 
+import dinkster_registry_service.admission as admission_module
 from dinkster_registry_service.admission import AdmissionService, LeaseLost
 from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
@@ -1289,3 +1292,130 @@ def test_publish_set_refuses_dependency_withdrawn_after_its_successful_probe(
         for finding in row["findings"]
     )
     assert client.get(f"/v1/packs/{name}").status_code == 404
+
+
+def test_publish_set_cannot_spoof_publisher_or_read_another_publishers_status(
+    tmp_path: Path,
+) -> None:
+    client, app, token = _client(tmp_path)
+    principals = PrincipalRepository(app.state.database)
+    now = datetime.now(UTC)
+    principals.register_user("outsider")
+    principals.register_publisher("outsider", "outsider", now.isoformat())
+    outsider, _ = principals.mint_token(
+        "outsider", "outsider", now.isoformat(), (now + timedelta(hours=1)).isoformat()
+    )
+    manifest = {
+        "publisher": "dinkster",
+        "members": [
+            {"name": "set-spoofed", "version": "1.2.3", "archive": "wheel", "tier": "first-party"}
+        ],
+    }
+    refused = client.post(
+        "/v1/publish-sets",
+        headers={"Authorization": f"Bearer {outsider}"},
+        data={"manifest": json.dumps(manifest)},
+        files={"wheel": ("pack.whl", b"unscanned")},
+    )
+    assert refused.status_code == 400, refused.text
+    with app.state.database.session() as session:
+        assert list(session.scalars(select(ReleaseSetRecord))) == []
+    submitted = _publish_set(client, token, [("set-private", b"unscanned")]).json()
+    status = client.get(
+        f"/v1/publish-sets/{submitted['setId']}",
+        headers={"Authorization": f"Bearer {outsider}"},
+    )
+    assert status.status_code == 403, status.text
+    assert "set-private" not in status.text
+
+
+@pytest.mark.parametrize("name,version", [("Not-Canonical", "1.2.3"), ("set-invalid", "garbage")])
+def test_publish_set_refuses_invalid_member_identity_without_persistence(
+    tmp_path: Path, name: str, version: str
+) -> None:
+    client, app, token = _client(tmp_path)
+    response = client.post(
+        "/v1/publish-sets",
+        headers={"Authorization": f"Bearer {token}"},
+        data={
+            "manifest": json.dumps(
+                {"members": [{"name": name, "version": version, "archive": "wheel"}]}
+            )
+        },
+        files={"wheel": ("pack.whl", b"unscanned")},
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "invalid_request"
+    with app.state.database.session() as session:
+        assert list(session.scalars(select(ReleaseSetRecord))) == []
+        assert list(session.scalars(select(ReleaseCandidateRecord))) == []
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_publish_set_concurrent_requests_replay_or_refuse_overlapping_reservations(
+    tmp_path: Path, database: Database, database_url: str, overlap: bool
+) -> None:
+    client, app, token = _client(tmp_path, database_url)
+    first = [("set-common", b"common"), ("set-first", b"first")]
+    second = [("set-second", b"second"), first[0]] if overlap else list(reversed(first))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(
+            executor.map(lambda rows: _publish_set(client, token, rows), (first, second))
+        )
+    assert sorted(row.status_code for row in responses) == ([202, 409] if overlap else [202, 202])
+    if not overlap:
+        assert responses[0].json() == responses[1].json()
+    with app.state.database.session() as session:
+        sets = list(session.scalars(select(ReleaseSetRecord)))
+        candidates = list(session.scalars(select(ReleaseCandidateRecord)))
+        assert len(sets) == 1
+        assert len(candidates) == 2
+        assert {str(row.id) for row in candidates} == set(sets[0].members)
+
+
+@pytest.mark.parametrize("recovers", [False, True])
+def test_publish_set_timeout_retries_preserve_private_siblings_and_full_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recovers: bool
+) -> None:
+    client, app, token = _client(tmp_path)
+    members = [(name, _archive(tmp_path, name)) for name in ("set-ready", "set-timeout")]
+    submitted = _publish_set(client, token, members).json()
+    failures = 2 if recovers else 3
+
+    def probe(root: Path, **kwargs: Any) -> StageResult:
+        nonlocal failures
+        if 'name = "set-timeout"' in (root / "dinkster-pack.toml").read_text() and failures:
+            failures -= 1
+            return StageResult(
+                (AdmissionFinding("probe.timeout", "error", "block", "Stage exceeded 30s."),),
+                operator_details={"timedOut": True, "returnCode": -9},
+            )
+        return run_executable_probe(root, **kwargs)
+
+    monkeypatch.setattr(admission_module, "run_executable_probe", probe)
+    admission = AdmissionService(
+        app.state.database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        require_isolation=False,
+    )
+    observed_retry = False
+    for _ in range(10):
+        assert admission.run_once(deliver_indexes=False)
+        status = client.get(
+            f"/v1/publish-sets/{submitted['setId']}",
+            headers={"Authorization": f"Bearer {token}"},
+        ).json()
+        assert {row["candidateId"] for row in status["members"]} == {
+            row["candidateId"] for row in submitted["members"]
+        }
+        observed_retry |= any(row["status"] == "retrying" for row in status["members"])
+        if status["status"] != "queued":
+            break
+        for name, _ in members:
+            assert client.get(f"/v1/packs/{name}").status_code == 404
+    assert observed_retry
+    assert status["status"] == ("accepted" if recovers else "rejected"), status
+    timed = next(row for row in status["members"] if row["packName"] == "set-timeout")
+    assert timed["attempts"] == 3
+    for name, _ in members:
+        assert client.get(f"/v1/packs/{name}").status_code == (200 if recovers else 404)

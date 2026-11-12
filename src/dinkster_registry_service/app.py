@@ -572,7 +572,14 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
                         )
                     )
                 set_id = submit_set(admission, uploads, token)
-        except (ReleaseSetError, PackLocksError, ScanEngineError, ValidationError) as exc:
+        except (
+            ReleaseSetError,
+            PackLocksError,
+            ScanEngineError,
+            ValidationError,
+            IdentifierError,
+            VersionError,
+        ) as exc:
             raise ProtocolError(400, "invalid_request", str(exc)) from None
         except (AdmissionError, RegistryError) as exc:
             raise ProtocolError(409, "publish_in_progress", str(exc)) from None
