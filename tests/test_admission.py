@@ -38,6 +38,7 @@ from dinkster_registry_service.accounts import PublisherIdentity
 from dinkster_registry_service.admission import (
     AdmissionError,
     AdmissionService,
+    LeaseLost,
     quarantine_object_key,
 )
 from dinkster_registry_service.admission_checks import run_manifest_admission
@@ -351,6 +352,7 @@ def test_probe_timing_and_scanner_are_persisted(
 
 @pytest.mark.parametrize("stage", ["install", "probe"])
 @pytest.mark.parametrize("recovers", [False, True])
+@pytest.mark.parametrize("crashes", [0, 2])
 def test_scan_timeouts_retry_same_candidate_until_success_or_exhaustion(
     database: Database,
     database_url: str,
@@ -358,6 +360,7 @@ def test_scan_timeouts_retry_same_candidate_until_success_or_exhaustion(
     monkeypatch: pytest.MonkeyPatch,
     stage: str,
     recovers: bool,
+    crashes: int,
 ) -> None:
     service = _service(database, tmp_path)
     principals = PrincipalRepository(database)
@@ -388,6 +391,14 @@ def test_scan_timeouts_retry_same_candidate_until_success_or_exhaustion(
     monkeypatch.setattr(admission_module, "run_executable_probe", probe)
     with _client(database_url, tmp_path / "objects") as client:
         for attempt in range(1, 4):
+            if attempt == 2:
+                for _ in range(crashes):
+                    interrupted = service.claim()
+                    assert interrupted is not None
+                    with database.session() as session, session.begin():
+                        row = session.get(ReleaseCandidateRecord, candidate)
+                        assert row is not None
+                        row.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
             claim = service.claim()
             assert claim is not None and claim.id == candidate
             assert service.status(candidate).status == "scanning"
@@ -400,7 +411,7 @@ def test_scan_timeouts_retry_same_candidate_until_success_or_exhaustion(
             payload = response.json()
             assert payload["candidateId"] == str(candidate)
             assert payload["artifactDigest"] == artifact_digest(archive)
-            assert payload["attempts"] == attempt
+            assert payload["attempts"] == attempt + (crashes if attempt >= 2 else 0)
             if attempt < 3:
                 assert payload["status"] == "retrying"
                 assert f"{limit}s" in payload["reason"]
@@ -1536,24 +1547,24 @@ def test_unexpected_scanner_exception_becomes_block_finding(
     assert all("pack-controlled" not in finding.message for finding in status.findings)
 
 
-def test_configured_candidate_claim_limit_is_honored(database: Database, tmp_path: Path) -> None:
+def test_expired_workers_do_not_exhaust_timeout_retries(database: Database, tmp_path: Path) -> None:
     service = _service(database, tmp_path, lease_seconds=60, max_attempts=1)
     candidate_id = service.submit(_archive(tmp_path), pack_name="example-pack", version="1.2.3")
     first = service.claim()
     assert first is not None and first.attempt == 1
-    with database.session() as session, session.begin():
-        candidate = session.get(ReleaseCandidateRecord, candidate_id)
-        assert candidate is not None
-        candidate.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
-
-    assert service.claim() is None
+    for _ in range(4):
+        with database.session() as session, session.begin():
+            candidate = session.get(ReleaseCandidateRecord, candidate_id)
+            assert candidate is not None
+            candidate.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        recovered = service.claim()
+        assert recovered is not None and recovered.id == candidate_id
+    with pytest.raises(LeaseLost):
+        service.process(first)
+    assert recovered is not None
+    service.process(recovered)
     status = service.status(candidate_id)
-    assert (status.status, status.reason, status.attempts) == (
-        "rejected",
-        "scanner.attempt-limit",
-        1,
-    )
-    assert any(finding.code == "scanner.attempt-limit" for finding in status.findings)
+    assert (status.status, status.reason, status.attempts) == ("accepted", None, 5)
 
 
 def test_running_probe_renews_lease(

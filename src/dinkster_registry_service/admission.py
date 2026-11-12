@@ -33,7 +33,7 @@ from dinkster_workers.manifest import load_manifest
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
-from sqlalchemy import and_, or_, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from .admission_checks import check_wheel_catalog, run_manifest_admission
@@ -473,61 +473,23 @@ class AdmissionService:
     def claim(self) -> CandidateClaim | None:
         now = datetime.now(UTC)
         with self.database.session() as session, session.begin():
-            while True:
-                candidate = session.scalar(
-                    select(ReleaseCandidateRecord)
-                    .where(
-                        or_(
-                            ReleaseCandidateRecord.status.in_(("queued", "retrying")),
-                            and_(
-                                ReleaseCandidateRecord.status == "scanning",
-                                ReleaseCandidateRecord.lease_expires_at <= now,
-                            ),
-                        )
-                    )
-                    .order_by(ReleaseCandidateRecord.submitted_at, ReleaseCandidateRecord.id)
-                    .with_for_update(skip_locked=True)
-                    .limit(1)
-                )
-                if candidate is None:
-                    return None
-                if candidate.attempt_count < self.settings.scanner_max_attempts:
-                    break
-                run_id = uuid7()
-                session.add(
-                    ReleaseScanRunRecord(
-                        id=run_id,
-                        release_id=None,
-                        candidate_id=candidate.id,
-                        created_at=now,
-                        accepted=False,
-                        stage="scanner_attempt_limit",
-                        attempt=candidate.attempt_count,
-                        policy_version=SCAN_POLICY_VERSION,
-                        operator_details={"maxAttempts": self.settings.scanner_max_attempts},
-                        doctor=candidate.doctor or _doctor_pending(),
-                        scan=_scan_payload("failed", now),
-                        provenance=_provenance(candidate.submitted_by),
-                        vulnerabilities=_vulnerabilities(),
+            candidate = session.scalar(
+                select(ReleaseCandidateRecord)
+                .where(
+                    or_(
+                        ReleaseCandidateRecord.status.in_(("queued", "retrying")),
+                        and_(
+                            ReleaseCandidateRecord.status == "scanning",
+                            ReleaseCandidateRecord.lease_expires_at <= now,
+                        ),
                     )
                 )
-                session.flush()
-                session.add(
-                    ReleaseFindingRecord(
-                        id=uuid7(),
-                        scan_run_id=run_id,
-                        created_at=now,
-                        code="scanner.attempt-limit",
-                        severity="error",
-                        effect="block",
-                        message="Scanner recovery attempts were exhausted.",
-                    )
-                )
-                candidate.status = "rejected"
-                candidate.status_reason = "scanner.attempt-limit"
-                candidate.lease_owner = None
-                candidate.lease_token = None
-                candidate.lease_expires_at = None
+                .order_by(ReleaseCandidateRecord.submitted_at, ReleaseCandidateRecord.id)
+                .with_for_update(skip_locked=True)
+                .limit(1)
+            )
+            if candidate is None:
+                return None
             token = uuid7()
             candidate.lease_owner = self.worker_id
             candidate.lease_token = token
@@ -648,6 +610,26 @@ class AdmissionService:
                     and (result.operator_details or {}).get("timedOut") is True
                 )
                 if stage == "executable_probe" and (probe_timeout or install_timeout):
+                    # A lost worker has no timeout result and must not spend this budget.
+                    timed_out_attempts = session.scalar(
+                        select(func.count(ReleaseScanRunRecord.id.distinct()))
+                        .join(ReleaseFindingRecord)
+                        .where(
+                            ReleaseScanRunRecord.candidate_id == candidate.id,
+                            ReleaseScanRunRecord.stage == "executable_probe",
+                            ReleaseFindingRecord.effect == "block",
+                            or_(
+                                ReleaseFindingRecord.code == "probe.timeout",
+                                and_(
+                                    ReleaseFindingRecord.code == "probe.dependencies-unresolved",
+                                    ReleaseScanRunRecord.operator_details["timedOut"]
+                                    .as_boolean()
+                                    .is_(True),
+                                ),
+                            ),
+                        )
+                    )
+                    assert timed_out_attempts is not None
                     limit = (
                         self.settings.probe_timeout_seconds
                         if probe_timeout
@@ -655,9 +637,9 @@ class AdmissionService:
                     )
                     candidate.status_reason = (
                         f"{candidate.status_reason}: {limit}s time limit exceeded "
-                        f"after {claim.attempt} attempts"
+                        f"after {timed_out_attempts} attempts"
                     )
-                    if claim.attempt < self.settings.scanner_max_attempts:
+                    if timed_out_attempts < self.settings.scanner_max_attempts:
                         candidate.status = "retrying"
                 candidate.lease_owner = None
                 candidate.lease_token = None
