@@ -234,6 +234,7 @@ def main() -> None:
                 "DINKSTER_CURSOR_SECRET",
                 "DINKSTER_SECURITY_SIGNING_KEY_PATH",
                 "DINKSTER_SCANNER_TOKEN_SHA256",
+                "DINKSTER_SCANNER_FLY_TOKEN",
                 "FLY_API_TOKEN",
                 "GITHUB_TOKEN",
                 "GH_TOKEN",

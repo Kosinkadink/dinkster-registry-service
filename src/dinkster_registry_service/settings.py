@@ -47,6 +47,10 @@ class ServerSettings(ProbeSettings):
     cursor_secret: bytes = b"local-cursor-secret-change-in-production"
     scanner_max_attempts: int = 3
     scanner_token_sha256: str | None = field(default=None, repr=False)
+    scanner_fly_app: str | None = None
+    scanner_machine_ids: tuple[str, ...] = ()
+    scanner_machine_limit: int = 1
+    scanner_fly_token: str | None = field(default=None, repr=False)
     identity_issuer: str = "https://id.dinkster.org"
     identity_audience: str = "dinkster-registry"
     security_signing_key_path: Path | None = field(default=None, repr=False)
@@ -54,6 +58,36 @@ class ServerSettings(ProbeSettings):
     probe_runtime_mirror: Path | None = None
 
     def __post_init__(self) -> None:
+        if self.scanner_fly_app or self.scanner_machine_ids or self.scanner_fly_token:
+            if (
+                self.scanner_fly_app is None
+                or re.fullmatch(r"[a-z][a-z0-9-]{0,62}", self.scanner_fly_app) is None
+                or self.scanner_fly_app == os.getenv("FLY_APP_NAME")
+                or not self.scanner_machine_ids
+                or len(self.scanner_machine_ids) != len(set(self.scanner_machine_ids))
+                or len(self.scanner_machine_ids) > 8
+                or any(
+                    re.fullmatch(r"[0-9a-f]{14,16}", value) is None
+                    for value in self.scanner_machine_ids
+                )
+                or not self.scanner_fly_token
+                or "\n" in self.scanner_fly_token
+                or "\r" in self.scanner_fly_token
+                or self.scanner_token_sha256 is None
+            ):
+                raise ValueError(
+                    "Scanner lifecycle requires a separate DINKSTER_SCANNER_FLY_APP, "
+                    "registered DINKSTER_SCANNER_MACHINE_IDS, DINKSTER_SCANNER_FLY_TOKEN "
+                    "and worker verifier"
+                )
+            _require_range(
+                "DINKSTER_SCANNER_MACHINE_LIMIT",
+                self.scanner_machine_limit,
+                1,
+                len(self.scanner_machine_ids),
+            )
+        else:
+            _require_range("DINKSTER_SCANNER_MACHINE_LIMIT", self.scanner_machine_limit, 1, 8)
         if (
             self.scanner_token_sha256 is not None
             and re.fullmatch(r"[0-9a-f]{64}", self.scanner_token_sha256) is None
@@ -150,6 +184,14 @@ class ServerSettings(ProbeSettings):
                 "DINKSTER_SCANNER_MAX_ATTEMPTS", defaults.scanner_max_attempts
             ),
             scanner_token_sha256=os.getenv("DINKSTER_SCANNER_TOKEN_SHA256"),
+            scanner_fly_app=os.getenv("DINKSTER_SCANNER_FLY_APP"),
+            scanner_machine_ids=tuple(
+                filter(None, os.getenv("DINKSTER_SCANNER_MACHINE_IDS", "").split(","))
+            ),
+            scanner_machine_limit=_environment_integer(
+                "DINKSTER_SCANNER_MACHINE_LIMIT", defaults.scanner_machine_limit
+            ),
+            scanner_fly_token=os.getenv("DINKSTER_SCANNER_FLY_TOKEN"),
         )
 
     def probe_settings(self) -> ProbeSettings:

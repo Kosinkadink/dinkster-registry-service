@@ -28,6 +28,35 @@ def test_runtime_metadata_mirror_is_development_only(
             ServerSettings(environment=environment, probe_runtime_mirror=tmp_path)
 
 
+def test_scanner_pool_requires_complete_separate_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    values = {
+        "DINKSTER_SCANNER_FLY_APP": "disposable-scanners",
+        "DINKSTER_SCANNER_MACHINE_IDS": "aaaaaaaaaaaaaa,bbbbbbbbbbbbbb",
+        "DINKSTER_SCANNER_MACHINE_LIMIT": "2",
+        "DINKSTER_SCANNER_FLY_TOKEN": "disposable-management-capability",
+        "DINKSTER_SCANNER_TOKEN_SHA256": "a" * 64,
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    settings = ServerSettings.from_environment()
+    assert settings.scanner_machine_ids == ("a" * 14, "b" * 14)
+    assert settings.scanner_machine_limit == 2
+    assert values["DINKSTER_SCANNER_FLY_TOKEN"] not in repr(settings)
+    for name, value in (
+        ("DINKSTER_SCANNER_FLY_APP", "../other-app"),
+        ("DINKSTER_SCANNER_MACHINE_IDS", "aaaaaaaaaaaaaa,aaaaaaaaaaaaaa"),
+        ("DINKSTER_SCANNER_MACHINE_IDS", "../other"),
+        ("DINKSTER_SCANNER_MACHINE_LIMIT", "3"),
+        ("DINKSTER_SCANNER_FLY_TOKEN", ""),
+        ("DINKSTER_SCANNER_TOKEN_SHA256", ""),
+        ("FLY_APP_NAME", "disposable-scanners"),
+    ):
+        with monkeypatch.context() as invalid:
+            invalid.setenv(name, value)
+            with pytest.raises(ValueError):
+                ServerSettings.from_environment()
+
+
 def test_probe_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     values = {
         "DINKSTER_PROBE_TIMEOUT_SECONDS": "1",

@@ -185,9 +185,12 @@ rebuild command after `seed` to expose fixtures through the static indexes.
 
 Two replicas share PostgreSQL metadata, fenced scanner leases and durable
 outbox events, plus R2 quarantine/artifacts/indexes. This makes local artifact
-volumes unnecessary; the image declares none. The Fly configuration keeps two
-512 MB shared-cpu-1x Machines in sjc, each with supervised nonroot API/scanner
-processes and full probe-isolation preflight. See [deploy.md](deploy.md) for
+volumes unnecessary; the image declares none. The checked-in Fly configuration
+declares two 512 MB shared-cpu-1x web Machines in sjc. Web startup supervises
+nonroot API and outbox-delivery processes, not scanner execution. A separate
+scanner app and registered worker pool must be provisioned before deploying
+this startup split; no production size or concurrency approval is implied.
+See [deploy.md](deploy.md) for
 secret prerequisites, migration/runtime credential separation, first deploy,
 health-checked rollback and the required live evidence.
 
@@ -736,6 +739,35 @@ not need a probe jail. The existing `dinkster-registry scanner` command retains
 the combined database-backed operator/development behavior and must not be used
 as the remote worker or the web startup. Machine lifecycle provisioning and
 restart policy are separate from these process entry points.
+
+For an explicitly provisioned separate scanner app, the delivery process can
+reconcile waiting work with a fixed Machine pool. Configure
+`DINKSTER_SCANNER_FLY_APP`, comma-separated `DINKSTER_SCANNER_MACHINE_IDS`,
+`DINKSTER_SCANNER_MACHINE_LIMIT` (default 1), and
+`DINKSTER_SCANNER_FLY_TOKEN`, plus the worker capability verifier above. The
+Fly credential belongs only on the web side and must be restricted to the
+scanner app. The worker receives no Fly management credential. These settings
+are disabled when absent; the software default is not production sizing approval.
+
+Pool Machines must run exactly `dinkster-scanner`, have restart policy `no`,
+no services and no auto-destroy setting. They stop naturally when the worker
+exits on an empty queue. Only the first configured limit of registered IDs
+can be started; extra IDs are not automatic spares. Changing that fixed subset
+requires stopping the old controllers first. The controller only lists Machines
+and starts existing pool members; it cannot provision, update, stop or execute
+commands on Machines. Running unregistered Machines also occupy capacity.
+
+Every start intent is committed before its provider request. Concurrent web
+replicas serialize reservations, and a lost response or controller crash leaves
+a 120-second reservation before retrying the same Machine. This is a retry
+grace, not a measured provider startup guarantee. Eligible queued/retrying work
+or an expired scanning lease triggers reconciliation; a live lease does not.
+Arrival during a worker's idle exit is recovered by later reconciliation after
+the Machine stops and any reservation expires. Provider failures retain the
+queue and do not change admission attempts or fabricate a verdict. Provider
+calls run separately from outbox delivery so startup latency cannot block
+publication. Provisioning and production size/concurrency approval remain
+operator responsibilities.
 
 Probe and scanner limits use integer environment variables validated at
 startup. Invalid values stop the process with an error naming the variable.

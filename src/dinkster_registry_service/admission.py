@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import socket
 import threading
 import time
@@ -58,6 +59,7 @@ from .pack_locks import MAX_LOCK_SIZE, lock_object_key, parse_pack_locks, quaran
 from .principals import PrincipalRepository
 from .scan_engine import parse_scan_engine
 from .scan_execution import ProbeDependencies, run_prepared_probe
+from .scanner_lifecycle import MachineUnavailable, ScannerLifecycle, ScannerMachines
 from .security_publication import SecurityPublication
 from .security_repository import (
     SecurityRepository,
@@ -1649,9 +1651,39 @@ class AdmissionService:
     def run_delivery(self, *, poll_seconds: float = 1.0) -> None:
         if poll_seconds <= 0:
             raise ValueError("poll_seconds must be positive")
-        while True:
-            if not self.deliver_once():
-                time.sleep(poll_seconds)
+        lifecycle = None
+        if self.settings.scanner_fly_app is not None:
+            assert self.settings.scanner_fly_token is not None
+            lifecycle = ScannerLifecycle(
+                self.database,
+                ScannerMachines(self.settings.scanner_fly_app, self.settings.scanner_fly_token),
+                self.settings.scanner_machine_ids,
+                self.settings.scanner_machine_limit,
+            )
+        stopped = threading.Event()
+
+        def reconcile() -> None:
+            while not stopped.is_set():
+                try:
+                    if lifecycle is not None:
+                        lifecycle.reconcile()
+                except MachineUnavailable:
+                    logging.getLogger(__name__).warning(
+                        "Scanner lifecycle unavailable; queue retained"
+                    )
+                stopped.wait(max(5, poll_seconds))
+
+        # Provider startup latency must not stall promotion or index delivery.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            background = executor.submit(reconcile)
+            try:
+                while True:
+                    if background.done():
+                        background.result()
+                    if not self.deliver_once():
+                        stopped.wait(poll_seconds)
+            finally:
+                stopped.set()
 
     def run_once(self, *, deliver_indexes: bool = True) -> bool:
         if self.deliver_once(deliver_indexes=False):
