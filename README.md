@@ -459,6 +459,22 @@ return the original candidate; a changed binding for that publication refuses.
 The release remains private until every lock and the archive are verified in
 immutable storage. A promotion outage retries through the existing outbox.
 
+The multipart request may also contain one text part named `engine`, a JSON
+object with `commit` (40 lowercase hex characters) and `manifestDigest`
+(`sha256:` plus 64 lowercase hex characters), at most 1024 bytes. This binding
+cannot change or disappear on a retry and is retained for rescans. The scanner
+resolves that exact commit and manifest digest from the trusted engine release
+index, verifies the API wheel's version, size and SHA256, and requires the pack's
+engine range to accept it. Missing or changed release bytes block admission;
+there is no fallback to a newer engine. Only the executable probe inside the
+jail uses the selected API; the host scanner remains pinned. Unbound requests
+retain the pinned API behavior.
+
+Disposable development registries can set `DINKSTER_PROBE_ENGINE_RELEASE` to a
+directory containing the exact `release-manifest.json` and API wheel instead of
+using the public release index. The same identity and byte checks apply, and
+the override is refused unless `DINKSTER_ENV` is `development`.
+
 Release detail exposes `installLocks`, keyed by variant, containing `baseId`,
 `artifactDigest`, lock `digest`, `size`, and a relative `url`. Resolve that URL
 against the registry origin and pass the exact `baseId` query parameter; a

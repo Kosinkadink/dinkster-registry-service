@@ -30,11 +30,16 @@ from dinkster_registry.archive_admission import (
 )
 from dinkster_workers.sandbox import ProbeJail
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import SQLAlchemyError
 
 import dinkster_registry_service.admission as admission_module
 from dinkster_registry_service.accounts import PublisherIdentity
-from dinkster_registry_service.admission import AdmissionService, quarantine_object_key
+from dinkster_registry_service.admission import (
+    AdmissionError,
+    AdmissionService,
+    quarantine_object_key,
+)
 from dinkster_registry_service.admission_checks import run_manifest_admission
 from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
@@ -58,6 +63,7 @@ from dinkster_registry_service.object_store import (
 )
 from dinkster_registry_service.ownership import transfer_ownership
 from dinkster_registry_service.principals import PrincipalRepository
+from dinkster_registry_service.scan_engine import ScanEngineError
 from dinkster_registry_service.security import SecurityRelease
 from dinkster_registry_service.security_repository import (
     NoticeChange,
@@ -157,6 +163,63 @@ def test_mandatory_stage_functions_accept_the_registry_fixture(
     assert not probe.blocked
     assert probe.data is not None and len(probe.data["schemas"]) == 2
     assert not security.blocked
+
+
+def test_engine_binding_survives_claim_and_cannot_change_on_replay(
+    database: Database, tmp_path: Path
+) -> None:
+    service = _service(database, tmp_path)
+    archive = _archive(tmp_path)
+    binding = {"commit": "a" * 40, "manifestDigest": "sha256:" + "b" * 64}
+    engine = json.dumps(binding).encode()
+    candidate_id = service.submit(archive, pack_name="example-pack", version="1.2.3", engine=engine)
+    assert (
+        service.submit(archive, pack_name="example-pack", version="1.2.3", engine=engine)
+        == candidate_id
+    )
+    claim = service.claim()
+    assert claim is not None and claim.id == candidate_id and claim.scan_engine == binding
+    for changed in (
+        None,
+        {**binding, "commit": "c" * 40},
+        {**binding, "manifestDigest": "sha256:" + "d" * 64},
+    ):
+        with pytest.raises(AdmissionError, match="different archive, lock or engine bindings"):
+            service.submit(
+                archive,
+                pack_name="example-pack",
+                version="1.2.3",
+                engine=json.dumps(changed).encode() if changed is not None else None,
+            )
+    with database.session() as session, pytest.raises(SQLAlchemyError, match="immutable"):
+        with session.begin():
+            session.execute(update(ReleaseCandidateRecord).values(scan_engine=None))
+
+
+@pytest.mark.parametrize(
+    "engine",
+    (
+        b"",
+        b"x" * 1025,
+        b"[]",
+        b"{}",
+        b'{"commit":"a","commit":"b","manifestDigest":"sha256:abc"}',
+        json.dumps({"commit": "a" * 39, "manifestDigest": "sha256:" + "b" * 64}).encode(),
+        json.dumps({"commit": "a" * 40, "manifestDigest": "sha256:" + "B" * 64}).encode(),
+        json.dumps({"commit": "a" * 40, "manifestDigest": "sha256:" + "b" * 63}).encode(),
+        json.dumps(
+            {"commit": "a" * 40, "manifestDigest": "sha256:" + "b" * 64, "url": "x"}
+        ).encode(),
+    ),
+)
+def test_submission_rejects_malformed_engine_binding(tmp_path: Path, engine: bytes) -> None:
+    database = Database(f"sqlite:///{tmp_path / 'registry.db'}")
+    try:
+        service = _service(database, tmp_path)
+        with pytest.raises(ScanEngineError):
+            service.submit(b"archive", pack_name="example-pack", version="1.2.3", engine=engine)
+    finally:
+        database.dispose()
 
 
 def test_probe_supports_current_pack_api(tmp_path: Path) -> None:

@@ -112,6 +112,40 @@ def _locks(archive: bytes) -> dict[str, object]:
     }
 
 
+def test_publish_api_binds_exact_engine_and_rejects_changed_or_malformed_binding(
+    tmp_path: Path,
+) -> None:
+    client, app, token = _client(tmp_path)
+    archive = _archive(tmp_path, "locked-pack")
+    binding = {"commit": "a" * 40, "manifestDigest": "sha256:" + "b" * 64}
+    endpoint = "/v1/publish/locked-pack/versions/1.2.3"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    def publish(engine: str | None) -> Response:
+        data = {"locks": json.dumps(_locks(archive))}
+        if engine is not None:
+            data["engine"] = engine
+        return client.post(
+            endpoint,
+            headers=headers,
+            files={"archive": ("pack.whl", archive, "application/zip")},
+            data=data,
+        )
+
+    submitted = publish(json.dumps(binding))
+    assert submitted.status_code == 202, submitted.text
+    assert publish(json.dumps(binding)).json() == submitted.json()
+    assert publish(json.dumps({**binding, "commit": "c" * 40})).status_code == 409
+    assert publish(None).status_code == 409
+    assert publish('{"commit":"short"}').status_code == 400
+    assert publish("x" * 1025).status_code == 400
+    admission = AdmissionService(
+        app.state.database, LocalFilesystemObjectStore(tmp_path / "objects")
+    )
+    claim = admission.claim()
+    assert claim is not None and claim.scan_engine == binding
+
+
 def test_locked_publication_recovers_rejected_dependency_without_reset(
     tmp_path: Path, database: Database, database_url: str
 ) -> None:

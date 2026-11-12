@@ -77,6 +77,9 @@ def test_accepted_catalog_facts_cannot_be_rewritten_or_erased(
         update(ArtifactRecord).values(size=1),
         delete(ArtifactRecord),
         update(ReleaseRecord).values(install_locks={"linux-cpu": {"digest": "rewritten"}}),
+        update(ReleaseRecord).values(
+            scan_engine={"commit": "a" * 40, "manifestDigest": "sha256:" + "b" * 64}
+        ),
         update(ReleaseNodeRecord).values(role="schema-only"),
         delete(ReleaseNodeRecord),
         delete(ReleaseRecord),
