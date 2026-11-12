@@ -658,6 +658,26 @@ promotion. R2 uses region `auto`. Partial configuration is rejected in every
 mode. `DINKSTER_ENV=production` requires all five settings and never falls back
 to local artifact storage. Local files remain a development/self-hosting choice.
 
+The internal scanner assignment endpoints require a separate bearer capability.
+`DINKSTER_SCANNER_TOKEN_SHA256` stores its lowercase SHA256 digest, never the
+plaintext capability. Unconfigured endpoints deny every request. Publisher
+tokens do not authenticate as scanners, and the scanner capability does not
+authorize publishing or public-index writes.
+
+- `POST /internal/scanner/claim` returns a fenced assignment and nonsecret probe
+  settings, or 204 when no candidate is eligible. It does not run a scan.
+- `GET /internal/scanner/{candidate_id}/input` returns only that assignment's
+  original bounded archive, without accepting object keys or URLs.
+- `POST /internal/scanner/{candidate_id}/heartbeat` renews a live lease. Reads
+  and heartbeats require `X-Scanner-Lease` with the assignment's token; expired
+  or replaced tokens return 409 and cannot revive the old assignment.
+
+These endpoints accept no query parameters or request bodies and return
+`Cache-Control: no-store`. They do not return database, object-store, cursor,
+signing or management credentials. Input-store failures return retryable 503
+without rejecting the candidate. These assignment endpoints do not submit
+verdicts or start/stop Machines, and do not replace the existing scanner command.
+
 Probe and scanner limits use integer environment variables validated at
 startup. Invalid values stop the process with an error naming the variable.
 
@@ -667,7 +687,7 @@ startup. Invalid values stop the process with an error naming the variable.
 | `DINKSTER_PROBE_DEPENDENCY_TIMEOUT_SECONDS` | 300 | 1-1800 seconds |
 | `DINKSTER_PROBE_OUTPUT_LIMIT_BYTES` | 2097152 | 4096-4194304 bytes per stream |
 | `DINKSTER_PROBE_OPERATOR_TAIL_BYTES` | 8192 | 512 bytes through the configured output limit |
-| `DINKSTER_SCANNER_MAX_ATTEMPTS` | 3 | 1-10 claims |
+| `DINKSTER_SCANNER_MAX_ATTEMPTS` | 3 | 1-10 completed timeout attempts |
 
 `DINKSTER_PROBE_PACKAGE_INDEX_URL` selects the operator-controlled package index
 (default `https://pypi.org/simple`). `DINKSTER_PROBE_DEPENDENCY_SOURCE` accepts

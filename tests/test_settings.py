@@ -12,6 +12,7 @@ PROBE_ENVIRONMENT_VARIABLES = (
     "DINKSTER_PROBE_OUTPUT_LIMIT_BYTES",
     "DINKSTER_PROBE_OPERATOR_TAIL_BYTES",
     "DINKSTER_SCANNER_MAX_ATTEMPTS",
+    "DINKSTER_SCANNER_TOKEN_SHA256",
 )
 
 
@@ -24,6 +25,7 @@ def test_probe_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) -
         "DINKSTER_PROBE_OUTPUT_LIMIT_BYTES": "4096",
         "DINKSTER_PROBE_OPERATOR_TAIL_BYTES": "512",
         "DINKSTER_SCANNER_MAX_ATTEMPTS": "1",
+        "DINKSTER_SCANNER_TOKEN_SHA256": "a" * 64,
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
@@ -37,6 +39,8 @@ def test_probe_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) -
     assert settings.probe_output_limit_bytes == 4096
     assert settings.probe_operator_tail_bytes == 512
     assert settings.scanner_max_attempts == 1
+    assert settings.scanner_token_sha256 == "a" * 64
+    assert settings.scanner_token_sha256 not in repr(settings)
 
 
 def test_probe_dependency_source_defaults_to_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -59,6 +63,8 @@ def test_probe_dependency_source_defaults_to_cpu(monkeypatch: pytest.MonkeyPatch
         ("DINKSTER_PROBE_OPERATOR_TAIL_BYTES", "2097153"),
         ("DINKSTER_SCANNER_MAX_ATTEMPTS", "0"),
         ("DINKSTER_SCANNER_MAX_ATTEMPTS", "11"),
+        ("DINKSTER_SCANNER_TOKEN_SHA256", "a" * 63),
+        ("DINKSTER_SCANNER_TOKEN_SHA256", "A" * 64),
         ("DINKSTER_PROBE_TIMEOUT_SECONDS", "not-an-integer"),
     ),
 )

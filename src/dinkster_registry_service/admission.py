@@ -16,7 +16,6 @@ from dinkster_registry import RegistryError, TokenRecord
 from dinkster_registry.archive_admission import (
     SCAN_POLICY_VERSION,
     AdmissionFinding,
-    ProbeSettings,
     StageResult,
     run_doctor_static,
 )
@@ -471,6 +470,8 @@ class AdmissionService:
     def claim(self) -> CandidateClaim | None:
         now = datetime.now(UTC)
         with self.database.session() as session, session.begin():
+            if not self.database.is_postgresql:
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             candidate = session.scalar(
                 select(ReleaseCandidateRecord)
                 .where(
@@ -516,6 +517,41 @@ class AdmissionService:
                 declared_size=candidate.declared_size,
                 object_key=candidate.object_key,
                 lease_token=token,
+                attempt=candidate.attempt_count,
+                scan_engine=candidate.scan_engine,
+            )
+
+    def leased_claim(
+        self, candidate_id: UUID, lease_token: UUID, *, renew: bool = False
+    ) -> CandidateClaim:
+        with self.database.session() as session, session.begin():
+            if not self.database.is_postgresql:
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            candidate = session.get(ReleaseCandidateRecord, candidate_id, with_for_update=True)
+            now = datetime.now(UTC)
+            expiry = candidate.lease_expires_at if candidate is not None else None
+            if expiry is not None and expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=UTC)
+            if (
+                candidate is None
+                or candidate.status != "scanning"
+                or candidate.lease_token != lease_token
+                or expiry is None
+                or expiry <= now
+            ):
+                raise LeaseLost("Scanner assignment is absent, expired or replaced.")
+            if renew:
+                candidate.lease_expires_at = now + timedelta(seconds=self.lease_seconds)
+            return CandidateClaim(
+                id=candidate.id,
+                kind=candidate.kind,
+                release_id=candidate.release_id,
+                pack_name=candidate.pack_name,
+                version=candidate.version,
+                declared_digest=candidate.declared_digest,
+                declared_size=candidate.declared_size,
+                object_key=candidate.object_key,
+                lease_token=lease_token,
                 attempt=candidate.attempt_count,
                 scan_engine=candidate.scan_engine,
             )
@@ -1352,14 +1388,7 @@ class AdmissionService:
         return run_prepared_probe(
             root,
             dependencies,
-            settings=ProbeSettings(
-                probe_timeout_seconds=self.settings.probe_timeout_seconds,
-                probe_dependency_timeout_seconds=self.settings.probe_dependency_timeout_seconds,
-                probe_package_index_url=self.settings.probe_package_index_url,
-                probe_dependency_source=self.settings.probe_dependency_source,
-                probe_output_limit_bytes=self.settings.probe_output_limit_bytes,
-                probe_operator_tail_bytes=self.settings.probe_operator_tail_bytes,
-            ),
+            settings=self.settings.probe_settings(),
             require_isolation=self.require_isolation,
             scan_engine=scan_engine,
             development_release=self.settings.probe_engine_release,
