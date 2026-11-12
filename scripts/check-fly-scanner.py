@@ -10,11 +10,17 @@ Fixture submission bypasses publisher authentication; fixture
 timings are not representative official-pack benchmarks. Provisioning must
 enforce the cumulative spend/runtime cap and teardown in its own finally block,
 including when this checker fails. Save evidence before destroying resources.
+
+--measure-worker repeats the unchanged assigned scan executor three times under
+one heartbeat-renewed lease. Use only for scan-body sizing, not lifecycle or
+end-to-end latency proof. Submit identical wheel/lock/engine bytes to a fresh
+queue for each size; the samples distinguish cold and warm local runtime caches.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import io
 import json
@@ -123,6 +129,24 @@ def create_proof_app(settings: ServerSettings, capability: str) -> FastAPI:
         authenticate(request)
         app.state.proof_arrival = True
         return {"armed": True}
+
+    @app.post("/proof/upload/{pack}/{version}")
+    def upload(
+        pack: str, version: str, payload: dict[str, Any], request: WebRequest
+    ) -> dict[str, str]:
+        authenticate(request)
+        archive = base64.b64decode(payload["archive"], validate=True)
+        if len(archive) > 64 * 1024 * 1024:
+            raise ProtocolError(400, "invalid_request", "Proof wheel exceeds admission bound")
+        candidate = service.submit(
+            archive,
+            pack_name=pack,
+            version=version,
+            publisher="dinkster",
+            locks=json.dumps(payload["locks"]).encode() if payload.get("locks") else None,
+            engine=json.dumps(payload["engine"]).encode() if payload.get("engine") else None,
+        )
+        return {"candidateId": str(candidate)}
 
     @app.middleware("http")
     async def arrival_after_empty_claim(request: WebRequest, call_next: Any) -> Response:
@@ -462,11 +486,64 @@ class Proof:
         self.record("final-queue", self.request("GET", "/proof/state"))
 
 
+def measure_worker() -> None:
+    import resource
+    import sys
+    from unittest.mock import patch
+
+    from dinkster_registry.archive_admission import StageResult
+
+    from dinkster_registry_service import scanner_worker
+
+    if not os.environ.get("FLY_APP_NAME", "").startswith(WORKER_PREFIX):
+        raise ValueError("Measurement worker requires a named disposable app")
+
+    class MeasuredWorker(scanner_worker.ScannerWorker):
+        def _execute(self, claim: dict[str, Any]) -> StageResult | None:
+            result = None
+            for sample in range(3):
+                before = resource.getrusage(resource.RUSAGE_CHILDREN)
+                started = time.monotonic()
+                result = super()._execute(claim)
+                after = resource.getrusage(resource.RUSAGE_CHILDREN)
+                print(
+                    json.dumps(
+                        {
+                            "benchmarkSample": sample + 1,
+                            "candidateId": claim["candidateId"],
+                            "artifactDigest": claim["artifactDigest"],
+                            "scanEngine": claim["scanEngine"],
+                            "installLocks": claim["installLocks"],
+                            "wallSeconds": time.monotonic() - started,
+                            "childCpuSeconds": after.ru_utime
+                            + after.ru_stime
+                            - before.ru_utime
+                            - before.ru_stime,
+                            "childPeakRssKiB": after.ru_maxrss,
+                            "cache": "cold" if sample == 0 else "warm",
+                            "blocked": result.blocked if result else None,
+                            "findings": [item.code for item in result.findings] if result else [],
+                        }
+                    ),
+                    flush=True,
+                )
+                if result is None or result.blocked:
+                    break
+            return result
+
+    # Keep production startup isolation checks and heartbeat/result handling.
+    # Only the disposable measurement command repeats the scan body.
+    with patch.object(scanner_worker, "ScannerWorker", MeasuredWorker):
+        sys.argv = ["dinkster-scanner"]
+        scanner_worker.main()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--serve", action="store_true")
     mode.add_argument("--check", action="store_true")
+    mode.add_argument("--measure-worker", action="store_true")
     parser.add_argument("--origin")
     parser.add_argument("--scanner-app")
     parser.add_argument("--machine")
@@ -475,7 +552,9 @@ def main() -> None:
     parser.add_argument("--measurements-only", action="store_true")
     parser.add_argument("--samples", type=int, choices=(1, 3), default=3)
     args = parser.parse_args()
-    if args.serve:
+    if args.measure_worker:
+        measure_worker()
+    elif args.serve:
         import uvicorn
 
         app_name = os.getenv("FLY_APP_NAME", "")
