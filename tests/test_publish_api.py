@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sys
@@ -20,7 +21,8 @@ from runtime_fixture import RuntimeFixture
 from sqlalchemy import select
 from test_wheels import wheel_bytes
 
-import dinkster_registry_service.admission as admission_module
+import dinkster_registry_service.scan_execution as scan_execution
+import dinkster_registry_service.scanner_worker as scanner_worker
 from dinkster_registry_service.admission import AdmissionService, LeaseLost
 from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
@@ -59,13 +61,18 @@ def _archive(tmp_path: Path, name: str, *, native: bool = False) -> bytes:
     return build_registry_fixture_archive(source)
 
 
-def _client(tmp_path: Path, database_url: str | None = None) -> tuple[TestClient, FastAPI, str]:
+def _client(
+    tmp_path: Path, database_url: str | None = None, *, scanner_token: str | None = None
+) -> tuple[TestClient, FastAPI, str]:
     app = create_app(
         ServerSettings(
             database_url=database_url or f"sqlite:///{tmp_path / 'registry.db'}",
             object_store_root=tmp_path / "objects",
             public_base_url="http://testserver",
             cursor_secret=b"publish-api-test-cursor-secret",
+            scanner_token_sha256=hashlib.sha256(scanner_token.encode()).hexdigest()
+            if scanner_token is not None
+            else None,
         )
     )
     principals = PrincipalRepository(app.state.database)
@@ -1172,10 +1179,38 @@ def test_publish_set_concurrent_workers_scan_distinct_members_and_activate_once(
 
 
 @pytest.mark.parametrize("failure", [None, "range", "cycle", "other-set"])
+@pytest.mark.parametrize("remote", [False, True])
 def test_publish_set_resolves_transitive_pack_and_library_siblings_without_publication(
-    tmp_path: Path, failure: str | None
+    tmp_path: Path, failure: str | None, remote: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    client, app, token = _client(tmp_path)
+    client, app, token = _client(tmp_path, scanner_token="set-scanner-capability")
+    worker = scanner_worker.ScannerWorker(
+        "http://testserver", "set-scanner-capability", tmp_path / "worker-runtime", development=True
+    )
+    if remote:
+
+        def request(
+            method: str,
+            path: str,
+            *,
+            lease: str | None = None,
+            payload: dict[str, Any] | None = None,
+            limit: int = 1024 * 1024,
+        ) -> bytes | None:
+            headers = {"Authorization": "Bearer set-scanner-capability"}
+            if lease is not None:
+                headers["X-Scanner-Lease"] = lease
+            response = client.request(
+                method, "/internal/scanner" + path, headers=headers, json=payload
+            )
+            assert response.status_code in {200, 204}, response.text
+            return None if response.status_code == 204 else response.content
+
+        def probe(*args: Any, **kwargs: Any) -> StageResult:
+            return scan_execution.run_prepared_probe(*args, **kwargs, require_isolation=False)
+
+        monkeypatch.setattr(worker, "_request", request)
+        monkeypatch.setattr(scanner_worker, "run_prepared_probe", probe)
     consumer = "set-consumer"
     helper = "set-helper"
     for name in (consumer, helper):
@@ -1226,7 +1261,11 @@ def test_publish_set_resolves_transitive_pack_and_library_siblings_without_publi
     admission = AdmissionService(app.state.database, store, require_isolation=False)
     auth = {"Authorization": f"Bearer {token}"}
     for _ in range(8):
-        assert admission.run_once(deliver_indexes=False)
+        assert (
+            admission.deliver_once(deliver_indexes=False) or worker.run_once()
+            if remote
+            else admission.run_once(deliver_indexes=False)
+        )
         status = client.get(f"/v1/publish-sets/{submitted['setId']}", headers=auth).json()
         if status["status"] != "queued":
             break
@@ -1392,7 +1431,7 @@ def test_publish_set_timeout_retries_preserve_private_siblings_and_full_scan(
             )
         return run_executable_probe(root, **kwargs)
 
-    monkeypatch.setattr(admission_module, "run_executable_probe", probe)
+    monkeypatch.setattr(scan_execution, "run_executable_probe", probe)
     admission = AdmissionService(
         app.state.database,
         LocalFilesystemObjectStore(tmp_path / "objects"),

@@ -1,30 +1,25 @@
 from __future__ import annotations
 
-import hashlib
 import io
+import logging
 import socket
-import tempfile
 import threading
 import time
-import tomllib
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 from uuid import UUID
 
-import tomli_w
 from dinkster_registry import RegistryError, TokenRecord
 from dinkster_registry.archive_admission import (
     SCAN_POLICY_VERSION,
     AdmissionFinding,
     StageResult,
     run_doctor_static,
-    run_executable_probe,
-    run_locked_probe,
 )
 from dinkster_schema import (
     canonical_claim,
@@ -32,18 +27,11 @@ from dinkster_schema import (
     claims_conflict,
     reserved_root,
 )
-from dinkster_store import object_path, readable_label
-from dinkster_supervisor.environment_artifacts import acquire
-from dinkster_supervisor.environment_downloads import fetch_artifact
-from dinkster_supervisor.environment_generations import prepare_engine_interpreter
-from dinkster_supervisor.environment_state import writer_lock
 from dinkster_workers.manifest import load_manifest
-from dinkster_workers.pack_lock import PackLock, normalize_requirement
-from dinkster_workers.provision import ProvisionError
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
-from sqlalchemy import and_, or_, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from .admission_checks import (
@@ -77,8 +65,9 @@ from .object_store import MAX_ARTIFACT_SIZE, ObjectStore, ObjectStoreError
 from .pack_locks import MAX_LOCK_SIZE, lock_object_key, parse_pack_locks, quarantine_lock_key
 from .principals import PrincipalRepository
 from .release_sets import clean_one_set, queue_set_cleanup, settle_one_set
-from .scan_engine import parse_scan_engine, stage_scan_api
-from .scan_runtime import scan_catalog
+from .scan_engine import parse_scan_engine
+from .scan_execution import ProbeDependencies, run_prepared_probe
+from .scanner_lifecycle import MachineUnavailable, ScannerLifecycle, ScannerMachines
 from .security_publication import SecurityPublication
 from .security_repository import (
     SecurityRepository,
@@ -505,71 +494,35 @@ class AdmissionService:
     def claim(self) -> CandidateClaim | None:
         now = datetime.now(UTC)
         with self.database.session() as session, session.begin():
-            while True:
-                candidate = session.scalar(
-                    select(ReleaseCandidateRecord)
-                    .where(
-                        or_(
-                            ReleaseCandidateRecord.status.in_(("queued", "retrying")),
-                            and_(
-                                ReleaseCandidateRecord.status == "scanning",
-                                ReleaseCandidateRecord.lease_expires_at <= now,
-                            ),
+            if not self.database.is_postgresql:
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            candidate = session.scalar(
+                select(ReleaseCandidateRecord)
+                .where(
+                    or_(
+                        ReleaseCandidateRecord.status.in_(("queued", "retrying")),
+                        and_(
+                            ReleaseCandidateRecord.status == "scanning",
+                            ReleaseCandidateRecord.lease_expires_at <= now,
                         ),
-                        or_(
-                            ReleaseCandidateRecord.set_id.is_(None),
-                            select(ReleaseSetRecord.id)
-                            .where(
-                                ReleaseSetRecord.id == ReleaseCandidateRecord.set_id,
-                                ReleaseSetRecord.status == "queued",
-                                ReleaseSetRecord.expires_at > now,
-                            )
-                            .exists(),
-                        ),
-                    )
-                    .order_by(ReleaseCandidateRecord.submitted_at, ReleaseCandidateRecord.id)
-                    .with_for_update(skip_locked=True)
-                    .limit(1)
+                    ),
+                    or_(
+                        ReleaseCandidateRecord.set_id.is_(None),
+                        select(ReleaseSetRecord.id)
+                        .where(
+                            ReleaseSetRecord.id == ReleaseCandidateRecord.set_id,
+                            ReleaseSetRecord.status == "queued",
+                            ReleaseSetRecord.expires_at > now,
+                        )
+                        .exists(),
+                    ),
                 )
-                if candidate is None:
-                    return None
-                if candidate.attempt_count < self.settings.scanner_max_attempts:
-                    break
-                run_id = uuid7()
-                session.add(
-                    ReleaseScanRunRecord(
-                        id=run_id,
-                        release_id=None,
-                        candidate_id=candidate.id,
-                        created_at=now,
-                        accepted=False,
-                        stage="scanner_attempt_limit",
-                        attempt=candidate.attempt_count,
-                        policy_version=SCAN_POLICY_VERSION,
-                        operator_details={"maxAttempts": self.settings.scanner_max_attempts},
-                        doctor=candidate.doctor or _doctor_pending(),
-                        scan=_scan_payload("failed", now),
-                        provenance=_provenance(candidate.submitted_by),
-                        vulnerabilities=_vulnerabilities(),
-                    )
-                )
-                session.flush()
-                session.add(
-                    ReleaseFindingRecord(
-                        id=uuid7(),
-                        scan_run_id=run_id,
-                        created_at=now,
-                        code="scanner.attempt-limit",
-                        severity="error",
-                        effect="block",
-                        message="Scanner recovery attempts were exhausted.",
-                    )
-                )
-                candidate.status = "rejected"
-                candidate.status_reason = "scanner.attempt-limit"
-                candidate.lease_owner = None
-                candidate.lease_token = None
-                candidate.lease_expires_at = None
+                .order_by(ReleaseCandidateRecord.submitted_at, ReleaseCandidateRecord.id)
+                .with_for_update(skip_locked=True)
+                .limit(1)
+            )
+            if candidate is None:
+                return None
             token = uuid7()
             candidate.lease_owner = self.worker_id
             candidate.lease_token = token
@@ -604,20 +557,90 @@ class AdmissionService:
                 set_id=candidate.set_id,
             )
 
+    def leased_claim(
+        self, candidate_id: UUID, lease_token: UUID, *, renew: bool = False
+    ) -> CandidateClaim:
+        with self.database.session() as session, session.begin():
+            if not self.database.is_postgresql:
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            candidate = session.get(ReleaseCandidateRecord, candidate_id, with_for_update=True)
+            now = datetime.now(UTC)
+            expiry = candidate.lease_expires_at if candidate is not None else None
+            if expiry is not None and expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=UTC)
+            if (
+                candidate is None
+                or candidate.status != "scanning"
+                or candidate.lease_token != lease_token
+                or expiry is None
+                or expiry <= now
+            ):
+                raise LeaseLost("Scanner assignment is absent, expired or replaced.")
+            if renew:
+                candidate.lease_expires_at = now + timedelta(seconds=self.lease_seconds)
+            return CandidateClaim(
+                id=candidate.id,
+                kind=candidate.kind,
+                release_id=candidate.release_id,
+                pack_name=candidate.pack_name,
+                version=candidate.version,
+                declared_digest=candidate.declared_digest,
+                declared_size=candidate.declared_size,
+                object_key=candidate.object_key,
+                lease_token=lease_token,
+                attempt=candidate.attempt_count,
+                scan_engine=candidate.scan_engine,
+                install_locks=candidate.install_locks,
+                set_id=candidate.set_id,
+            )
+
     @staticmethod
-    def _leased_candidate(session: Session, claim: CandidateClaim) -> ReleaseCandidateRecord:
+    def _leased_candidate(
+        session: Session, claim: CandidateClaim, *, promoting: bool = False
+    ) -> ReleaseCandidateRecord:
         candidate = session.scalar(
             select(ReleaseCandidateRecord)
             .where(ReleaseCandidateRecord.id == claim.id)
             .with_for_update()
         )
-        if candidate is None or candidate.lease_token != claim.lease_token:
-            raise LeaseLost(f"candidate {claim.id} lease was replaced")
+        expiry = candidate.lease_expires_at if candidate is not None else None
+        if expiry is not None and expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=UTC)
+        if (
+            candidate is None
+            or candidate.status != ("promoting" if promoting else "scanning")
+            or candidate.lease_token != claim.lease_token
+            or (not promoting and (expiry is None or expiry <= datetime.now(UTC)))
+        ):
+            raise LeaseLost(f"candidate {claim.id} lease is absent, expired or replaced")
         return candidate
 
-    def _record_stage(self, claim: CandidateClaim, stage: str, result: StageResult) -> bool:
+    def accept_probe_result(self, claim: CandidateClaim, result: StageResult | None) -> None:
+        # Consume the worker capability before recording any admission stage.
+        # A duplicate submission cannot race or resume this private processing lease.
+        token = uuid7()
         with self.database.session() as session, session.begin():
+            if not self.database.is_postgresql:
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             candidate = self._leased_candidate(session, claim)
+            candidate.lease_token = token
+            candidate.lease_owner = self.worker_id
+            candidate.lease_expires_at = datetime.now(UTC) + timedelta(seconds=self.lease_seconds)
+        self._process(replace(claim, lease_token=token), remote=True, probe_result=result)
+
+    def _record_stage(
+        self,
+        claim: CandidateClaim,
+        stage: str,
+        result: StageResult,
+        *,
+        remote: bool = False,
+        promoting: bool = False,
+    ) -> bool:
+        with self.database.session() as session, session.begin():
+            if not self.database.is_postgresql:
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            candidate = self._leased_candidate(session, claim, promoting=promoting)
             now = datetime.now(UTC)
             doctor = (
                 cast("dict[str, object]", result.data)
@@ -638,8 +661,11 @@ class AdmissionService:
             if stage == "executable_probe":
                 operator_details = {
                     **(operator_details or {}),
-                    "scannerHost": socket.gethostname(),
-                    "scannerWorker": self.worker_id,
+                    **(
+                        {"scannerTransport": "remote"}
+                        if remote
+                        else {"scannerHost": socket.gethostname(), "scannerWorker": self.worker_id}
+                    ),
                 }
             session.add(
                 ReleaseScanRunRecord(
@@ -692,6 +718,26 @@ class AdmissionService:
                     and (result.operator_details or {}).get("timedOut") is True
                 )
                 if stage == "executable_probe" and (probe_timeout or install_timeout):
+                    # A lost worker has no timeout result and must not spend this budget.
+                    timed_out_attempts = session.scalar(
+                        select(func.count(ReleaseScanRunRecord.id.distinct()))
+                        .join(ReleaseFindingRecord)
+                        .where(
+                            ReleaseScanRunRecord.candidate_id == candidate.id,
+                            ReleaseScanRunRecord.stage == "executable_probe",
+                            ReleaseFindingRecord.effect == "block",
+                            or_(
+                                ReleaseFindingRecord.code == "probe.timeout",
+                                and_(
+                                    ReleaseFindingRecord.code == "probe.dependencies-unresolved",
+                                    ReleaseScanRunRecord.operator_details["timedOut"]
+                                    .as_boolean()
+                                    .is_(True),
+                                ),
+                            ),
+                        )
+                    )
+                    assert timed_out_attempts is not None
                     limit = (
                         self.settings.probe_timeout_seconds
                         if probe_timeout
@@ -699,9 +745,9 @@ class AdmissionService:
                     )
                     candidate.status_reason = (
                         f"{candidate.status_reason}: {limit}s time limit exceeded "
-                        f"after {claim.attempt} attempts"
+                        f"after {timed_out_attempts} attempts"
                     )
-                    if claim.attempt < self.settings.scanner_max_attempts:
+                    if timed_out_attempts < self.settings.scanner_max_attempts:
                         candidate.status = "retrying"
                 candidate.lease_owner = None
                 candidate.lease_token = None
@@ -722,6 +768,8 @@ class AdmissionService:
 
     def _mark_review(self, claim: CandidateClaim) -> None:
         with self.database.session() as session, session.begin():
+            if not self.database.is_postgresql:
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             candidate = self._leased_candidate(session, claim)
             finding = (
                 session.execute(
@@ -810,7 +858,7 @@ class AdmissionService:
             ):
                 if own_transaction:
                     lock_security(session)
-                candidate = self._leased_candidate(session, claim)
+                candidate = self._leased_candidate(session, claim, promoting=not own_transaction)
                 authorization = SecurityRepository.require_candidate_upload(session, candidate)
                 if self.database.is_postgresql:
                     session.execute(
@@ -1229,7 +1277,7 @@ class AdmissionService:
                                     )
                                 available[binding].read(self.object_store)
                         else:
-                            self._probe_library_wheels(set(wheel.requirements), root, catalog)
+                            self._probe_library_wheels(set(wheel.requirements), catalog)
                     self.object_store.put(artifact_object_key(candidate.declared_digest), data)
                     for variant, binding in candidate.install_locks.items():
                         stored = self.object_store.open(
@@ -1295,6 +1343,7 @@ class AdmissionService:
                         ),
                     )
                 ),
+                promoting=True,
             )
         return True
 
@@ -1439,6 +1488,8 @@ class AdmissionService:
 
     def _finish_rescan(self, claim: CandidateClaim, *, review: bool) -> None:
         with self.database.session() as session, session.begin():
+            if not self.database.is_postgresql:
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             candidate = self._leased_candidate(session, claim)
             if candidate.release_id is None:
                 raise AdmissionError("rescan candidate has no release")
@@ -1497,9 +1548,8 @@ class AdmissionService:
     def _probe_library_wheels(
         self,
         requirements: set[str],
-        directory: Path,
         dependencies: list[DependencyRelease] | None = None,
-    ) -> tuple[tuple[Path, ...], set[str]]:
+    ) -> tuple[tuple[tuple[str, bytes], ...], set[str]]:
         with self.database.session() as session:
             catalog = dependency_releases(session) if dependencies is None else dependencies
             libraries = {canonicalize_name(release.name) for release in catalog}
@@ -1575,195 +1625,67 @@ class AdmissionService:
                 {},
                 frozenset(),
             )
-            paths = []
+            wheels = []
             for library_name, release in sorted(selected.items()):
                 wheel, data = read(release, library_name)
-                path = directory / wheel.filename
-                path.write_bytes(data)
-                paths.append(path)
-            return tuple(paths), {release.binding for release in selected.values()}
+                wheels.append((wheel.filename, data))
+            return tuple(wheels), {release.binding for release in selected.values()}
 
-    def _probe_locked(
-        self, root: Path, claim: CandidateClaim, wheels: tuple[Path, ...], requirements: set[str]
-    ) -> StageResult:
-        locks: dict[str, PackLock] = {}
-        for variant, binding in claim.install_locks.items():
-            if binding["artifactDigest"] != claim.declared_digest:
-                raise ValueError(f"{variant}: lock artifact digest differs from archive")
-            data = self.object_store.read(
-                quarantine_lock_key(claim.id, variant), max_size=MAX_LOCK_SIZE
-            )
-            if len(data) != binding["size"] or artifact_digest(data) != binding["digest"]:
-                raise ValueError(f"{variant}: submitted dependency lock bytes changed")
-            lock = PackLock.from_json(data)
-            if lock.pack != claim.pack_name or lock.variant != variant:
-                raise ValueError(f"{variant}: dependency lock pack or variant differs")
-            locks[variant] = lock
-        catalog, variant = scan_catalog(
-            claim.scan_engine, claim.install_locks, mirror=self.settings.probe_runtime_mirror
-        )
-        manifest = load_manifest(root / "dinkster-pack.toml")
-        if manifest.compatibility is not None:
-            manifest.compatibility.require_engine(manifest.name, catalog.channel.engine_version)
-        lock = locks[variant]
-        if missing := {normalize_requirement(value) for value in requirements} - set(
-            lock.requirements
-        ):
-            raise ValueError(f"{variant}: dependency lock omits requirements {sorted(missing)}")
-        for wheel in wheels:
-            sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
-            if not any(
-                item.filename == wheel.name and item.sha256 == sha
-                for package in lock.packages
-                for item in package.wheels
-            ):
-                raise ValueError(
-                    f"{variant}: dependency lock differs from verified library {wheel.name}"
-                )
-        store = self.settings.object_store_root / ".probe-runtime"
-        store.mkdir(parents=True, exist_ok=True)
-        with writer_lock(store):
-            for wheel in wheels:
-                sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
-                fetch_artifact(
-                    (str(wheel.parent),),
-                    wheel.name,
-                    object_path(store / "wheels", "sha256:" + sha, label=readable_label(wheel.stem))
-                    / wheel.name,
-                    sha,
-                    wheel.stat().st_size,
-                )
-            constraints = acquire(catalog, variant, store)
-            with tempfile.TemporaryDirectory(prefix=".probe-", dir=store) as directory:
-                scratch = Path(directory)
-                python = prepare_engine_interpreter(
-                    scratch / "engine",
-                    store=store,
-                    base=catalog.channel.base_for(variant),
-                    constraints=constraints,
-                )
-                return run_locked_probe(
-                    root,
-                    lock,
-                    generation_python=python,
-                    packs=scratch / "packs",
-                    wheel_store=store / "wheels",
-                    uv_cache=store / "uv-cache",
-                    variant=variant,
-                    settings=self.settings,
-                    require_isolation=self.require_isolation,
-                    source_roots=(root,),
-                )
-
-    def _probe_with_dependencies(self, root: Path, claim: CandidateClaim) -> StageResult:
+    def _resolve_probe_dependencies(
+        self, root: Path, set_id: UUID | None = None
+    ) -> ProbeDependencies:
         manifest_path = root / "dinkster-pack.toml"
-        original = manifest_path.read_bytes()
         manifest = load_manifest(manifest_path)
         pending = list(manifest.dependencies)
         selected: dict[str, str] = {}
         bindings: set[str] = set()
         requirements = set(manifest.requires_for("cpu"))
+        helpers = []
+        with self.database.session() as session:
+            catalog = dependency_releases(session, set_id)
+            while pending:
+                dependency = pending.pop(0)
+                if dependency.pack in selected:
+                    if not dependency.accepts(selected[dependency.pack]):
+                        raise ValueError(f"Conflicting helper dependency {dependency.pack!r}.")
+                    continue
+                release = max(
+                    (
+                        item
+                        for item in catalog
+                        if item.name == dependency.pack
+                        and item.available
+                        and dependency.accepts(item.version)
+                    ),
+                    key=lambda item: Version(item.version),
+                    default=None,
+                )
+                if release is None:
+                    raise ValueError(f"No active helper dependency {dependency.pack!r}.")
+                selected[dependency.pack] = release.version
+                bindings.add(release.binding)
+                wheel, data = release.read(self.object_store)
+                if wheel.library:
+                    raise ValueError("Pack dependencies must name packs, not libraries.")
+                with extracted_wheel(data, wheel) as dependency_root:
+                    helper = load_manifest(dependency_root / "dinkster-pack.toml")
+                    pending.extend(helper.dependencies)
+                    requirements.update(helper.requires_for("cpu"))
+                helpers.append(data)
+        wheels, library_bindings = self._probe_library_wheels(requirements, catalog)
+        return ProbeDependencies(
+            tuple(helpers),
+            wheels,
+            tuple(sorted(requirements)),
+            tuple(sorted(bindings | library_bindings)),
+        )
+
+    def probe_dependencies(
+        self, root: Path, set_id: UUID | None = None
+    ) -> ProbeDependencies | StageResult:
         try:
-            with self.database.session() as session:
-                catalog = dependency_releases(session, claim.set_id)
-                while pending:
-                    dependency = pending.pop(0)
-                    if dependency.pack in selected:
-                        if not dependency.accepts(selected[dependency.pack]):
-                            raise ValueError(f"Conflicting helper dependency {dependency.pack!r}.")
-                        continue
-                    release = max(
-                        (
-                            item
-                            for item in catalog
-                            if item.name == dependency.pack
-                            and item.available
-                            and dependency.accepts(item.version)
-                        ),
-                        key=lambda item: Version(item.version),
-                        default=None,
-                    )
-                    if release is None:
-                        raise ValueError(f"No active helper dependency {dependency.pack!r}.")
-                    selected[dependency.pack] = release.version
-                    bindings.add(release.binding)
-                    wheel, data = release.read(self.object_store)
-                    if wheel.library:
-                        raise ValueError("Pack dependencies must name packs, not libraries.")
-                    with extracted_wheel(data, wheel) as dependency_root:
-                        helper = load_manifest(dependency_root / "dinkster-pack.toml")
-                        pending.extend(helper.dependencies)
-                        requirements.update(helper.requires_for("cpu"))
-                    # Stage only the installed wheel layout, not the dependency's
-                    # relocated probe assets. The submitted pack keeps its root assets.
-                    with zipfile.ZipFile(io.BytesIO(data)) as archive:
-                        for member in archive.infolist():
-                            if member.is_dir():
-                                continue
-                            destination = root / member.filename
-                            if destination.exists():
-                                raise ValueError("Helper wheel overlaps the submitted pack.")
-                            destination.parent.mkdir(parents=True, exist_ok=True)
-                            destination.write_bytes(archive.read(member))
-            if selected:
-                # Only the disposable probe view receives the combined CPU
-                # requirements. Published metadata and the wheel remain unchanged.
-                document = tomllib.loads(original.decode())
-                document["pack"]["requires"] = sorted(requirements)
-                document["pack"].pop("extra-requires", None)
-                manifest_path.write_text(tomli_w.dumps(document))
-            with tempfile.TemporaryDirectory(prefix="registry-library-wheels-") as directory:
-                wheels, library_bindings = self._probe_library_wheels(
-                    requirements, Path(directory), catalog
-                )
-                bindings.update(library_bindings)
-                if claim.install_locks:
-                    probe = self._probe_locked(root, claim, wheels, requirements)
-                elif claim.scan_engine is not None:
-                    try:
-                        api_wheel, engine_version = stage_scan_api(
-                            claim.scan_engine,
-                            Path(directory),
-                            development_release=self.settings.probe_engine_release,
-                        )
-                        if manifest.compatibility is None:
-                            raise ValueError("selected engine requires pack compatibility")
-                        manifest.compatibility.require_engine(manifest.name, engine_version)
-                    except (ValueError, OSError) as exc:
-                        return StageResult(
-                            (
-                                AdmissionFinding(
-                                    "probe.engine-unavailable", "error", "block", str(exc)
-                                ),
-                            )
-                        )
-                    probe = run_executable_probe(
-                        root,
-                        settings=self.settings,
-                        require_isolation=self.require_isolation,
-                        dependency_wheels=wheels,
-                        api_wheel=api_wheel,
-                    )
-                elif wheels:
-                    probe = run_executable_probe(
-                        root,
-                        settings=self.settings,
-                        require_isolation=self.require_isolation,
-                        dependency_wheels=wheels,
-                    )
-                else:
-                    probe = run_executable_probe(
-                        root, settings=self.settings, require_isolation=self.require_isolation
-                    )
-                return StageResult(
-                    findings=probe.findings,
-                    data=probe.data,
-                    operator_details={
-                        **(probe.operator_details or {}),
-                        "dependencyBindings": sorted(bindings),
-                    },
-                )
-        except (ValueError, ObjectStoreError, OSError, ProvisionError) as exc:
+            return self._resolve_probe_dependencies(root, set_id)
+        except (ValueError, ObjectStoreError, FileNotFoundError) as exc:
             return StageResult(
                 (
                     AdmissionFinding(
@@ -1771,10 +1693,60 @@ class AdmissionService:
                     ),
                 )
             )
-        finally:
-            manifest_path.write_bytes(original)
 
-    def _process(self, claim: CandidateClaim) -> None:
+    def probe_install_locks(self, claim: CandidateClaim) -> dict[str, bytes]:
+        locks = {}
+        for variant, binding in claim.install_locks.items():
+            data = self.object_store.read(
+                quarantine_lock_key(claim.id, variant), max_size=MAX_LOCK_SIZE
+            )
+            if len(data) != binding["size"] or artifact_digest(data) != binding["digest"]:
+                raise ValueError(f"{variant}: submitted dependency lock bytes changed")
+            locks[variant] = data
+        return locks
+
+    def _probe_with_dependencies(self, root: Path, claim: CandidateClaim) -> StageResult:
+        dependencies = self.probe_dependencies(root, claim.set_id)
+        if isinstance(dependencies, StageResult):
+            return dependencies
+        try:
+            locks = self.probe_install_locks(claim)
+        except (ValueError, ObjectStoreError, OSError) as exc:
+            return StageResult(
+                (
+                    AdmissionFinding(
+                        "probe.pack-dependencies-unavailable", "error", "block", str(exc)
+                    ),
+                )
+            )
+        probe = run_prepared_probe(
+            root,
+            dependencies,
+            settings=self.settings.probe_settings(),
+            require_isolation=self.require_isolation,
+            scan_engine=claim.scan_engine,
+            development_release=self.settings.probe_engine_release,
+            install_locks=claim.install_locks,
+            lock_bytes=locks,
+            artifact_digest=claim.declared_digest,
+            runtime_store=self.settings.object_store_root / ".probe-runtime",
+            development_runtime=self.settings.probe_runtime_mirror,
+        )
+        return replace(
+            probe,
+            operator_details={
+                **(probe.operator_details or {}),
+                "dependencyBindings": list(dependencies.bindings),
+            },
+        )
+
+    def _process(
+        self,
+        claim: CandidateClaim,
+        *,
+        remote: bool = False,
+        probe_result: StageResult | None = None,
+    ) -> None:
         try:
             data = self.object_store.read(claim.object_key, max_size=MAX_ARTIFACT_SIZE)
         except (FileNotFoundError, ObjectStoreError) as exc:
@@ -1896,16 +1868,16 @@ class AdmissionService:
             if claim.kind == "upload" and wheel.library:
                 self._record_stage(claim, "executable_probe", StageResult(data={"schemas": []}))
             if claim.kind == "upload" and not wheel.library:
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(self._probe_with_dependencies, root, claim)
-                    while not wait((future,), timeout=self.lease_seconds / 3).done:
-                        with self.database.session() as session, session.begin():
-                            candidate = self._leased_candidate(session, claim)
-                            candidate.lease_expires_at = datetime.now(UTC) + timedelta(
-                                seconds=self.lease_seconds
-                            )
-                    probe = future.result()
-                if not self._record_stage(claim, "executable_probe", probe):
+                if remote:
+                    assert probe_result is not None
+                    probe = probe_result
+                else:
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(self._probe_with_dependencies, root, claim)
+                        while not wait((future,), timeout=self.lease_seconds / 3).done:
+                            self.leased_claim(claim.id, claim.lease_token, renew=True)
+                        probe = future.result()
+                if not self._record_stage(claim, "executable_probe", probe, remote=remote):
                     return
                 review |= probe.review
             security = run_wheel_security(data)
@@ -1945,7 +1917,7 @@ class AdmissionService:
                 ),
             )
 
-    def run_once(self, *, deliver_indexes: bool = True) -> bool:
+    def deliver_once(self, *, deliver_indexes: bool = True) -> bool:
         if settle_one_set(self) or clean_one_set(self):
             return True
         if SecurityPublication(
@@ -1958,6 +1930,48 @@ class AdmissionService:
         if self.deliver_one_promotion():
             return True
         if self.deliver_one_set_promotion():
+            return True
+        return self.indexes.deliver_one() if deliver_indexes else False
+
+    def run_delivery(self, *, poll_seconds: float = 1.0) -> None:
+        if poll_seconds <= 0:
+            raise ValueError("poll_seconds must be positive")
+        lifecycle = None
+        if self.settings.scanner_fly_app is not None:
+            assert self.settings.scanner_fly_token is not None
+            lifecycle = ScannerLifecycle(
+                self.database,
+                ScannerMachines(self.settings.scanner_fly_app, self.settings.scanner_fly_token),
+                self.settings.scanner_machine_ids,
+                self.settings.scanner_machine_limit,
+            )
+        stopped = threading.Event()
+
+        def reconcile() -> None:
+            while not stopped.is_set():
+                try:
+                    if lifecycle is not None:
+                        lifecycle.reconcile()
+                except MachineUnavailable:
+                    logging.getLogger(__name__).warning(
+                        "Scanner lifecycle unavailable; queue retained"
+                    )
+                stopped.wait(max(5, poll_seconds))
+
+        # Provider startup latency must not stall promotion or index delivery.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            background = executor.submit(reconcile)
+            try:
+                while True:
+                    if background.done():
+                        background.result()
+                    if not self.deliver_once():
+                        stopped.wait(poll_seconds)
+            finally:
+                stopped.set()
+
+    def run_once(self, *, deliver_indexes: bool = True) -> bool:
+        if self.deliver_once(deliver_indexes=False):
             return True
         claim = self.claim()
         if claim is None:

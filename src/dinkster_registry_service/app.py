@@ -38,6 +38,7 @@ from .pack_locks import MAX_LOCKS_SIZE, PackLocksError, lock_object_key
 from .principals import PrincipalRepository
 from .release_sets import MAX_SET_BODY, ReleaseSetError, SetUpload, member_limit, submit_set
 from .repository import CatalogDataError, CatalogRepository
+from .scan_control import ScannerError, scanner_router
 from .scan_engine import ScanEngineError
 from .security_repository import (
     NoticeChange,
@@ -330,6 +331,7 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     app.state.database = database
     app.state.object_store = object_store
     app.include_router(account_router(database, configured))
+    app.include_router(scanner_router(admission, configured.scanner_token_sha256))
     identity = management_identity(configured)
 
     async def security_actor(request: Request) -> tuple[str, TokenRecord | None]:
@@ -392,6 +394,22 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     @app.exception_handler(ProtocolError)
     async def protocol_error_handler(request: Request, error: ProtocolError) -> Response:
         return _error_response(request, error)
+
+    @app.exception_handler(ScannerError)
+    async def scanner_error_handler(request: Request, error: ScannerError) -> Response:
+        code: ErrorCode = (
+            "unauthenticated"
+            if error.status_code == 401
+            else "scan_unavailable"
+            if error.status_code in {409, 503}
+            else "invalid_request"
+        )
+        return _error_response(
+            request,
+            ProtocolError(
+                error.status_code, code, str(error.detail), retryable=error.status_code == 503
+            ),
+        )
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request: Request, error: RequestValidationError) -> Response:

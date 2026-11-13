@@ -2,9 +2,15 @@
 
 The production app is `dinkster-registry` in the `dinkster` organization, primary
 region `sjc`, at `https://registry.dinkster.org`. `fly.toml` declares two
-always-running shared-cpu-1x, 512 MB Machines and no mounts. Each runs the
-nonroot API and lease-based scanner. PostgreSQL holds metadata and durable
-outbox/leases; R2 holds quarantine, immutable artifacts and static JSON indexes.
+always-running performance 1 CPU, 2 GB web Machines and no mounts. Each runs
+the nonroot API and outbox delivery, never an installer or submitted pack code.
+The separate `dinkster-registry-scanner` app contains one performance 1 CPU,
+2 GB Machine, stopped when idle, with at most one scanner running. These are
+[the approved production settings](https://github.com/Kosinkadink/comfy-vibe-station/issues/866#issuecomment-6842089411);
+changing scanner capacity or web size requires a separate operator decision.
+PostgreSQL holds metadata and durable outbox/leases; R2 holds quarantine,
+immutable artifacts and static JSON indexes. Only the web control plane holds
+credentials for those stores and promotes releases.
 No user data depends on a Machine filesystem. Temporary extracted submissions
 and dependency directories are disposable and removed after each scan.
 The executable probe resolves the manifest's CPU requirements using uv's CPU
@@ -120,26 +126,106 @@ a fake prior release. Check inventory before retrying any failed operation.
 
 ## Scanner isolation and process lifetime
 
-The image runs uid10001, not root. Fly starts `bash scripts/start-service.sh`.
-It detects the upstream full bubblewrap user/PID namespace jail before starting
-the API and scanner; a degraded or unavailable jail fails startup. Both children
-are supervised: either exiting terminates its sibling and fails the Machine.
-Fly sets `HTTP_HOST=0.0.0.0` for IPv4 proxy and health-check reachability on
-port8000; `/healthz` performs an uncached database `SELECT 1`.
-There is no fixture seeding or migration in runtime startup.
+The image runs uid10001, not root. On web Machines Fly starts
+`bash scripts/start-service.sh`, which supervises `dinkster-registry serve`
+and `dinkster-registry deliver`. Either child exiting terminates its sibling
+and fails the web Machine. Neither child runs submitted code or requires a
+probe jail. Fly sets `HTTP_HOST=0.0.0.0` for IPv4 proxy and health-check
+reachability on port8000; `/healthz` performs an uncached database `SELECT 1`.
+There is no fixture seeding or migration in runtime startup. A healthy web API
+alone does not prove that scanners are configured or can execute work.
+
+Before deploying this split, provision the separate scanner app and one
+registered Machine from the reviewed immutable image. Set its `init.exec` to
+`["dinkster-scanner"]`, `restart.policy` to `no`, no services, no auto-destroy
+and no mounts. Create it stopped; do not start a second Machine as a spare.
+The main-push web deployment workflow does not provision or update this pool.
+Record the worker image digest and source revision independently of the web
+image. Subsequent worker image changes require their own reviewed deployment;
+a web deploy does not silently update the scanner.
+
+The scanner receives only secret `DINKSTER_SCANNER_TOKEN`, nonsecret HTTPS
+`DINKSTER_SCANNER_ORIGIN=https://registry.dinkster.org` and optional
+`DINKSTER_SCANNER_RUNTIME_STORE`. It authenticates only to bounded leased
+claim/input/dependencies/locks/heartbeat/result endpoints. It has no database,
+object-store, cursor, signing, publisher or Fly management credential, and
+cannot write public indexes. It requires the full bubblewrap user/PID namespace
+jail before claiming work; unavailable isolation or ambient control-plane
+credentials fail worker startup. Never bypass that check to drain a queue.
+
+Stage these additional web settings without manually deploying the web app:
+
+| Name | Purpose and lifetime |
+| --- | --- |
+| `DINKSTER_SCANNER_TOKEN_SHA256` | Worker capability's SHA256 verifier; rotate with the worker capability, no automatic protocol expiry |
+| `DINKSTER_SCANNER_FLY_TOKEN` | Management credential scoped only to the scanner app, with a 90 day lifetime |
+| `DINKSTER_SCANNER_FLY_APP` | `dinkster-registry-scanner` |
+| `DINKSTER_SCANNER_MACHINE_IDS` | Exact ID of the single registered stopped Machine |
+| `DINKSTER_SCANNER_MACHINE_LIMIT` | `1` |
+
+Keep the plaintext worker capability off web and the Fly credential off the
+scanner. The provisioned credential named `registry-scanner-lifecycle-821`
+expires February 11, 2027 UTC (February 10 Pacific); renew before expiry and
+record the new expiry without printing values. Resource/secret names and
+initial state are recorded in the
+[provisioning receipt](https://github.com/Kosinkadink/comfy-vibe-station/issues/821#issuecomment-6842395452).
+The worker capability has no automatic expiry and must be revoked or rotated
+by the operator. Preserve all existing DB/S3/cursor secrets. Verify names,
+state, exact image, resource size and limit before landing; do not print raw
+configuration, credential values, process arguments or environment dumps.
+
+Outbox delivery reconciles pending or expired assignments against the fixed
+pool and records durable start reservations before asking Fly to start the
+registered Machine. It cannot provision, update, stop or execute commands on
+Machines. Worker PID1 drains eligible work, then exits on an empty queue;
+restart=no leaves the Machine stopped. A later arrival restarts it through
+reconciliation. Concurrent web replicas share reservations; running
+unregistered Machines occupy capacity rather than allowing another start.
+
+A crash, interrupted transport or failed start leaves the candidate eligible
+after its lease or start reservation expires. A lost assignment gets a new
+fence and stale results cannot promote a release. Infrastructure loss does
+not spend the completed probe-timeout retry budget. Actual install/probe
+timeouts retain their existing finite retry policy. The web control plane
+alone applies verdicts, promotes and delivers public indexes. If the scanner
+fails, preserve bounded diagnostics and restore its approved configuration;
+do not move execution back onto web or resubmit publication to evade recovery.
 
 Local Docker's seccomp/AppArmor can deny namespaces even when Fly's guest
 kernel supports them. The CI isolation probe uses a disposable privileged test
 container, still uid10001, with no network. This is test permission, not a
 production privilege exception. No production root/privileged fallback is
-configured. If nonroot Fly isolation fails, preserve the diagnostic and stop;
-do not expose a healthy API with a nonfunctional scanner or bypass the jail.
-Any necessary Fly exception requires a measured reason recorded on issue586.
+configured. Any necessary Fly exception requires a measured reason and
+explicit authorization. Web-image rollback does not roll back staged secrets,
+the scanner image or its configuration. Before removing scanner credentials
+or destroying the pool, restore a reviewed compatible web topology through
+the ordinary main deployment gate; do not strand the split web service with
+no executor. Check actual state before retrying any failed operator action.
 
-## Acceptance evidence
+## Scanner split acceptance
 
-Record the exact landed commit, CI/deploy run URL and immutable image digest on
-issue586, and link the successful landed-commit deploy run from README. Local
+For the scanner split, record the landed commit, automatic CI/deploy run,
+immutable web and worker images, and name/state-only readbacks of the two web
+Machines and the single scanner on
+[issue821](https://github.com/Kosinkadink/comfy-vibe-station/issues/821).
+Web remains performance 1 CPU, 2 GB with two replicas; the scanner starts for
+queued work and stops when idle. A staged credential name is not proof that a
+worker consumed it: confirm activation and the natural scan after deployment.
+
+Wait for a later natural official publication. Link its original run and
+public pack/version/digest, plus scanner Machine start/stop records that
+identify the executor. A prior accepted publication, a health200 or local
+simulation is not criterion8 evidence. Do not create a fixture submission,
+resubmit an official publication, read private database/object-store data or
+manually deploy web to manufacture that receipt. Preserve the explicit
+operator authorization boundary when collecting evidence.
+
+## Initial service acceptance evidence
+
+The following checks describe the initial service acceptance on issue586,
+not permission to repeat its publication or rollback exercise for the scanner
+split. Record the exact landed commit, CI/deploy run URL and immutable image
+digest on issue586, and link the successful landed-commit deploy run from README. Local
 simulator tests are not live deployment/rollback evidence. After the actual
 two-replica deployment, run these read-only checks from an authenticated shell:
 
@@ -152,8 +238,8 @@ flyctl volumes list --app dinkster-registry --json
 flyctl certs show registry.dinkster.org --app dinkster-registry
 ```
 
-Require a Fly CNAME, valid TLS, health200, exactly two started Machines in sjc,
-512 MB shared CPUs and no volumes. Publish through the normal authenticated
+Require a Fly CNAME, valid TLS, health200, exactly two started web Machines in
+sjc at the currently approved performance 1 CPU, 2 GB size and no volumes. Publish through the normal authenticated
 API and wait for scanner acceptance; verify the same pack/version/BLAKE3 in
 both static indexes and conditional304 on both, without exposing the token.
 Run `uv run python conformance/run.py https://registry.dinkster.org --release-lock

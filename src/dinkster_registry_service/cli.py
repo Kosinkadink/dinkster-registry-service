@@ -69,6 +69,12 @@ def _parser() -> argparse.ArgumentParser:
     scanner_parser.add_argument("--database-url")
     scanner_parser.add_argument("--object-store-root")
 
+    delivery_parser = subparsers.add_parser("deliver", help="deliver web outboxes without scanning")
+    delivery_parser.add_argument("--once", action="store_true")
+    delivery_parser.add_argument("--poll-seconds", type=float, default=1.0)
+    delivery_parser.add_argument("--database-url")
+    delivery_parser.add_argument("--object-store-root")
+
     rescan_parser = subparsers.add_parser(
         "rescan", help="queue static and security checks for an active release"
     )
@@ -281,6 +287,11 @@ def main() -> None:
             )
         elif args.command == "rescan":
             print(service.schedule_rescan(args.pack, args.version, submitted_by=args.submitted_by))
+        elif args.command == "deliver":
+            if args.once:
+                service.deliver_once()
+            else:
+                service.run_delivery(poll_seconds=args.poll_seconds)
         elif args.once:
             service.run_once()
         else:

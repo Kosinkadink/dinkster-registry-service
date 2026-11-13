@@ -102,6 +102,12 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: false
+          python-version: "3.12"
+      - name: Sync public dependencies for the split scanner check
+        run: env -u GH_TOKEN -u GITHUB_TOKEN uv sync --frozen
       - name: Build container
         run: DOCKER_BUILDKIT=1 docker build --network host --tag dinkster-registry:test .
       - name: Inspect container contents
@@ -155,6 +161,8 @@ jobs:
           PY
       - name: Run isolated executable probe
         run: docker run --rm --network none --privileged dinkster-registry:test python scripts/check-isolated-probe.py
+      - name: Run HTTPS split scanner with assignment-only authority
+        run: uv run python scripts/check-split-scanner.py dinkster-registry:test
       - name: Run container conformance suite
         run: |
           bash scripts/with-test-postgres.sh bash -e <<'SH'

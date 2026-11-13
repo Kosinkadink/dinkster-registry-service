@@ -10,25 +10,34 @@ import subprocess
 import threading
 import urllib.request
 import zipfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from uuid import UUID
 
 import pytest
+from dinkster_registry.archive_admission import StageResult
 from fastapi.testclient import TestClient
 from runtime_fixture import RuntimeFixture
 from sqlalchemy import select
 
-from dinkster_registry_service.admission import AdmissionService
+import dinkster_registry_service.scan_control as scan_control
+from dinkster_registry_service.admission import AdmissionService, quarantine_object_key
 from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
-from dinkster_registry_service.database import Database, NamespaceGrantRecord, ReleaseRecord
-from dinkster_registry_service.digests import artifact_digest
+from dinkster_registry_service.database import (
+    Database,
+    NamespaceGrantRecord,
+    ReleaseCandidateRecord,
+    ReleaseRecord,
+)
+from dinkster_registry_service.digests import artifact_digest, artifact_object_key
 from dinkster_registry_service.indexes import StaticIndexes
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore
 from dinkster_registry_service.principals import PrincipalRepository
-from dinkster_registry_service.seed import FIXTURE_ROOT
+from dinkster_registry_service.scan_execution import ProbeDependencies
+from dinkster_registry_service.seed import FIXTURE_ROOT, seed_fixtures
 from dinkster_registry_service.settings import ServerSettings
 from dinkster_registry_service.wheels import WheelError, extracted_wheel, inspect_wheel
 
@@ -94,6 +103,134 @@ def test_library_is_identified_by_absence_of_manifest() -> None:
     assert wheel.library
     assert wheel.manifest_path is None
     assert wheel.imports == ("demo_nodes",)
+
+
+def test_scanner_dependency_transfer_uses_verified_public_bytes_and_live_assignment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = "disposable-worker-test-token"
+    settings = ServerSettings(
+        database_url=f"sqlite:///{tmp_path / 'catalog.db'}",
+        object_store_root=tmp_path / "objects",
+        scanner_token_sha256=hashlib.sha256(token.encode()).hexdigest(),
+    )
+    app = create_app(settings)
+    database, store = app.state.database, app.state.object_store
+    service = AdmissionService(database, store, settings=settings, require_isolation=False)
+    principals = PrincipalRepository(database)
+    principals.register_user("operator")
+    principals.register_publisher("dinkster", "operator", datetime.now(UTC).isoformat())
+    library = wheel_bytes(name="demo-core", package="demo_core", library=True, requirements=())
+    library_id = service.submit(library, pack_name="demo-core", version="1.2.3")
+    assert service.run_once()
+    assert service.status(library_id).status == "accepted"
+    seed_fixtures(database, store)
+    helper = build_registry_fixture_archive(FIXTURE_ROOT / "example-pack")
+    helper_key = artifact_object_key(artifact_digest(helper))
+    source = tmp_path / "consumer"
+    shutil.copytree(FIXTURE_ROOT / "example-pack", source)
+    manifest = source / "dinkster-pack.toml"
+    manifest.write_text(
+        manifest.read_text()
+        .replace('name = "example-pack"', 'name = "consumer-pack"')
+        .replace("[pack]\n", '[pack]\nrequires = ["demo-core>=1,<2"]\n')
+        + '\n[pack.dependencies]\nexample-pack = ">=1,<2"\n'
+    )
+    archive = build_registry_fixture_archive(source)
+    candidate_id = service.submit(archive, pack_name="consumer-pack", version="1.2.3")
+
+    def no_scan(self: AdmissionService, claim: object) -> None:
+        raise AssertionError("Dependency delivery cannot execute a scan")
+
+    def no_probe(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Dependency delivery cannot execute a probe")
+
+    monkeypatch.setattr(AdmissionService, "process", no_scan)
+    monkeypatch.setattr("dinkster_registry_service.scan_execution.run_executable_probe", no_probe)
+    headers = {"Authorization": f"Bearer {token}"}
+    with TestClient(app) as client:
+        claimed = client.post("/internal/scanner/claim", headers=headers).json()
+        assert claimed["candidateId"] == str(candidate_id)
+        headers["X-Scanner-Lease"] = claimed["leaseToken"]
+        path = f"/internal/scanner/{candidate_id}/dependencies"
+        response = client.get(path, headers=headers)
+        assert response.status_code == 200
+        payload = response.json()
+        assert [base64.b64decode(value, validate=True) for value in payload["helperWheels"]] == [
+            helper
+        ]
+        assert payload["requirements"] == ["demo-core>=1,<2"]
+        assert payload["libraryWheels"] == [
+            {
+                "filename": "demo_core-1.2.3-py3-none-any.whl",
+                "data": base64.b64encode(library).decode(),
+            }
+        ]
+        assert response.headers["cache-control"] == "no-store"
+        with monkeypatch.context() as limited:
+            limited.setattr(scan_control, "EXPANDED_LIMIT", len(helper) + len(library) - 1)
+            assert client.get(path, headers=headers).status_code == 503
+            limited.setattr(scan_control, "EXPANDED_LIMIT", len(helper) + len(library))
+            assert client.get(path, headers=headers).status_code == 200
+        store.remove(helper_key)
+        store.put(helper_key, b"changed")
+        failure = client.get(path, headers=headers)
+        assert failure.status_code == 200
+        assert failure.json()["failure"]["findings"] == [
+            {
+                "code": "probe.pack-dependencies-unavailable",
+                "severity": "error",
+                "effect": "block",
+                "message": "Dependency artifact changed for 'example-pack'.",
+            }
+        ]
+        store.remove(helper_key)
+        store.put(helper_key, helper)
+        store.remove(quarantine_object_key(candidate_id))
+        store.put(quarantine_object_key(candidate_id), b"changed")
+        assert client.get(path, headers=headers).status_code == 422
+        store.remove(quarantine_object_key(candidate_id))
+        store.put(quarantine_object_key(candidate_id), archive)
+        with database.session() as session, session.begin():
+            release = session.scalar(
+                select(ReleaseRecord).where(
+                    ReleaseRecord.artifact_digest == artifact_digest(helper)
+                )
+            )
+            assert release is not None
+            release.state = "yanked"
+        failure = client.get(path, headers=headers)
+        assert failure.status_code == 200
+        assert (
+            failure.json()["failure"]["findings"][0]["code"]
+            == "probe.pack-dependencies-unavailable"
+        )
+        assert failure.json()["failure"]["findings"][0]["effect"] == "block"
+        assert service.status(candidate_id).status == "scanning"
+        with database.session() as session, session.begin():
+            release = session.scalar(
+                select(ReleaseRecord).where(
+                    ReleaseRecord.artifact_digest == artifact_digest(helper)
+                )
+            )
+            assert release is not None
+            release.state = "active"
+        # A fence can expire during catalog resolution, not just before the request.
+        original = AdmissionService.probe_dependencies
+
+        def expire(
+            self: AdmissionService, root: Path, set_id: UUID | None = None
+        ) -> ProbeDependencies | StageResult:
+            result = original(self, root, set_id)
+            with database.session() as session, session.begin():
+                candidate = session.get(ReleaseCandidateRecord, candidate_id)
+                assert candidate is not None
+                candidate.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+            return result
+
+        monkeypatch.setattr(AdmissionService, "probe_dependencies", expire)
+        assert client.get(path, headers=headers).status_code == 409
+        assert service.status(candidate_id).status == "scanning"
 
 
 @pytest.mark.parametrize("library", (False, True))

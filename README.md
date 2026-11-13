@@ -225,9 +225,15 @@ rebuild command after `seed` to expose fixtures through the static indexes.
 
 Two replicas share PostgreSQL metadata, fenced scanner leases and durable
 outbox events, plus R2 quarantine/artifacts/indexes. This makes local artifact
-volumes unnecessary; the image declares none. The Fly configuration keeps two
-512 MB shared-cpu-1x Machines in sjc, each with supervised nonroot API/scanner
-processes and full probe-isolation preflight. See [deploy.md](deploy.md) for
+volumes unnecessary; the image declares none. The checked-in Fly configuration
+declares two performance 1 CPU, 2 GB web Machines in sjc. Web startup supervises
+nonroot API and outbox-delivery processes, not scanner execution. The separately
+provisioned `dinkster-registry-scanner` app has one performance 1 CPU, 2 GB
+Machine, with at most one scanner running under
+[the approved production settings](https://github.com/Kosinkadink/comfy-vibe-station/issues/866#issuecomment-6842089411).
+Provision the registered worker pool and stage its separate credentials before
+deploying this startup split; the deploy workflow does not provision scanners.
+See [deploy.md](deploy.md) for
 secret prerequisites, migration/runtime credential separation, first deploy,
 health-checked rollback and the required live evidence.
 
@@ -698,6 +704,114 @@ promotion. R2 uses region `auto`. Partial configuration is rejected in every
 mode. `DINKSTER_ENV=production` requires all five settings and never falls back
 to local artifact storage. Local files remain a development/self-hosting choice.
 
+The internal scanner assignment endpoints require a separate bearer capability.
+`DINKSTER_SCANNER_TOKEN_SHA256` stores its lowercase SHA256 digest, never the
+plaintext capability. Unconfigured endpoints deny every request. Publisher
+tokens do not authenticate as scanners, and the scanner capability does not
+authorize publishing or public-index writes.
+
+- `POST /internal/scanner/claim` returns a fenced assignment and nonsecret probe
+  settings, or 204 when no candidate is eligible. `installLocks` retains the
+  submitted base, archive and lock identities and byte sizes. It does not run a scan.
+- `GET /internal/scanner/{candidate_id}/input` returns only that assignment's
+  original bounded archive, without accepting object keys or URLs.
+- `GET /internal/scanner/{candidate_id}/locks` returns the assignment's native
+  dependency locks as a variant-to-base64 map, after verifying each stored size
+  and digest. Each lock is bounded at 1 MiB and submissions contain at most 32
+  variants. Missing or changed stored bytes return retryable 503. The prepared
+  executor verifies these bytes against the claim again and uses the trusted
+  base/runtime catalog and locked probe path, without catalog or object-store
+  authority. Development runtime mirrors remain forbidden in production.
+- `GET /internal/scanner/{candidate_id}/dependencies` resolves the assignment's
+  active public helper/library wheels with the same catalog and digest checks
+  as local scanning. It returns `helperWheels` (base64 bytes), `libraryWheels`
+  (filename/data objects with base64 bytes), and sorted `requirements`. Library
+  uploads and rescans need no executable probe and return empty lists. Combined
+  wheel bytes are limited to 256 MiB before base64 encoding; an oversized set
+  returns retryable 503, not a candidate rejection. Resolution failures instead
+  return a `failure` object with the existing executable-probe stage findings,
+  preserving `probe.pack-dependencies-unavailable` blocking policy. The read
+  itself does not record that verdict or change the candidate's status.
+  Invalid assigned input returns 422. No submitted Python is run by this route.
+- `POST /internal/scanner/{candidate_id}/heartbeat` renews a live lease. Reads
+  and heartbeats require `X-Scanner-Lease` with the assignment's token; expired
+  or replaced tokens return 409 and cannot revive the old assignment.
+- `POST /internal/scanner/{candidate_id}/result` accepts a JSON object with
+  `artifactDigest` and `probe` under the same live lease. `probe` contains the
+  executable StageResult's `findings`, `data` and `operator_details`; library
+  uploads and rescans instead require null. The body is limited to 16 MiB.
+  Successful probes require complete, unique wire schemas with matching
+  identities, signatures and manifest roles. Malformed or incomplete evidence
+  returns 400 without consuming the assignment. The service atomically consumes
+  the worker token before applying the shared integrity, manifest, doctor,
+  security and promotion policy; it never executes a probe on this path.
+  Concurrent or repeated results return 409, including after a timeout requeue.
+  A failure after consumption leaves a private processing lease to expire for
+  recovery rather than granting the old worker authority again.
+
+These endpoints accept no query parameters; only result accepts a body. All return
+`Cache-Control: no-store`. They do not return database, object-store, cursor,
+signing or management credentials. Reads recheck the fence after retrieving
+bytes so an assignment expiring during resolution receives 409 instead of data.
+Input-store failures return retryable 503 without rejecting the candidate.
+These endpoints do not start/stop Machines.
+
+`dinkster-scanner` is the remote worker entry point. It reads only
+`DINKSTER_SCANNER_ORIGIN` (an HTTPS origin), `DINKSTER_SCANNER_TOKEN` (the worker
+bearer capability) and optional `DINKSTER_SCANNER_RUNTIME_STORE` (default
+`/tmp/dinkster-scan-runtime`). It does not load ServerSettings or the service's
+database, object-store, admission or web modules. The shared engine package
+imports SQLAlchemy for asset record types; the worker does not construct a
+database engine or hold a database credential. Startup refuses known web,
+storage, GitHub and Fly management credentials in its environment and requires
+full user/PID namespace probe isolation before claiming work. Local HTTP and
+runtime mirrors are available only through the explicit development Python API,
+not the production command.
+
+The worker downloads only its assigned bounded inputs, renews the live lease
+during input preparation and execution, and submits one fenced result. HTTP
+redirects and ambient proxies are disabled so neither can receive its bearer
+capability. Transport failures stop the worker without inventing a rejection;
+the lost assignment recovers after expiry. It drains eligible work and exits
+successfully on an empty queue; `--once` processes at most one assignment.
+
+`scripts/start-service.sh` supervises only the HTTP service and
+`dinkster-registry deliver`. Delivery drains promotion, security and index
+outboxes without claiming candidates or running probes. The web startup does
+not need a probe jail. The existing `dinkster-registry scanner` command retains
+the combined database-backed operator/development behavior and must not be used
+as the remote worker or the web startup. Machine lifecycle provisioning and
+restart policy are separate from these process entry points.
+
+For an explicitly provisioned separate scanner app, the delivery process can
+reconcile waiting work with a fixed Machine pool. Configure
+`DINKSTER_SCANNER_FLY_APP`, comma-separated `DINKSTER_SCANNER_MACHINE_IDS`,
+`DINKSTER_SCANNER_MACHINE_LIMIT` (default 1), and
+`DINKSTER_SCANNER_FLY_TOKEN`, plus the worker capability verifier above. The
+Fly credential belongs only on the web side and must be restricted to the
+scanner app. The worker receives no Fly management credential. These settings
+are disabled when absent; the software default is not production sizing approval.
+
+Pool Machines must run exactly `dinkster-scanner`, have restart policy `no`,
+no services and no auto-destroy setting. They stop naturally when the worker
+exits on an empty queue. Only the first configured limit of registered IDs
+can be started; extra IDs are not automatic spares. Changing that fixed subset
+requires stopping the old controllers first. The controller only lists Machines
+and starts existing pool members; it cannot provision, update, stop or execute
+commands on Machines. Running unregistered Machines also occupy capacity.
+
+Every start intent is committed before its provider request. Concurrent web
+replicas serialize reservations, and a lost response or controller crash leaves
+a 120-second reservation before retrying the same Machine. This is a retry
+grace, not a measured provider startup guarantee. Eligible queued/retrying work
+or an expired scanning lease triggers reconciliation; a live lease does not.
+Arrival during a worker's idle exit is recovered by later reconciliation after
+the Machine stops and any reservation expires. Provider failures retain the
+queue and do not change admission attempts or fabricate a verdict. Provider
+calls run separately from outbox delivery so startup latency cannot block
+publication. Provisioning and production size/concurrency approval remain
+operator responsibilities.
+
 Probe and scanner limits use integer environment variables validated at
 startup. Invalid values stop the process with an error naming the variable.
 
@@ -707,7 +821,7 @@ startup. Invalid values stop the process with an error naming the variable.
 | `DINKSTER_PROBE_DEPENDENCY_TIMEOUT_SECONDS` | 300 | 1-1800 seconds |
 | `DINKSTER_PROBE_OUTPUT_LIMIT_BYTES` | 2097152 | 4096-4194304 bytes per stream |
 | `DINKSTER_PROBE_OPERATOR_TAIL_BYTES` | 8192 | 512 bytes through the configured output limit |
-| `DINKSTER_SCANNER_MAX_ATTEMPTS` | 3 | 1-10 claims |
+| `DINKSTER_SCANNER_MAX_ATTEMPTS` | 3 | 1-10 completed timeout attempts |
 
 `DINKSTER_PROBE_PACKAGE_INDEX_URL` selects the operator-controlled package index
 (default `https://pypi.org/simple`). `DINKSTER_PROBE_DEPENDENCY_SOURCE` accepts
@@ -755,6 +869,18 @@ uv build --all-packages
 CI runs these checks against PostgreSQL 16, starts the HTTP conformance runner,
 builds the container without dependency credentials, inspects image contents,
 runs the isolated probe under bubblewrap, and runs conformance against the image.
+
+`scripts/check-split-scanner.py <image>` also runs in container CI. It starts
+a disposable HTTPS control plane with a trap against web probe execution,
+then invokes the production `dinkster-scanner` entry point in a separate
+nonroot container. Only its assignment credential, HTTPS origin and temporary
+public test certificate are supplied; the web database, object store and TLS
+private key are not mounted. It asserts accepted fixture schemas, permanent
+legacy-ZIP rejection, web-side public-index delivery and successful empty-queue
+exit. OpenSSL and Docker are required. As with the existing container jail
+checks, Docker needs privileged mode for nested namespaces; this is a local
+transport/jail check, not deployed Fly credential or Machine lifecycle proof.
+Its temporary database, keys, capability file and container are removed on exit.
 
 The container also admits the unchanged first-party wheel in `fixtures/wheels`,
 pinned by source commit, size and SHA-256 in `scripts/release-packs.lock`.
