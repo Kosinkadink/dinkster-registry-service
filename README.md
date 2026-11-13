@@ -226,10 +226,13 @@ rebuild command after `seed` to expose fixtures through the static indexes.
 Two replicas share PostgreSQL metadata, fenced scanner leases and durable
 outbox events, plus R2 quarantine/artifacts/indexes. This makes local artifact
 volumes unnecessary; the image declares none. The checked-in Fly configuration
-declares two 512 MB shared-cpu-1x web Machines in sjc. Web startup supervises
-nonroot API and outbox-delivery processes, not scanner execution. A separate
-scanner app and registered worker pool must be provisioned before deploying
-this startup split; no production size or concurrency approval is implied.
+declares two performance 1 CPU, 2 GB web Machines in sjc. Web startup supervises
+nonroot API and outbox-delivery processes, not scanner execution. The separately
+provisioned `dinkster-registry-scanner` app has one performance 1 CPU, 2 GB
+Machine, with at most one scanner running under
+[the approved production settings](https://github.com/Kosinkadink/comfy-vibe-station/issues/866#issuecomment-6842089411).
+Provision the registered worker pool and stage its separate credentials before
+deploying this startup split; the deploy workflow does not provision scanners.
 See [deploy.md](deploy.md) for
 secret prerequisites, migration/runtime credential separation, first deploy,
 health-checked rollback and the required live evidence.
