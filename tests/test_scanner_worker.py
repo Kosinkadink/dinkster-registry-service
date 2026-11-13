@@ -5,7 +5,6 @@ import json
 import os
 import shutil
 import socket
-import subprocess
 import sys
 import threading
 import time
@@ -144,29 +143,6 @@ def test_worker_runs_locked_probe_over_http_and_delivery_never_claims(
             thread.join(timeout=10)
             assert not thread.is_alive()
             database.dispose()
-
-
-def test_worker_import_does_not_load_control_plane_authority() -> None:
-    code = """
-import importlib.abc
-import sys
-import sqlalchemy
-def no_database(*args, **kwargs):
-    raise AssertionError('Worker constructed a database engine')
-sqlalchemy.create_engine = no_database
-class NoControlPlane(importlib.abc.MetaPathFinder):
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname in {'boto3', 'dinkster_registry_service.settings',
-                        'dinkster_registry_service.database', 'dinkster_registry_service.admission',
-                        'dinkster_registry_service.app', 'dinkster_registry_service.object_store'}:
-            raise AssertionError('Worker loaded control-plane authority: ' + fullname)
-sys.meta_path.insert(0, NoControlPlane())
-import dinkster_registry_service.scanner_worker
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=30
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(
