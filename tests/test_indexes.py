@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from blake3 import blake3
 from fastapi.testclient import TestClient
 from sqlalchemy import select, text
 
@@ -289,6 +290,36 @@ def test_replacements_keep_first_party_alternatives_and_complete_schema_rules(
             ],
         }
     ]
+
+
+def test_static_html_icons_preserve_download_links_and_http_caching(
+    seeded_catalog: tuple[Database, LocalFilesystemObjectStore], client: TestClient
+) -> None:
+    _, store = seeded_catalog
+    key = "static/cpu/simple/example-pack/index.html"
+    stored = b'<!doctype html>\n<html><body><a href="/wheel.whl#sha256=abc">wheel</a></body></html>'
+    store.put(key, stored)
+    response = client.get("/" + key)
+    assert response.status_code == 200
+    assert b'<a href="/wheel.whl#sha256=abc">wheel</a>' in response.content
+    assert b'<link rel="manifest" href="/manifest.webmanifest">' in response.content
+    assert b'<link rel="icon" type="image/svg+xml" href="/favicon.svg">' in response.content
+    assert int(response.headers["content-length"]) == len(response.content)
+    head = client.head("/" + key)
+    assert head.content == b""
+    assert head.headers["content-length"] == response.headers["content-length"]
+    assert head.headers["etag"] == response.headers["etag"]
+    assert (
+        client.get("/" + key, headers={"If-None-Match": response.headers["etag"]}).status_code
+        == 304
+    )
+    assert (
+        client.get(
+            "/" + key, headers={"If-None-Match": f'"{blake3(stored).hexdigest()}"'}
+        ).status_code
+        == 200
+    )
+    assert store.read(key) == stored
 
 
 def test_unlisted_static_index_is_not_served_or_rewritten(

@@ -2,6 +2,7 @@
 
 | Feature | Hardware | Date | Evidence |
 | --- | --- | --- | --- |
+| Cropped browser and phone icons on documentation and stored package indexes | X570 CPU, Chromium | 2026-11-13 | [Canonical assets and service rollout](https://github.com/Kosinkadink/comfy-vibe-station/issues/887#issuecomment-6849215705) |
 | Registry documentation browser icons and mounted documentation paths | X570 CPU, headed Chromium | 2026-11-13 | [Approved source/wheel/HTTP byte equality, inspected tab captures, full PostgreSQL suite and HTTP conformance](https://github.com/Kosinkadink/comfy-vibe-station/issues/887#issuecomment-6847126130) |
 | Node-pack registry service import | X570 | 2026-09-18 | [Import and local gate evidence](https://github.com/Kosinkadink/comfy-vibe-station/issues/76) |
 | Format 1 and 2 dependency lock admission, retained fields and malformed engine-range refusal | X570 CPU | 2026-11-10 | [Old-pin failures, new-pin HTTP regression checks and imported-code audit](https://github.com/Kosinkadink/comfy-vibe-station/issues/731#issuecomment-6772305009) |

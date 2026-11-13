@@ -30,7 +30,7 @@ from .admission import AdmissionError, AdmissionService, CandidateStatus
 from .cursors import CursorCodec, CursorError
 from .database import Database, ReleaseCandidateRecord, ReleaseSetRecord
 from .digests import DigestError, require_blake3_digest
-from .documentation import documentation_router
+from .documentation import documentation_router, icon_links
 from .identifiers import IdentifierError, require_canonical_pack_name
 from .ids import uuid7
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStoreError
@@ -512,6 +512,9 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
             body = object_store.read(f"static/{path}")
         except FileNotFoundError:
             raise _not_found("The static index has not been published.") from None
+        if path.endswith(".html"):
+            root = request.scope.get("root_path", "").rstrip("/")
+            body = body.replace(b"<html>", f"<html><head>{icon_links(root)}</head>".encode(), 1)
         etag = f'"{blake3(body).hexdigest()}"'
         headers = {"ETag": etag, "Cache-Control": PUBLIC_CACHE, **cors}
         if _etag_matches(request.headers.get("if-none-match", ""), etag):

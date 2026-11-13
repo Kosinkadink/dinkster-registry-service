@@ -8,9 +8,14 @@ live behind an object-store interface; development uses the local filesystem
 implementation.
 
 The public API documentation at `/docs` and `/redoc`, including the Swagger
-OAuth redirect page, uses the approved Dinkster D browser icon. The wheel
+OAuth redirect page, uses the approved cropped Dinkster D browser icon. The wheel
 includes its ICO, SVG and 32px PNG at `/favicon.ico`, `/favicon.svg` and
-`/favicon-32.png`; no external icon host is required.
+`/favicon-32.png`, an opaque dark 180px `/apple-touch-icon.png`, and transparent
+192px/512px PNGs linked by `/manifest.webmanifest`. All are copied unchanged
+from Dinkster-Frontend main `c21e3c0e4355fffb339884c1040533913ee8bd93`, under
+`branding/favicon/`. Stored simple-index HTML receives the same links when
+served, with response ETags and lengths calculated after adding the head;
+no republishing or external icon host is required.
 
 Operators can submit pack wheels to quarantine through the in-process CLI.
 Lease-based scanner workers validate every candidate and promote accepted bytes
