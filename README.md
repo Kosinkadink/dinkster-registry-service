@@ -7,6 +7,11 @@ hosted catalog or SQLite for a self-hosted registry. Immutable pack wheels
 live behind an object-store interface; development uses the local filesystem
 implementation.
 
+The public API documentation at `/docs` and `/redoc`, including the Swagger
+OAuth redirect page, uses the approved Dinkster D browser icon. The wheel
+includes its ICO, SVG and 32px PNG at `/favicon.ico`, `/favicon.svg` and
+`/favicon-32.png`; no external icon host is required.
+
 Operators can submit pack wheels to quarantine through the in-process CLI.
 Lease-based scanner workers validate every candidate and promote accepted bytes
 to immutable artifact storage. Bearer-authenticated HTTP routes accept publisher

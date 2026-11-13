@@ -30,6 +30,7 @@ from .admission import AdmissionError, AdmissionService, CandidateStatus
 from .cursors import CursorCodec, CursorError
 from .database import Database, ReleaseCandidateRecord, ReleaseSetRecord
 from .digests import DigestError, require_blake3_digest
+from .documentation import documentation_router
 from .identifiers import IdentifierError, require_canonical_pack_name
 from .ids import uuid7
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStoreError
@@ -327,7 +328,8 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
         yield
         database.dispose()
 
-    app = FastAPI(title="Dinkster Registry", lifespan=lifespan)
+    app = FastAPI(title="Dinkster Registry", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app.include_router(documentation_router)
     app.state.database = database
     app.state.object_store = object_store
     app.include_router(account_router(database, configured))
