@@ -5,7 +5,7 @@ import io
 import tempfile
 import tomllib
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -23,8 +23,15 @@ from dinkster_supervisor.environment_downloads import fetch_artifact
 from dinkster_supervisor.environment_generations import prepare_engine_interpreter
 from dinkster_supervisor.environment_state import writer_lock
 from dinkster_workers.manifest import load_manifest
-from dinkster_workers.pack_lock import PackLock, normalize_requirement
+from dinkster_workers.pack_lock import (
+    GenerationPackages,
+    LockedDistribution,
+    PackLock,
+    normalize_requirement,
+)
 from dinkster_workers.provision import ProvisionError
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
 from .digests import artifact_digest as digest_bytes
 from .scan_engine import stage_scan_api
@@ -105,12 +112,6 @@ def run_prepared_probe(
                         manifest.name, catalog.channel.engine_version
                     )
                 lock = locks[variant]
-                if missing := {
-                    normalize_requirement(value) for value in dependencies.requirements
-                } - set(lock.requirements):
-                    raise ValueError(
-                        f"{variant}: dependency lock omits requirements {sorted(missing)}"
-                    )
                 for wheel in wheels:
                     sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
                     if not any(
@@ -148,9 +149,38 @@ def run_prepared_probe(
                             base=catalog.channel.base_for(variant),
                             constraints=constraints,
                         )
+                        # Validate helper ranges against the locked pack and actual engine
+                        # packages, not declaration spelling. This probe-only view never
+                        # changes submitted lock bytes or published bindings.
+                        generation = GenerationPackages.inspect(python)
+                        requirements = tuple(
+                            dict.fromkeys(
+                                (
+                                    *lock.requirements,
+                                    *map(normalize_requirement, dependencies.requirements),
+                                )
+                            )
+                        )
+                        inherited = {
+                            canonicalize_name(Requirement(value).name) for value in requirements
+                        } - {package.name for package in lock.packages}
+                        if lock.engine is not None:
+                            inherited.discard("dinkster-api")
+                        probe_lock = replace(
+                            lock,
+                            requirements=requirements,
+                            packages=(
+                                *lock.packages,
+                                *(
+                                    LockedDistribution(name, generation.versions[name], ())
+                                    for name in sorted(inherited)
+                                    if name in generation.versions
+                                ),
+                            ),
+                        )
                         return run_locked_probe(
                             root,
-                            lock,
+                            probe_lock,
                             generation_python=python,
                             packs=scratch / "packs",
                             wheel_store=runtime_store / "wheels",
