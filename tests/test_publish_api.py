@@ -345,6 +345,95 @@ def test_locked_publication_recovers_rejected_dependency_without_reset(
         assert event is not None and event.data["supersedesCandidateId"] == old_id
 
 
+@pytest.mark.parametrize("selected_version", ["1.0", "0.5", None, "base", "base-conflict"])
+def test_locked_helper_requirements_use_selected_versions(
+    tmp_path: Path, runtime: RuntimeFixture, selected_version: str | None
+) -> None:
+    client, app, token = _client(tmp_path)
+    headers = {"Authorization": f"Bearer {token}"}
+    admission = AdmissionService(
+        app.state.database,
+        LocalFilesystemObjectStore(tmp_path / "objects"),
+        require_isolation=False,
+        settings=runtime.settings(tmp_path),
+    )
+    from_base = selected_version in {"base", "base-conflict"}
+    requirement = "packaging>=1" if from_base else "fixture>=1"
+    _archive(tmp_path, "helper-pack")
+    helper_manifest = tmp_path / "helper-pack" / "dinkster-pack.toml"
+    helper_manifest.write_text(
+        helper_manifest.read_text()
+        + f'\n[pack.extra-requires]\ncpu = ["{requirement}", "dinkster-api>=0"]\n'
+    )
+    helper = build_registry_fixture_archive(helper_manifest.parent)
+    helper_locks = json.loads(json.dumps(_locks(helper, runtime)))
+    for binding in helper_locks.values():
+        binding["lock"].update(
+            pack="helper-pack",
+            requirements=[requirement, "dinkster-api>=0"],
+            engine=f"=={runtime.engine_version}",
+            packages=[]
+            if from_base
+            else [
+                {
+                    "name": "fixture",
+                    "version": "1.0",
+                    "wheels": [runtime.wheel_record("fixture", "1.0")],
+                }
+            ],
+        )
+    submitted = client.post(
+        "/v1/publish/helper-pack/versions/1.2.3",
+        headers=headers,
+        files={"archive": ("helper.whl", helper, "application/zip")},
+        data={"locks": json.dumps(helper_locks)},
+    )
+    assert submitted.status_code == 202, submitted.text
+    assert admission.run_once()
+    helper_status = admission.status(UUID(submitted.json()["candidateId"]))
+    assert helper_status.status == "accepted", helper_status
+
+    _archive(tmp_path, "locked-pack")
+    manifest = tmp_path / "locked-pack" / "dinkster-pack.toml"
+    manifest.write_text(manifest.read_text() + '\n[pack.dependencies]\nhelper-pack = ">=1,<2"\n')
+    archive = build_registry_fixture_archive(manifest.parent)
+    locks = json.loads(json.dumps(_locks(archive, runtime)))
+    for binding in locks.values():
+        binding["lock"]["engine"] = f"=={runtime.engine_version}"
+        binding["lock"]["requirements"] = [] if from_base else ["fixture>=0.1"]
+        if selected_version is not None and selected_version != "base":
+            name = "packaging" if from_base else "fixture"
+            locked_version = "0.5" if from_base else selected_version
+            binding["lock"]["packages"] = [
+                {
+                    "name": name,
+                    "version": locked_version,
+                    "wheels": [runtime.wheel_record(name, locked_version)],
+                }
+            ]
+    submitted = client.post(
+        "/v1/publish/locked-pack/versions/1.2.3",
+        headers=headers,
+        files={"archive": ("consumer.whl", archive, "application/zip")},
+        data={"locks": json.dumps(locks)},
+    )
+    assert submitted.status_code == 202, submitted.text
+    assert admission.run_once()
+    status = admission.status(UUID(submitted.json()["candidateId"]))
+    endpoint = "/v1/packs/locked-pack/versions/1.2.3"
+    if selected_version not in {"1.0", "base"}:
+        assert status.status == "rejected"
+        assert client.get(endpoint).status_code == 404
+        assert any(requirement in finding.message for finding in status.findings)
+        return
+    assert status.status == "accepted", status
+    for variant, binding in locks.items():
+        response = client.get(endpoint + f"/locks/{variant}", params={"baseId": binding["baseId"]})
+        assert response.status_code == 200
+        expected = json.dumps(binding["lock"], sort_keys=True, separators=(",", ":")).encode()
+        assert response.content == expected
+
+
 def test_published_locks_bind_archive_base_and_visibility(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runtime: RuntimeFixture
 ) -> None:

@@ -2,6 +2,7 @@
 
 | Feature | Hardware | Date | Evidence |
 | --- | --- | --- | --- |
+| Helper requirements validate selected pack and engine-base versions without changing published locks | X570 CPU | 2026-11-14 | [Public admission activation/refusal controls, immutable lock downloads and six retained-lock planner checks](https://github.com/Kosinkadink/comfy-vibe-station/issues/697#issuecomment-6871259515) |
 | Cropped browser and phone icons on documentation and stored package indexes | X570 CPU, Chromium | 2026-11-13 | [Canonical assets and service rollout](https://github.com/Kosinkadink/comfy-vibe-station/issues/887#issuecomment-6849215705) |
 | Registry documentation browser icons and mounted documentation paths | X570 CPU, headed Chromium | 2026-11-13 | [Approved source/wheel/HTTP byte equality, inspected tab captures, full PostgreSQL suite and HTTP conformance](https://github.com/Kosinkadink/comfy-vibe-station/issues/887#issuecomment-6847126130) |
 | Node-pack registry service import | X570 | 2026-09-18 | [Import and local gate evidence](https://github.com/Kosinkadink/comfy-vibe-station/issues/76) |
