@@ -58,7 +58,7 @@ def test_read_identity_views_publisher_and_tokens_without_writes(
             identity_issuer="https://id.example",
         )
     )
-    alice, bob, mallory, project = (uuid4() for _ in range(4))
+    alice, bob, mallory, project, organization, organization_admin = (uuid4() for _ in range(6))
 
     def database_counts() -> tuple[int, ...]:
         with app.state.database.session() as session:
@@ -74,18 +74,21 @@ def test_read_identity_views_publisher_and_tokens_without_writes(
                 )
             )
 
-    def credential(user: object, name: str, grant: str) -> dict[str, str]:
+    def credential(
+        user: object, name: str, grant: str, *, organization: object | None = None
+    ) -> dict[str, str]:
         now = int(datetime.now(UTC).timestamp())
+        context = f"org:{organization}" if organization is not None else f"project:{project}"
         claims = {
             "iss": "https://id.example",
             "aud": "dinkster-registry",
             "sub": f"u_{user}",
             "kind": "human",
-            "org": None,
+            "org": str(organization) if organization is not None else None,
             "acct": str(user),
             "key": None,
             "key_scopes": None,
-            "grants": {f"project:{project}": [grant, f"registry:publisher:{name}"]},
+            "grants": {context: [grant, f"registry:publisher:{name}"]},
             "iat": now,
             "exp": now + 60,
             "jti": str(uuid4()),
@@ -112,6 +115,44 @@ def test_read_identity_views_publisher_and_tokens_without_writes(
         }
         assert browser.get(f"{path}/tokens", headers=bob_read).status_code == 404
         assert database_counts() == before_unclaimed_reads
+        organization_subject = f"org:{organization}"
+        with app.state.database.session() as session, session.begin():
+            session.add(
+                PublisherRecord(id="organization-publisher", display_name="organization-publisher")
+            )
+            session.flush()
+            session.add(RegistryUserRecord(id=organization_subject))
+            session.flush()
+            session.add(
+                PublisherBindingRecord(
+                    publisher_id="organization-publisher", identity_subject=organization_subject
+                )
+            )
+            session.add(
+                PublisherMembershipRecord(
+                    publisher_id="organization-publisher",
+                    user_id=organization_subject,
+                    role="owner",
+                )
+            )
+        PrincipalRepository(app.state.database).mint_token(
+            "organization-publisher",
+            organization_subject,
+            datetime.now(UTC).isoformat(),
+            (datetime.now(UTC) + timedelta(days=1)).isoformat(),
+        )
+        organization_read = credential(
+            organization_admin,
+            "organization-publisher",
+            "registry:read",
+            organization=organization,
+        )
+        before_organization_read = database_counts()
+        organization_tokens = browser.get(f"{path}/tokens", headers=organization_read)
+        assert organization_tokens.status_code == 200
+        assert organization_tokens.json()["publisher"] == "organization-publisher"
+        assert len(organization_tokens.json()["tokens"]) == 1
+        assert database_counts() == before_organization_read
         assert browser.post(f"{path}/publisher", headers=alice_manage).status_code == 201
         before_claimed_reads = database_counts()
         assert browser.get(f"{path}/publisher", headers=alice_read).json() == {

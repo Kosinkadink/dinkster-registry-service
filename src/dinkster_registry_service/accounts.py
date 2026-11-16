@@ -237,9 +237,7 @@ def account_router(database: Database, settings: ServerSettings) -> APIRouter:
     def list_tokens(who: Annotated[PublisherIdentity, Depends(read_identity)]) -> JSONResponse:
         name = publisher_for_read(who)
         try:
-            records = principals.read_administered_tokens(
-                name, who.actor, identity_subject=who.subject
-            )
+            records = principals.read_administered_tokens(name, identity_subject=who.subject)
         except RegistryError:
             raise AccountError(403, "Token listing is forbidden.") from None
         return _json(
