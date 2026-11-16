@@ -67,7 +67,7 @@ def _json(value: object, status: int = 200) -> JSONResponse:
 
 
 def management_identity(
-    settings: ServerSettings,
+    settings: ServerSettings, *, accepted_grants: frozenset[str] = frozenset({"registry:manage"})
 ) -> Callable[[Request], Awaitable[PublisherIdentity]]:
     verifier = TokenVerifier(
         issuer=settings.identity_issuer,
@@ -95,8 +95,8 @@ def management_identity(
             for c in capabilities
             if c.startswith("registry:publisher:")
         ]
-        if len(names) != 1 or "registry:manage" not in capabilities:
-            raise AccountError(403, "The token does not grant publisher management.")
+        if len(names) != 1 or not accepted_grants.intersection(capabilities):
+            raise AccountError(403, "The token does not grant publisher access.")
         try:
             name = require_canonical_pack_name(names[0])
         except ValueError:
@@ -119,7 +119,38 @@ def management_identity(
 def account_router(database: Database, settings: ServerSettings) -> APIRouter:
     router = APIRouter(prefix="/v1/account", tags=["publisher account"])
     principals = PrincipalRepository(database)
-    identity = management_identity(settings)
+    manage_identity = management_identity(settings)
+    read_identity = management_identity(
+        settings, accepted_grants=frozenset({"registry:manage", "registry:read"})
+    )
+
+    def publisher_for_read(identity: PublisherIdentity) -> str:
+        with database.session() as session:
+            binding = session.scalar(
+                select(PublisherBindingRecord).where(
+                    PublisherBindingRecord.identity_subject == identity.subject
+                )
+            )
+            if binding is None:
+                raise AccountError(404, "Claim a publisher before managing tokens.")
+            if session.get(PublisherFreezeRecord, binding.publisher_id) is not None:
+                raise AccountError(403, "This publisher is frozen; contact registry support.")
+            return binding.publisher_id
+
+    def publisher_state(identity: PublisherIdentity) -> tuple[str, str]:
+        with database.session() as session:
+            binding = session.scalar(
+                select(PublisherBindingRecord).where(
+                    PublisherBindingRecord.identity_subject == identity.subject
+                )
+            )
+            if binding is not None:
+                return binding.publisher_id, "claimed"
+            if identity.name == "dinkster" or (
+                session.get(PublisherRecord, identity.name) is not None
+            ):
+                return identity.name, "unavailable"
+            return identity.name, "available"
 
     def publisher(identity: PublisherIdentity, *, claim: bool = False) -> str:
         now = datetime.now(UTC).isoformat()
@@ -192,14 +223,23 @@ def account_router(database: Database, settings: ServerSettings) -> APIRouter:
             raise AccountError(409, "Publisher claim conflicts with an existing binding.") from None
 
     @router.post("/publisher")
-    def claim_publisher(who: Annotated[PublisherIdentity, Depends(identity)]) -> JSONResponse:
+    def claim_publisher(
+        who: Annotated[PublisherIdentity, Depends(manage_identity)],
+    ) -> JSONResponse:
         return _json({"publisher": publisher(who, claim=True)}, 201)
 
+    @router.get("/publisher")
+    def get_publisher(who: Annotated[PublisherIdentity, Depends(read_identity)]) -> JSONResponse:
+        name, state = publisher_state(who)
+        return _json({"publisher": name, "state": state})
+
     @router.get("/tokens")
-    def list_tokens(who: Annotated[PublisherIdentity, Depends(identity)]) -> JSONResponse:
-        name = publisher(who)
+    def list_tokens(who: Annotated[PublisherIdentity, Depends(read_identity)]) -> JSONResponse:
+        name = publisher_for_read(who)
         try:
-            records = principals.administered_tokens(name, who.actor, identity_subject=who.subject)
+            records = principals.read_administered_tokens(
+                name, who.actor, identity_subject=who.subject
+            )
         except RegistryError:
             raise AccountError(403, "Token listing is forbidden.") from None
         return _json(
@@ -214,7 +254,7 @@ def account_router(database: Database, settings: ServerSettings) -> APIRouter:
 
     @router.post("/tokens")
     def create_token(
-        body: TokenCreate, who: Annotated[PublisherIdentity, Depends(identity)]
+        body: TokenCreate, who: Annotated[PublisherIdentity, Depends(manage_identity)]
     ) -> JSONResponse:
         now = datetime.now(UTC)
         if not now < body.expires_at <= now + timedelta(days=90):
@@ -244,7 +284,9 @@ def account_router(database: Database, settings: ServerSettings) -> APIRouter:
 
     @router.post("/tokens/{token_id}/revoke")
     def revoke_token(
-        token_id: str, body: TokenRevoke, who: Annotated[PublisherIdentity, Depends(identity)]
+        token_id: str,
+        body: TokenRevoke,
+        who: Annotated[PublisherIdentity, Depends(manage_identity)],
     ) -> JSONResponse:
         name = publisher(who)
         if not body.reason.strip():

@@ -10,22 +10,144 @@ from dinkster_token_verifier import TokenVerifier
 from fastapi.testclient import TestClient
 from joserfc import jwt
 from joserfc.jwk import OKPKey
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from dinkster_registry_service import accounts
 from dinkster_registry_service.admission import AdmissionService
 from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
 from dinkster_registry_service.database import (
+    PrincipalAuditRecord,
     PublisherBindingRecord,
     PublisherMembershipRecord,
+    PublisherRecord,
     PublisherTokenRecord,
+    RegistryUserRecord,
 )
 from dinkster_registry_service.object_store import LocalFilesystemObjectStore
 from dinkster_registry_service.ownership import transfer_ownership
 from dinkster_registry_service.principals import PrincipalRepository
 from dinkster_registry_service.seed import FIXTURE_ROOT
 from dinkster_registry_service.settings import ServerSettings
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgresql"])
+def test_read_identity_views_publisher_and_tokens_without_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, backend: str
+) -> None:
+    key = OKPKey.generate_key("Ed25519", auto_kid=True)
+    jwk = {**key.as_dict(private=False), "alg": "Ed25519", "use": "sig"}
+    verifier = TokenVerifier(
+        issuer="https://id.example",
+        audience="dinkster-registry",
+        jwks_url="https://id.example/.well-known/jwks.json",
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"keys": [jwk]}))
+        ),
+    )
+    monkeypatch.setattr(accounts, "TokenVerifier", lambda **kwargs: verifier)
+    if backend == "postgresql":
+        request.getfixturevalue("database")
+        database_url = request.getfixturevalue("database_url")
+    else:
+        database_url = f"sqlite:///{tmp_path / 'registry.db'}"
+    app = create_app(
+        ServerSettings(
+            database_url=database_url,
+            object_store_root=tmp_path / "objects",
+            identity_issuer="https://id.example",
+        )
+    )
+    alice, bob, mallory, project = (uuid4() for _ in range(4))
+
+    def database_counts() -> tuple[int, ...]:
+        with app.state.database.session() as session:
+            return tuple(
+                session.scalar(select(func.count()).select_from(table))
+                for table in (
+                    RegistryUserRecord,
+                    PublisherRecord,
+                    PublisherBindingRecord,
+                    PublisherMembershipRecord,
+                    PublisherTokenRecord,
+                    PrincipalAuditRecord,
+                )
+            )
+
+    def credential(user: object, name: str, grant: str) -> dict[str, str]:
+        now = int(datetime.now(UTC).timestamp())
+        claims = {
+            "iss": "https://id.example",
+            "aud": "dinkster-registry",
+            "sub": f"u_{user}",
+            "kind": "human",
+            "org": None,
+            "acct": str(user),
+            "key": None,
+            "key_scopes": None,
+            "grants": {f"project:{project}": [grant, f"registry:publisher:{name}"]},
+            "iat": now,
+            "exp": now + 60,
+            "jti": str(uuid4()),
+        }
+        token = jwt.encode({"alg": "Ed25519", "kid": key.kid}, claims, key, algorithms=["Ed25519"])
+        return {"Authorization": f"Bearer {token}", "Origin": "https://id.example"}
+
+    with TestClient(app) as browser:
+        path = "/v1/account"
+        alice_manage = credential(alice, "alice", "registry:manage")
+        alice_read = credential(alice, "alice", "registry:read")
+        bob_read = credential(bob, "bob", "registry:read")
+        mallory_read = credential(mallory, "alice", "registry:read")
+        reserved_read = credential(bob, "dinkster", "registry:read")
+
+        before_unclaimed_reads = database_counts()
+        assert browser.get(f"{path}/publisher", headers=bob_read).json() == {
+            "publisher": "bob",
+            "state": "available",
+        }
+        assert browser.get(f"{path}/publisher", headers=reserved_read).json() == {
+            "publisher": "dinkster",
+            "state": "unavailable",
+        }
+        assert browser.get(f"{path}/tokens", headers=bob_read).status_code == 404
+        assert database_counts() == before_unclaimed_reads
+        assert browser.post(f"{path}/publisher", headers=alice_manage).status_code == 201
+        before_claimed_reads = database_counts()
+        assert browser.get(f"{path}/publisher", headers=alice_read).json() == {
+            "publisher": "alice",
+            "state": "claimed",
+        }
+        assert browser.get(f"{path}/publisher", headers=alice_manage).json() == {
+            "publisher": "alice",
+            "state": "claimed",
+        }
+        assert browser.get(f"{path}/publisher", headers=mallory_read).json() == {
+            "publisher": "alice",
+            "state": "unavailable",
+        }
+        assert browser.get(f"{path}/tokens", headers=alice_read).json() == {
+            "publisher": "alice",
+            "tokens": [],
+        }
+        assert browser.post(f"{path}/publisher", headers=alice_read).status_code == 403
+        assert (
+            browser.post(
+                f"{path}/tokens",
+                headers=alice_read,
+                json={"expires_at": (datetime.now(UTC) + timedelta(days=1)).isoformat()},
+            ).status_code
+            == 403
+        )
+        assert (
+            browser.post(
+                f"{path}/tokens/not-a-token/revoke",
+                headers=alice_read,
+                json={"reason": "read access cannot revoke"},
+            ).status_code
+            == 403
+        )
+        assert database_counts() == before_claimed_reads
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "postgresql"])

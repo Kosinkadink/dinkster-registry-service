@@ -452,6 +452,7 @@ All catalog routes are under `/v1` and use camelCase JSON fields:
 | POST | `/v1/publish/{name}/versions/{version}/yank` | Withdraw an active release of the token's publisher/pack, including registry maintenance releases. |
 | GET | `/v1/publish/{candidateId}` | Read publisher-scoped admission status. |
 | POST | `/v1/reviews/{candidateId}` | Accept or reject a candidate as a registry operator. |
+| GET | `/v1/account/publisher` | Read the attested publisher's claim state. |
 | POST | `/v1/account/publisher` | Claim the publisher attested by a Dinkster human identity. |
 | GET | `/v1/account/tokens` | List that publisher's token metadata. |
 | POST | `/v1/account/tokens` | Create an expiring publisher or single-pack publish token. |
