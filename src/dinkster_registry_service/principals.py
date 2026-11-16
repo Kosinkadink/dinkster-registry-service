@@ -287,6 +287,18 @@ class PrincipalRepository:
             directory.authorize(actor, publisher, "manage-members")
             return directory.tokens(publisher)
 
+    def read_administered_tokens(
+        self, publisher: str, *, identity_subject: str
+    ) -> tuple[TokenRecord, ...]:
+        with self.database.session() as session:
+            binding = session.get(PublisherBindingRecord, canonical_name(publisher))
+            if binding is None or binding.identity_subject != identity_subject:
+                raise RegistryError("publisher identity binding changed")
+            if session.get(PublisherFreezeRecord, publisher) is not None:
+                raise RegistryError("publisher is frozen")
+            directory, _ = self._load(session)
+            return directory.tokens(publisher)
+
     def is_operator(self, user: str) -> bool:
         with self.database.session() as session:
             _, operators = self._load(session)

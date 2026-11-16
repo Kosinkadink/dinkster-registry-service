@@ -139,7 +139,12 @@ jobs:
           sudo apt-get install --yes --no-install-recommends bubblewrap apparmor-profiles
           if [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] &&
              [[ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1 ]]; then
-            sudo apparmor_parser -r /usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+            profile=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+            if [[ ! -f "$profile" ]]; then
+              profile=/etc/apparmor.d/bwrap-userns-restrict
+            fi
+            test -f "$profile"
+            sudo apparmor_parser -r "$profile"
           fi
       - name: Inspect container namespace capability
         run: |
