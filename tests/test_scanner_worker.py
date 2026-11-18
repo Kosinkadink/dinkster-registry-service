@@ -8,18 +8,22 @@ import socket
 import sys
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import pytest
 import uvicorn
 from dinkster_registry.archive_admission import StageResult
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from runtime_fixture import RuntimeFixture
 
 import dinkster_registry_service.scanner_worker as scanner_worker
 from dinkster_registry_service.admission import AdmissionService, CandidateClaim
+from dinkster_registry_service.app import create_app
 from dinkster_registry_service.artifacts import build_registry_fixture_archive
 from dinkster_registry_service.database import Database
 from dinkster_registry_service.digests import artifact_digest
@@ -29,9 +33,22 @@ from dinkster_registry_service.scan_execution import run_prepared_probe
 from dinkster_registry_service.seed import FIXTURE_ROOT
 
 
-@pytest.mark.parametrize("multipart", [False, True])
+@pytest.mark.parametrize(
+    "multipart,fault",
+    [
+        (False, None),
+        (True, None),
+        (True, "missing-lock"),
+        (True, "broken-entry"),
+        (True, "collision"),
+    ],
+)
 def test_worker_runs_locked_probe_over_http_and_delivery_never_claims(
-    tmp_path: Path, runtime: RuntimeFixture, monkeypatch: pytest.MonkeyPatch, multipart: bool
+    tmp_path: Path,
+    runtime: RuntimeFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    multipart: bool,
+    fault: str | None,
 ) -> None:
     token = "disposable-worker-capability"
     settings = runtime.settings(tmp_path, database_url=f"sqlite:///{tmp_path / 'catalog.db'}")
@@ -50,9 +67,12 @@ def test_worker_runs_locked_probe_over_http_and_delivery_never_claims(
             manifest.read_text() + '\n[[pack.parts]]\nname = "shared"\n'
             '[pack.parts.entry]\nnodes = "example_pack.shared_nodes:PACK_NODES"\n'
         )
-        (source / "shared_nodes.py").write_text(
-            (source / "nodes.py").read_text().replace('"example.', '"example.shared-')
-        )
+        sibling = (source / "nodes.py").read_text()
+        if fault != "collision":
+            sibling = sibling.replace('"example.', '"example.shared-')
+        if fault == "broken-entry":
+            sibling = "raise RuntimeError('Sibling entry cannot load')\n"
+        (source / "shared_nodes.py").write_text(sibling)
     archive = build_registry_fixture_archive(source)
     locks: dict[str, dict[str, Any]] = {
         variant: {
@@ -70,7 +90,7 @@ def test_worker_runs_locked_probe_over_http_and_delivery_never_claims(
         }
         for variant in ("linux-cpu", "win-cpu")
     }
-    if multipart:
+    if multipart and fault != "missing-lock":
         for binding in locks.values():
             binding["parts"] = {
                 "shared": {
@@ -79,13 +99,20 @@ def test_worker_runs_locked_probe_over_http_and_delivery_never_claims(
                     "lock": {**binding["lock"], "format": "dinkster.pack-lock/3", "part": "shared"},
                 }
             }
-    candidate_id = service.submit(
-        archive,
-        pack_name="example-pack",
-        version="1.2.3",
-        publisher="dinkster",
-        locks=json.dumps(locks).encode(),
+    now = datetime.now(UTC)
+    publisher_token, _ = principals.mint_token(
+        "dinkster", "operator", now.isoformat(), (now + timedelta(hours=1)).isoformat()
     )
+    with TestClient(create_app(settings)) as public:
+        submitted = public.post(
+            "/v1/publish/example-pack/versions/1.2.3",
+            headers={"Authorization": f"Bearer {publisher_token}"},
+            files={"archive": ("pack.whl", archive, "application/zip")},
+            data={"locks": json.dumps(locks)},
+        )
+        assert submitted.status_code == 202, submitted.text
+        candidate_id = UUID(submitted.json()["candidateId"])
+        assert public.get("/v1/packs").json()["items"] == []
     assert not service.deliver_once()
     assert service.status(candidate_id).status == "queued"
     assert service.status(candidate_id).attempts == 0
@@ -133,6 +160,19 @@ def test_worker_runs_locked_probe_over_http_and_delivery_never_claims(
             )
             assert worker.run_once()
             assert not worker.run_once()
+            if fault is not None:
+                status = service.status(candidate_id)
+                assert status.status == "rejected", status
+                expected = {
+                    "missing-lock": "probe.parts-invalid",
+                    "broken-entry": "entry.unresolvable",
+                    "collision": "probe.node-conflict",
+                }[fault]
+                assert expected in {finding.code for finding in status.findings}
+                with TestClient(create_app(settings)) as public:
+                    assert public.get("/v1/packs").json()["items"] == []
+                    assert public.get("/v1/packs/example-pack/versions/1.2.3").status_code == 404
+                return
             assert service.status(candidate_id).status == "accepted", [
                 (finding.code, finding.message) for finding in service.status(candidate_id).findings
             ]
@@ -141,7 +181,43 @@ def test_worker_runs_locked_probe_over_http_and_delivery_never_claims(
                 assert time.monotonic() < deadline + 30
             assert service.object_store.exists("static/packs/index.json")
             index = json.loads(service.object_store.read("static/packs/index.json"))
-            assert any(item["name"] == "example-pack" for item in index["items"])
+            assert [item["name"] for item in index["items"]] == ["example-pack"]
+            versions = json.loads(service.object_store.read("static/" + index["items"][0]["url"]))
+            assert [item["version"] for item in versions["items"]] == ["1.2.3"]
+            published = versions["items"][0]
+            with TestClient(create_app(settings)) as public:
+                listing = public.get("/v1/packs").json()["items"]
+                assert [item["name"] for item in listing] == ["example-pack"]
+                detail = public.get("/v1/packs/example-pack/versions/1.2.3").json()
+                schemas = public.get("/v1/packs/example-pack/versions/1.2.3/schemas").json()
+                expected_nodes = {"example.resize", "example.save"}
+                if multipart:
+                    expected_nodes.update({"example.shared-resize", "example.shared-save"})
+                assert {node["nodeType"] for node in detail["nodes"]} == expected_nodes
+                assert {node["nodeType"] for node in schemas["schemas"]} == expected_nodes
+                for variant, submitted_lock in locks.items():
+                    dynamic = detail["installLocks"][variant]
+                    static = published["installLocks"][variant]
+                    selected = [(dynamic, static, submitted_lock["lock"])]
+                    if multipart:
+                        selected.append(
+                            (
+                                dynamic["parts"]["shared"],
+                                static["parts"]["shared"],
+                                submitted_lock["parts"]["shared"]["lock"],
+                            )
+                        )
+                    for binding, static_binding, record in selected:
+                        download = public.get(binding["url"], params={"baseId": binding["baseId"]})
+                        assert download.status_code == 200, download.text
+                        assert download.json() == record
+                        assert artifact_digest(download.content) == binding["digest"]
+                        assert len(download.content) == binding["size"]
+                        assert binding["artifactDigest"] == artifact_digest(archive)
+                        assert (
+                            service.object_store.read("static/" + static_binding["url"])
+                            == download.content
+                        )
             rescan_id = service.schedule_rescan("example-pack", "1.2.3")
             assert worker.run_once()
             assert service.status(rescan_id).status == "accepted"
