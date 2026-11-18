@@ -29,8 +29,9 @@ from dinkster_registry_service.scan_execution import run_prepared_probe
 from dinkster_registry_service.seed import FIXTURE_ROOT
 
 
+@pytest.mark.parametrize("multipart", [False, True])
 def test_worker_runs_locked_probe_over_http_and_delivery_never_claims(
-    tmp_path: Path, runtime: RuntimeFixture, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, runtime: RuntimeFixture, monkeypatch: pytest.MonkeyPatch, multipart: bool
 ) -> None:
     token = "disposable-worker-capability"
     settings = runtime.settings(tmp_path, database_url=f"sqlite:///{tmp_path / 'catalog.db'}")
@@ -41,8 +42,19 @@ def test_worker_runs_locked_probe_over_http_and_delivery_never_claims(
     principals = PrincipalRepository(database)
     principals.register_user("operator")
     principals.register_publisher("dinkster", "operator", "2026-11-12T00:00:00Z")
-    archive = build_registry_fixture_archive(FIXTURE_ROOT / "example-pack")
-    locks = {
+    source = tmp_path / "submitted-pack"
+    shutil.copytree(FIXTURE_ROOT / "example-pack", source)
+    if multipart:
+        manifest = source / "dinkster-pack.toml"
+        manifest.write_text(
+            manifest.read_text() + '\n[[pack.parts]]\nname = "shared"\n'
+            '[pack.parts.entry]\nnodes = "example_pack.shared_nodes:PACK_NODES"\n'
+        )
+        (source / "shared_nodes.py").write_text(
+            (source / "nodes.py").read_text().replace('"example.', '"example.shared-')
+        )
+    archive = build_registry_fixture_archive(source)
+    locks: dict[str, dict[str, Any]] = {
         variant: {
             "baseId": runtime.base_ids[variant],
             "artifactDigest": artifact_digest(archive),
@@ -58,6 +70,15 @@ def test_worker_runs_locked_probe_over_http_and_delivery_never_claims(
         }
         for variant in ("linux-cpu", "win-cpu")
     }
+    if multipart:
+        for binding in locks.values():
+            binding["parts"] = {
+                "shared": {
+                    "baseId": binding["baseId"],
+                    "artifactDigest": binding["artifactDigest"],
+                    "lock": {**binding["lock"], "format": "dinkster.pack-lock/3", "part": "shared"},
+                }
+            }
     candidate_id = service.submit(
         archive,
         pack_name="example-pack",
@@ -112,7 +133,9 @@ def test_worker_runs_locked_probe_over_http_and_delivery_never_claims(
             )
             assert worker.run_once()
             assert not worker.run_once()
-            assert service.status(candidate_id).status == "accepted", service.status(candidate_id)
+            assert service.status(candidate_id).status == "accepted", [
+                (finding.code, finding.message) for finding in service.status(candidate_id).findings
+            ]
             assert service.status(candidate_id).attempts == 1
             while service.deliver_once():
                 assert time.monotonic() < deadline + 30

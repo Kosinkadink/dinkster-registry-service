@@ -137,15 +137,7 @@ class ScannerWorker:
                     failure["data"],
                     failure["operator_details"],
                 )
-            dependencies = ProbeDependencies(
-                tuple(base64.b64decode(item, validate=True) for item in resolved["helperWheels"]),
-                tuple(
-                    (item["filename"], base64.b64decode(item["data"], validate=True))
-                    for item in resolved["libraryWheels"]
-                ),
-                tuple(resolved["requirements"]),
-                tuple(resolved["bindings"]),
-            )
+            dependencies = ProbeDependencies.from_record(resolved)
             locks = json.loads(
                 self._request("GET", path + "/locks", lease=lease, limit=48 * 1024 * 1024)
                 or b"null"
@@ -168,7 +160,7 @@ class ScannerWorker:
                 probe,
                 operator_details={
                     **(probe.operator_details or {}),
-                    "dependencyBindings": list(dependencies.bindings),
+                    "dependencyBindings": list(dependencies.all_bindings),
                 },
             )
 

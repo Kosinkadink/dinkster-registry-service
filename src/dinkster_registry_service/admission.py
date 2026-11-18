@@ -1639,10 +1639,10 @@ class AdmissionService:
             return tuple(wheels), {release.binding for release in selected.values()}
 
     def _resolve_probe_dependencies(
-        self, root: Path, set_id: UUID | None = None
+        self, root: Path, set_id: UUID | None = None, *, part: str | None = None
     ) -> ProbeDependencies:
         manifest_path = root / "dinkster-pack.toml"
-        manifest = load_manifest(manifest_path)
+        manifest = load_manifest(manifest_path, part=part)
         pending = list(manifest.dependencies)
         selected: dict[str, str] = {}
         bindings: set[str] = set()
@@ -1691,7 +1691,18 @@ class AdmissionService:
         self, root: Path, set_id: UUID | None = None
     ) -> ProbeDependencies | StageResult:
         try:
-            return self._resolve_probe_dependencies(root, set_id)
+            dependencies = self._resolve_probe_dependencies(root, set_id)
+            manifest = load_manifest(root / "dinkster-pack.toml")
+            parts = []
+            for selected in manifest.parts:
+                assert selected.part is not None
+                parts.append(
+                    (
+                        selected.part,
+                        self._resolve_probe_dependencies(root, set_id, part=selected.part),
+                    )
+                )
+            return replace(dependencies, parts=tuple(parts))
         except (ValueError, ObjectStoreError, FileNotFoundError) as exc:
             return StageResult(
                 (
@@ -1743,7 +1754,7 @@ class AdmissionService:
             probe,
             operator_details={
                 **(probe.operator_details or {}),
-                "dependencyBindings": list(dependencies.bindings),
+                "dependencyBindings": list(dependencies.all_bindings),
             },
         )
 

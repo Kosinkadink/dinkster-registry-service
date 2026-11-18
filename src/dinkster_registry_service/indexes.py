@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from functools import partial
+from typing import Any
 
 from packaging.version import Version
 from sqlalchemy import select, text
@@ -205,7 +206,7 @@ class StaticIndexes:
                     f'<a href="{html.escape(link, quote=True)}">'
                     f"{html.escape(wheel['filename'])}</a>"
                 )
-            locks = {}
+            locks: dict[str, dict[str, Any]] = {}
             for variant, lock in iter_install_locks(release.install_locks):
                 lock_key = f"locks/{lock['digest'].replace(':', '/')}.json"
                 object_writes.append(

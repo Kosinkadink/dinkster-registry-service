@@ -197,25 +197,9 @@ def scanner_router(service: AdmissionService, token_sha256: str | None) -> APIRo
         assignment(candidate_id, x_scanner_lease)
         if isinstance(resolved, StageResult):
             return JSONResponse({"failure": asdict(resolved)}, headers=NO_STORE)
-        size = sum(len(value) for value in resolved.helper_wheels) + sum(
-            len(value) for _, value in resolved.library_wheels
-        )
-        if size > EXPANDED_LIMIT:
+        if resolved.transfer_size > EXPANDED_LIMIT:
             raise ScannerError(503, "Assigned scan dependencies exceed the transfer limit.")
-        return JSONResponse(
-            {
-                "helperWheels": [
-                    base64.b64encode(value).decode() for value in resolved.helper_wheels
-                ],
-                "libraryWheels": [
-                    {"filename": name, "data": base64.b64encode(value).decode()}
-                    for name, value in resolved.library_wheels
-                ],
-                "requirements": list(resolved.requirements),
-                "bindings": list(resolved.bindings),
-            },
-            headers=NO_STORE,
-        )
+        return JSONResponse(resolved.to_record(), headers=NO_STORE)
 
     @router.post("/{candidate_id}/heartbeat")
     def heartbeat(candidate_id: UUID, x_scanner_lease: Annotated[UUID, Header()]) -> Response:
