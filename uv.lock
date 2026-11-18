@@ -652,8 +652,8 @@ wheels = [
 
 [[package]]
 name = "dinkster-api"
-version = "0.0.15"
-source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=09a19d695b2634e684d48d425de4663db1113904#09a19d695b2634e684d48d425de4663db1113904" }
+version = "0.0.16"
+source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=af8bca7ae23c976491e4b26a505589fe751e9f5e#af8bca7ae23c976491e4b26a505589fe751e9f5e" }
 dependencies = [
     { name = "aiohttp" },
     { name = "alembic" },
@@ -730,8 +730,8 @@ requires-dist = [
     { name = "blake3", specifier = ">=1.0,<2" },
     { name = "boto3", specifier = ">=1.40,<2" },
     { name = "cryptography", specifier = ">=46,<51" },
-    { name = "dinkster-api", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=09a19d695b2634e684d48d425de4663db1113904" },
-    { name = "dinkster-supervisor", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-supervisor&rev=09a19d695b2634e684d48d425de4663db1113904" },
+    { name = "dinkster-api", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-api&rev=af8bca7ae23c976491e4b26a505589fe751e9f5e" },
+    { name = "dinkster-supervisor", git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-supervisor&rev=af8bca7ae23c976491e4b26a505589fe751e9f5e" },
     { name = "dinkster-token-verifier", url = "https://github.com/Kosinkadink/dinkster-token-verifier/releases/download/v0.1.1/dinkster_token_verifier-0.1.1-py3-none-any.whl" },
     { name = "fastapi", specifier = ">=0.116,<1" },
     { name = "packaging", specifier = ">=25,<26" },
@@ -754,8 +754,8 @@ dev = [
 
 [[package]]
 name = "dinkster-supervisor"
-version = "0.0.12"
-source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-supervisor&rev=09a19d695b2634e684d48d425de4663db1113904#09a19d695b2634e684d48d425de4663db1113904" }
+version = "0.0.13"
+source = { git = "https://github.com/Kosinkadink/Dinkster.git?subdirectory=packages%2Fdinkster-supervisor&rev=af8bca7ae23c976491e4b26a505589fe751e9f5e#af8bca7ae23c976491e4b26a505589fe751e9f5e" }
 dependencies = [
     { name = "aiohttp" },
     { name = "blake3" },
