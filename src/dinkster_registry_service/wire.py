@@ -134,6 +134,9 @@ class ReleaseManifest(ResponseModel):
     platforms: list[str]
     sandbox: Sandbox
     python_requirements: list[str]
+    python_extra_requirements: dict[str, list[str]] = Field(default_factory=dict)
+    namespaces: list[str] = Field(default_factory=list)
+    parts: dict[str, ReleaseManifest] = Field(default_factory=dict)
     dependencies: list[ReleaseDependency]
     node_source: Literal["remote-gateway-catalog"] | None = None
 
