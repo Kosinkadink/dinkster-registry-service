@@ -381,7 +381,9 @@ class CatalogRepository:
                             "parts": {
                                 part: {
                                     **selected,
-                                    "url": f"/v1/packs/{name}/versions/{version}/locks/{variant}~{part}",
+                                    "url": (
+                                        f"/v1/packs/{name}/versions/{version}/locks/{variant}~{part}"
+                                    ),
                                 }
                                 for part, selected in lock.get("parts", {}).items()
                             },
