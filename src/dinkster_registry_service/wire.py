@@ -134,6 +134,9 @@ class ReleaseManifest(ResponseModel):
     platforms: list[str]
     sandbox: Sandbox
     python_requirements: list[str]
+    python_extra_requirements: dict[str, list[str]] = Field(default_factory=dict)
+    namespaces: list[str] = Field(default_factory=list)
+    parts: dict[str, ReleaseManifest] = Field(default_factory=dict)
     dependencies: list[ReleaseDependency]
     node_source: Literal["remote-gateway-catalog"] | None = None
 
@@ -208,12 +211,16 @@ class CloudEligibility(ResponseModel):
     policy_version: str
 
 
-class InstallationLock(ResponseModel):
+class InstallationPartLock(ResponseModel):
     base_id: str
     artifact_digest: str
     digest: str
     size: int
     url: str
+
+
+class InstallationLock(InstallationPartLock):
+    parts: dict[str, InstallationPartLock] = Field(default_factory=dict)
 
 
 class ReleaseDetail(ResponseModel):

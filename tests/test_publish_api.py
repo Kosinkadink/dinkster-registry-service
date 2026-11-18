@@ -6,6 +6,7 @@ import shutil
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -177,8 +178,8 @@ def test_service_refuses_incompatible_lock_with_the_user_install_reason(
     lock = bindings["linux-cpu"]["lock"]
     lock.update(format="dinkster.pack-lock/2", engine=">=999")
     expected = (
-        "pack locked-pack: dinkster-api: generation has 0.0.3, engine needs >=999. "
-        "Use an own environment (0 bytes)."
+        f"pack locked-pack: dinkster-api: generation has {version('dinkster-api')}, "
+        "engine needs >=999. Use an own environment (0 bytes)."
     )
     with pytest.raises(ProvisionError) as refusal:
         plan_pack(
@@ -345,7 +346,9 @@ def test_locked_publication_recovers_rejected_dependency_without_reset(
         assert event is not None and event.data["supersedesCandidateId"] == old_id
 
 
-@pytest.mark.parametrize("selected_version", ["1.0", "0.5", None, "base", "base-conflict"])
+@pytest.mark.parametrize(
+    "selected_version", ["1.0", "0.5", None, "base", "base-compatible", "base-conflict"]
+)
 def test_locked_helper_requirements_use_selected_versions(
     tmp_path: Path, runtime: RuntimeFixture, selected_version: str | None
 ) -> None:
@@ -357,7 +360,7 @@ def test_locked_helper_requirements_use_selected_versions(
         require_isolation=False,
         settings=runtime.settings(tmp_path),
     )
-    from_base = selected_version in {"base", "base-conflict"}
+    from_base = selected_version in {"base", "base-compatible", "base-conflict"}
     requirement = "packaging>=1" if from_base else "fixture>=1"
     _archive(tmp_path, "helper-pack")
     helper_manifest = tmp_path / "helper-pack" / "dinkster-pack.toml"
@@ -400,7 +403,13 @@ def test_locked_helper_requirements_use_selected_versions(
     locks = json.loads(json.dumps(_locks(archive, runtime)))
     for binding in locks.values():
         binding["lock"]["engine"] = f"=={runtime.engine_version}"
-        binding["lock"]["requirements"] = [] if from_base else ["fixture>=0.1"]
+        binding["lock"]["requirements"] = (
+            ["packaging>=999"]
+            if selected_version == "base-conflict"
+            else []
+            if from_base
+            else ["fixture>=0.1"]
+        )
         if selected_version is not None and selected_version != "base":
             name = "packaging" if from_base else "fixture"
             locked_version = "0.5" if from_base else selected_version
@@ -421,10 +430,13 @@ def test_locked_helper_requirements_use_selected_versions(
     assert admission.run_once()
     status = admission.status(UUID(submitted.json()["candidateId"]))
     endpoint = "/v1/packs/locked-pack/versions/1.2.3"
-    if selected_version not in {"1.0", "base"}:
+    if selected_version not in {"1.0", "base", "base-compatible"}:
         assert status.status == "rejected"
         assert client.get(endpoint).status_code == 404
-        assert any(requirement in finding.message for finding in status.findings)
+        refused_requirement = (
+            "packaging>=999" if selected_version == "base-conflict" else requirement
+        )
+        assert any(refused_requirement in finding.message for finding in status.findings)
         return
     assert status.status == "accepted", status
     for variant, binding in locks.items():
@@ -562,8 +574,8 @@ def test_format2_lock_validation_preserves_legacy_exact_locks(
     lock.update(format="dinkster.pack-lock/2", engine=">=0.0.2,<0.1")
     api = {
         "name": "dinkster-api",
-        "version": "0.0.3",
-        "wheels": [runtime.wheel_record("dinkster-api", "0.0.3")],
+        "version": version("dinkster-api"),
+        "wheels": [runtime.wheel_record("dinkster-api", version("dinkster-api"))],
     }
     locks["win-cpu"]["lock"]["packages"] = [api]
 
@@ -579,7 +591,7 @@ def test_format2_lock_validation_preserves_legacy_exact_locks(
         ({"engine": ""}, "engine API requires a nonempty compatibility range"),
         ({"engine": 7}, "engine compatibility range must be a string"),
         ({"packages": [api]}, "engine API must not also be an exact lock package"),
-        ({"format": "dinkster.pack-lock/3"}, "unsupported dependency lock format"),
+        ({"format": "dinkster.pack-lock/99"}, "unsupported dependency lock format"),
     ):
         invalid = json.loads(json.dumps(locks))
         invalid["linux-cpu"]["lock"].update(changes)
@@ -628,6 +640,9 @@ def test_format2_lock_validation_preserves_legacy_exact_locks(
         "wheel-hash",
         "too-many-variants",
         "oversized-lock",
+        "part-selector",
+        "part-base",
+        "part-name",
     ],
 )
 def test_invalid_published_locks_refuse_before_submission(tmp_path: Path, mutation: str) -> None:
@@ -662,6 +677,15 @@ def test_invalid_published_locks_refuse_before_submission(tmp_path: Path, mutati
             locks[variant]["lock"]["variant"] = variant
     elif mutation == "oversized-lock":
         lock["indexes"] = ["https://example.test/" + "a" * (1024 * 1024)]
+    elif mutation.startswith("part-"):
+        selected = json.loads(json.dumps(locks["linux-cpu"]))
+        selected["lock"].update(format="dinkster.pack-lock/3", part="face")
+        if mutation == "part-selector":
+            selected["lock"]["part"] = "other"
+        elif mutation == "part-base":
+            selected["baseId"] = "sha256:" + "b" * 64
+        name = "main" if mutation == "part-name" else "face"
+        locks["linux-cpu"]["parts"] = {name: selected}
     elif mutation.startswith("package-") or mutation.startswith("wheel-"):
         url = {
             "wheel-url-no-host": "https:///fixture.whl",

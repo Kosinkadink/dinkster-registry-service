@@ -18,7 +18,7 @@ from .digests import artifact_digest
 from .identifiers import require_canonical_pack_name
 from .ids import uuid7
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStoreError
-from .pack_locks import MAX_LOCKS_SIZE, parse_pack_locks, quarantine_lock_key
+from .pack_locks import MAX_LOCKS_SIZE, iter_install_locks, parse_pack_locks, quarantine_lock_key
 from .scan_engine import parse_scan_engine
 from .security_repository import SecurityRepository, lock_security
 from .versioning import public_version_key, require_public_version
@@ -54,7 +54,8 @@ def queue_set_cleanup(
     for candidate in candidates:
         keys.append(candidate.object_key)
         keys.extend(
-            quarantine_lock_key(candidate.id, variant) for variant in candidate.install_locks
+            quarantine_lock_key(candidate.id, key)
+            for key, _ in iter_install_locks(candidate.install_locks)
         )
     now = datetime.now(UTC)
     session.add(
@@ -244,7 +245,12 @@ def submit_set(service: AdmissionService, uploads: list[SetUpload], token: Token
                 )
                 candidate = session.get(ReleaseCandidateRecord, candidate_id)
                 assert candidate is not None
-                cleanup.append((candidate_id, tuple(candidate.install_locks)))
+                cleanup.append(
+                    (
+                        candidate_id,
+                        tuple(key for key, _ in iter_install_locks(candidate.install_locks)),
+                    )
+                )
                 members.append(str(candidate_id))
             release_set.members = members
             session.add(

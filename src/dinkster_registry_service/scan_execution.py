@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
+import shutil
 import tempfile
 import tomllib
 import zipfile
@@ -34,6 +36,7 @@ from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
 from .digests import artifact_digest as digest_bytes
+from .pack_locks import iter_install_locks
 from .scan_engine import stage_scan_api
 from .scan_runtime import scan_catalog
 
@@ -44,6 +47,52 @@ class ProbeDependencies:
     library_wheels: tuple[tuple[str, bytes], ...]
     requirements: tuple[str, ...]
     bindings: tuple[str, ...] = ()
+    parts: tuple[tuple[str, ProbeDependencies], ...] = ()
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "helperWheels": [base64.b64encode(value).decode() for value in self.helper_wheels],
+            "libraryWheels": [
+                {"filename": name, "data": base64.b64encode(value).decode()}
+                for name, value in self.library_wheels
+            ],
+            "requirements": list(self.requirements),
+            "bindings": list(self.bindings),
+            **(
+                {"parts": {name: dependency.to_record() for name, dependency in self.parts}}
+                if self.parts
+                else {}
+            ),
+        }
+
+    @classmethod
+    def from_record(cls, record: dict[str, Any]) -> ProbeDependencies:
+        return cls(
+            tuple(base64.b64decode(value, validate=True) for value in record["helperWheels"]),
+            tuple(
+                (item["filename"], base64.b64decode(item["data"], validate=True))
+                for item in record["libraryWheels"]
+            ),
+            tuple(record["requirements"]),
+            tuple(record["bindings"]),
+            tuple(
+                (name, cls.from_record(value)) for name, value in record.get("parts", {}).items()
+            ),
+        )
+
+    @property
+    def transfer_size(self) -> int:
+        return (
+            sum(map(len, self.helper_wheels))
+            + sum(len(value) for _, value in self.library_wheels)
+            + sum(value.transfer_size for _, value in self.parts)
+        )
+
+    @property
+    def all_bindings(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(set(self.bindings).union(*(value.all_bindings for _, value in self.parts)))
+        )
 
 
 def run_prepared_probe(
@@ -60,10 +109,121 @@ def run_prepared_probe(
     runtime_store: Path | None = None,
     development_runtime: Path | None = None,
 ) -> StageResult:
-    """Run a probe using resolved bytes, without catalog or object-store authority."""
+    """Admit every entry before exposing a single combined parent catalog."""
+    manifest = load_manifest(root / "dinkster-pack.toml")
+    declared = {selected.part for selected in manifest.parts}
+    if set(dict(dependencies.parts)) != declared:
+        return StageResult(
+            (
+                AdmissionFinding(
+                    "probe.parts-invalid",
+                    "error",
+                    "block",
+                    "Assigned execution-part dependencies differ.",
+                ),
+            )
+        )
+    if declared and not install_locks:
+        return StageResult(
+            (
+                AdmissionFinding(
+                    "probe.parts-invalid",
+                    "error",
+                    "block",
+                    "Execution parts require published dependency locks.",
+                ),
+            )
+        )
+    for variant, binding in (install_locks or {}).items():
+        if set(binding.get("parts", {})) != declared:
+            return StageResult(
+                (
+                    AdmissionFinding(
+                        "probe.parts-invalid",
+                        "error",
+                        "block",
+                        f"{variant}: declared execution-part locks differ.",
+                    ),
+                )
+            )
+    if not declared:
+        return _run_selected_probe(
+            root,
+            dependencies,
+            settings=settings,
+            require_isolation=require_isolation,
+            scan_engine=scan_engine,
+            development_release=development_release,
+            install_locks=install_locks,
+            lock_bytes=lock_bytes,
+            artifact_digest=artifact_digest,
+            runtime_store=runtime_store,
+            development_runtime=development_runtime,
+        )
+    schemas: list[dict[str, Any]] = []
+    findings: list[AdmissionFinding] = []
+    details: dict[str, Any] = {}
+    owners: set[str] = set()
+    with tempfile.TemporaryDirectory(prefix="registry-entry-probes-") as directory:
+        for part, selected in ((None, dependencies), *dependencies.parts):
+            source = root
+            if declared:
+                source = Path(directory) / (part or "main")
+                shutil.copytree(root, source)
+            result = _run_selected_probe(
+                source,
+                selected,
+                settings=settings,
+                require_isolation=require_isolation,
+                scan_engine=scan_engine,
+                development_release=development_release,
+                install_locks=install_locks,
+                lock_bytes=lock_bytes,
+                artifact_digest=artifact_digest,
+                runtime_store=runtime_store,
+                development_runtime=development_runtime,
+                part=part,
+            )
+            findings.extend(result.findings)
+            details[part or "main"] = result.operator_details
+            if result.blocked:
+                return replace(result, findings=tuple(findings))
+            for schema in (result.data or {}).get("schemas", []):
+                if schema["nodeType"] in owners:
+                    return StageResult(
+                        (
+                            AdmissionFinding(
+                                "probe.node-conflict",
+                                "error",
+                                "block",
+                                "Execution parts publish the same node type.",
+                            ),
+                        )
+                    )
+                owners.add(schema["nodeType"])
+                schemas.append(schema)
+    return StageResult(tuple(findings), {"schemas": schemas}, {"parts": details})
+
+
+def _run_selected_probe(
+    root: Path,
+    dependencies: ProbeDependencies,
+    *,
+    settings: ProbeSettings,
+    require_isolation: bool = True,
+    scan_engine: dict[str, str] | None = None,
+    development_release: Path | None = None,
+    install_locks: dict[str, dict[str, Any]] | None = None,
+    lock_bytes: dict[str, bytes] | None = None,
+    artifact_digest: str | None = None,
+    runtime_store: Path | None = None,
+    development_runtime: Path | None = None,
+    part: str | None = None,
+) -> StageResult:
+    """Probe one entry without catalog or object-store authority."""
     manifest_path = root / "dinkster-pack.toml"
     original = manifest_path.read_bytes()
-    manifest = load_manifest(manifest_path)
+    manifest = load_manifest(manifest_path, part=part)
     try:
         for data in dependencies.helper_wheels:
             # Helpers keep their installed layout, not their relocated probe assets.
@@ -79,8 +239,11 @@ def run_prepared_probe(
         if dependencies.helper_wheels:
             # Published metadata and the original wheel are never changed.
             document = tomllib.loads(original.decode())
-            document["pack"]["requires"] = list(dependencies.requirements)
-            document["pack"].pop("extra-requires", None)
+            selected = document["pack"]
+            if part is not None:
+                selected = next(item for item in selected["parts"] if item["name"] == part)
+            selected["requires"] = list(dependencies.requirements)
+            selected.pop("extra-requires", None)
             manifest_path.write_text(tomli_w.dumps(document))
         with tempfile.TemporaryDirectory(prefix="registry-library-wheels-") as directory:
             wheels = []
@@ -92,18 +255,23 @@ def run_prepared_probe(
                 if runtime_store is None or lock_bytes is None:
                     raise ValueError("Locked probes require assigned locks and a runtime store")
                 locks = {}
-                if set(lock_bytes) != set(install_locks):
-                    raise ValueError("Assigned dependency lock variants differ")
-                for variant, binding in install_locks.items():
+                if set(lock_bytes) != {key for key, _ in iter_install_locks(install_locks)}:
+                    raise ValueError("Assigned dependency lock variants or parts differ")
+                for key, binding in iter_install_locks(install_locks):
+                    variant, _, selector = key.partition("~")
                     if binding["artifactDigest"] != artifact_digest:
                         raise ValueError(f"{variant}: lock artifact digest differs from archive")
-                    data = lock_bytes[variant]
+                    data = lock_bytes[key]
                     if len(data) != binding["size"] or digest_bytes(data) != binding["digest"]:
-                        raise ValueError(f"{variant}: submitted dependency lock bytes changed")
+                        raise ValueError(f"{key}: submitted dependency lock bytes changed")
                     lock = PackLock.from_json(data)
-                    if lock.pack != manifest.name or lock.variant != variant:
-                        raise ValueError(f"{variant}: dependency lock pack or variant differs")
-                    locks[variant] = lock
+                    if (
+                        lock.pack != manifest.name
+                        or lock.variant != variant
+                        or lock.part != (selector or None)
+                    ):
+                        raise ValueError(f"{key}: dependency lock pack, variant or part differs")
+                    locks[key] = lock
                 catalog, variant = scan_catalog(
                     scan_engine, install_locks, mirror=development_runtime
                 )
@@ -111,7 +279,7 @@ def run_prepared_probe(
                     manifest.compatibility.require_engine(
                         manifest.name, catalog.channel.engine_version
                     )
-                lock = locks[variant]
+                lock = locks[variant if part is None else f"{variant}~{part}"]
                 for wheel in wheels:
                     sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
                     if not any(

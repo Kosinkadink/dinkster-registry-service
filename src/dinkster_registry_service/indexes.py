@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from functools import partial
+from typing import Any
 
 from packaging.version import Version
 from sqlalchemy import select, text
@@ -16,7 +17,7 @@ from sqlalchemy.orm import Session
 from .database import ArtifactRecord, Database, OutboxRecord, PackRecord, ReleaseRecord
 from .ids import uuid7
 from .object_store import ObjectStore, ObjectStoreError
-from .pack_locks import lock_object_key
+from .pack_locks import iter_install_locks, lock_object_key
 from .repository import CatalogRepository
 
 
@@ -205,15 +206,21 @@ class StaticIndexes:
                     f'<a href="{html.escape(link, quote=True)}">'
                     f"{html.escape(wheel['filename'])}</a>"
                 )
-            locks = {}
-            for variant, lock in release.install_locks.items():
+            locks: dict[str, dict[str, Any]] = {}
+            for variant, lock in iter_install_locks(release.install_locks):
                 lock_key = f"locks/{lock['digest'].replace(':', '/')}.json"
                 object_writes.append(
                     partial(
                         self._copy_object, lock_object_key(lock["digest"]), f"static/{lock_key}"
                     )
                 )
-                locks[variant] = {**lock, "url": lock_key}
+                parent, _, part = variant.partition("~")
+                published = {key: value for key, value in lock.items() if key != "parts"}
+                published["url"] = lock_key
+                if part:
+                    locks[parent].setdefault("parts", {})[part] = published
+                else:
+                    locks[parent] = published
             entry = {
                 "name": pack.name,
                 "version": release.version,

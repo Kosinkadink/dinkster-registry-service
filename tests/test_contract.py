@@ -108,6 +108,33 @@ def test_pack_release_and_schema_contracts(client: TestClient) -> None:
     assert_public_metadata(schemas_response)
 
 
+def test_release_wire_preserves_named_part_declarations(client: TestClient) -> None:
+    payload = client.get("/v1/packs/example-pack/versions/1.2.3").json()
+    sibling = {
+        **payload["manifest"],
+        "pythonRequirements": ["numpy>=2"],
+        "pythonExtraRequirements": {"cpu": ["pillow>=11"]},
+        "namespaces": ["example.shared"],
+        "sandbox": {"gpu": True, "network": False, "writableMounts": False},
+        "parts": {},
+    }
+    payload["manifest"]["parts"] = {"shared": sibling}
+    manifest = ReleaseDetail.model_validate(payload).model_dump(mode="json", by_alias=True)[
+        "manifest"
+    ]
+    assert set(manifest["parts"]) == {"shared"}
+    selected = manifest["parts"]["shared"]
+    assert selected["pythonRequirements"] == ["numpy>=2"]
+    assert selected["pythonExtraRequirements"] == {"cpu": ["pillow>=11"]}
+    assert selected["namespaces"] == ["example.shared"]
+    assert selected["sandbox"] == {"gpu": True, "network": False, "writableMounts": False}
+    assert manifest["sandbox"]["gpu"] is False
+    assert [pack["name"] for pack in client.get("/v1/packs").json()["items"]] == [
+        "example-pack",
+        "color-tools",
+    ]
+
+
 def test_template_catalog_and_immutable_body_contract(
     client: TestClient,
 ) -> None:

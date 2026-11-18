@@ -2,6 +2,7 @@
 
 | Feature | Hardware | Date | Evidence |
 | --- | --- | --- | --- |
+| One-version multipart publication, per-entry probes and static/dynamic lock readback | X570 Linux CPU, Python 3.14 | 2026-11-18 | [Authenticated HTTP controls, missing/broken/colliding sibling refusal, asymmetric metadata response regression and 12 scanner-worker tests passing with the containing landed engine pin; probe isolation disabled](https://github.com/Kosinkadink/comfy-vibe-station/issues/1004#issuecomment-6962603252) |
 | Helper requirements validate selected pack and engine-base versions without changing published locks | X570 CPU | 2026-11-14 | [Public admission activation/refusal controls, immutable lock downloads and six retained-lock planner checks](https://github.com/Kosinkadink/comfy-vibe-station/issues/697#issuecomment-6871259515) |
 | Cropped browser and phone icons on documentation and stored package indexes | X570 CPU, Chromium | 2026-11-13 | [Canonical assets and service rollout](https://github.com/Kosinkadink/comfy-vibe-station/issues/887#issuecomment-6849215705) |
 | Registry documentation browser icons and mounted documentation paths | X570 CPU, headed Chromium | 2026-11-13 | [Approved source/wheel/HTTP byte equality, inspected tab captures, full PostgreSQL suite and HTTP conformance](https://github.com/Kosinkadink/comfy-vibe-station/issues/887#issuecomment-6847126130) |

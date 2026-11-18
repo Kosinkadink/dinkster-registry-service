@@ -378,6 +378,15 @@ class CatalogRepository:
                         variant: {
                             **lock,
                             "url": f"/v1/packs/{name}/versions/{version}/locks/{variant}",
+                            "parts": {
+                                part: {
+                                    **selected,
+                                    "url": (
+                                        f"/v1/packs/{name}/versions/{version}/locks/{variant}~{part}"
+                                    ),
+                                }
+                                for part, selected in lock.get("parts", {}).items()
+                            },
                         }
                         for variant, lock in release.install_locks.items()
                     },
