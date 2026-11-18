@@ -65,7 +65,10 @@ def test_worker_runs_locked_probe_over_http_and_delivery_never_claims(
         manifest = source / "dinkster-pack.toml"
         manifest.write_text(
             manifest.read_text() + '\n[[pack.parts]]\nname = "shared"\n'
+            'requires = ["packaging>=1"]\nnamespaces = ["example"]\n'
+            '[pack.parts.extra-requires]\ncpu = ["packaging<99"]\n'
             '[pack.parts.entry]\nnodes = "example_pack.shared_nodes:PACK_NODES"\n'
+            "[pack.parts.sandbox]\ngpu = true\nnetwork = false\nwritable-mounts = false\n"
         )
         sibling = (source / "nodes.py").read_text()
         if fault != "collision":
@@ -96,7 +99,12 @@ def test_worker_runs_locked_probe_over_http_and_delivery_never_claims(
                 "shared": {
                     "baseId": binding["baseId"],
                     "artifactDigest": binding["artifactDigest"],
-                    "lock": {**binding["lock"], "format": "dinkster.pack-lock/3", "part": "shared"},
+                    "lock": {
+                        **binding["lock"],
+                        "format": "dinkster.pack-lock/3",
+                        "part": "shared",
+                        "requirements": ["packaging>=1", "packaging<99"],
+                    },
                 }
             }
     now = datetime.now(UTC)
@@ -195,6 +203,20 @@ def test_worker_runs_locked_probe_over_http_and_delivery_never_claims(
                     expected_nodes.update({"example.shared-resize", "example.shared-save"})
                 assert {node["nodeType"] for node in detail["nodes"]} == expected_nodes
                 assert {node["nodeType"] for node in schemas["schemas"]} == expected_nodes
+                metadata = detail["manifest"]
+                assert metadata["pythonRequirements"] == []
+                assert metadata["sandbox"]["gpu"] is False
+                assert set(metadata["parts"]) == ({"shared"} if multipart else set())
+                if multipart:
+                    declaration = metadata["parts"]["shared"]
+                    assert declaration["pythonRequirements"] == ["packaging>=1"]
+                    assert declaration["pythonExtraRequirements"] == {"cpu": ["packaging<99"]}
+                    assert declaration["namespaces"] == ["example"]
+                    assert declaration["sandbox"] == {
+                        "gpu": True,
+                        "network": False,
+                        "writableMounts": False,
+                    }
                 for variant, submitted_lock in locks.items():
                     dynamic = detail["installLocks"][variant]
                     static = published["installLocks"][variant]
