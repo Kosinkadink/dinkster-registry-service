@@ -500,8 +500,17 @@ archive BLAKE3 and existing `dinkster.pack-lock/1` document:
 ```
 
 Empty package lists are suitable only when the pack has no dependency closure.
-The ordinary archive-only request remains unchanged. A lock-bearing request
-requires a nonempty map of at most 32 variants, at most 8 MiB of lock input,
+The ordinary archive-only request remains unchanged. A pack with declared
+execution parts must attach locks: each variant binding includes a `parts`
+map keyed by the declared part names. Each child contains its own `baseId`,
+`artifactDigest` and `lock`; the lock uses `dinkster.pack-lock/3` and its exact
+`part` selector. Every child must bind the same base and archive as its parent.
+Missing or undeclared part locks reject the whole version. Each entry is probed
+with its own requirements, and duplicate node identities across entries reject
+publication. All entries remain one pack version and one public listing.
+
+A lock-bearing request requires a nonempty map of at most 32 variants,
+at most 8 MiB of lock input,
 and at most 1 MiB per lock. Duplicate JSON keys, mismatched archive/pack/variant
 identities, malformed base identities, incorrect JSON field types, unhashed
 wheel records, local-file wheel origins and URLs with credentials or no host
@@ -538,7 +547,10 @@ against the registry origin and pass the exact `baseId` query parameter; a
 rolling variant label is insufficient and a different base returns 409. Lock
 downloads follow archive visibility (active or yanked, never quarantine), verify
 stored bytes, and use the digest ETag and immutable cache policy. Raw archive
-releases without attached locks expose an empty map.
+releases without attached locks expose an empty map. Named child bindings remain
+under each variant's `parts` map; child lock URLs use `variant~part` selectors.
+Release manifest responses also retain named `parts` declarations, including
+requirements, accelerator requirements, namespace claims and sandbox needs.
 
 Every mutable public GET returns a strong opaque ETag and:
 
@@ -727,8 +739,9 @@ authorize publishing or public-index writes.
 - `GET /internal/scanner/{candidate_id}/input` returns only that assignment's
   original bounded archive, without accepting object keys or URLs.
 - `GET /internal/scanner/{candidate_id}/locks` returns the assignment's native
-  dependency locks as a variant-to-base64 map, after verifying each stored size
-  and digest. Each lock is bounded at 1 MiB and submissions contain at most 32
+  dependency locks as a variant-to-base64 map, with `variant~part` keys for
+  declared siblings, after verifying each stored size and digest. Each lock is
+  bounded at 1 MiB and submissions contain at most 32
   variants. Missing or changed stored bytes return retryable 503. The prepared
   executor verifies these bytes against the claim again and uses the trusted
   base/runtime catalog and locked probe path, without catalog or object-store
@@ -736,8 +749,9 @@ authorize publishing or public-index writes.
 - `GET /internal/scanner/{candidate_id}/dependencies` resolves the assignment's
   active public helper/library wheels with the same catalog and digest checks
   as local scanning. It returns `helperWheels` (base64 bytes), `libraryWheels`
-  (filename/data objects with base64 bytes), and sorted `requirements`. Library
-  uploads and rescans need no executable probe and return empty lists. Combined
+  (filename/data objects with base64 bytes), and sorted `requirements`. A `parts`
+  map retains separate dependency records for declared siblings. Library uploads
+  and rescans need no executable probe and return empty lists. Combined
   wheel bytes are limited to 256 MiB before base64 encoding; an oversized set
   returns retryable 503, not a candidate rejection. Resolution failures instead
   return a `failure` object with the existing executable-probe stage findings,
