@@ -628,6 +628,9 @@ def test_format2_lock_validation_preserves_legacy_exact_locks(
         "wheel-hash",
         "too-many-variants",
         "oversized-lock",
+        "part-selector",
+        "part-base",
+        "part-name",
     ],
 )
 def test_invalid_published_locks_refuse_before_submission(tmp_path: Path, mutation: str) -> None:
@@ -662,6 +665,15 @@ def test_invalid_published_locks_refuse_before_submission(tmp_path: Path, mutati
             locks[variant]["lock"]["variant"] = variant
     elif mutation == "oversized-lock":
         lock["indexes"] = ["https://example.test/" + "a" * (1024 * 1024)]
+    elif mutation.startswith("part-"):
+        selected = json.loads(json.dumps(locks["linux-cpu"]))
+        selected["lock"].update(format="dinkster.pack-lock/3", part="face")
+        if mutation == "part-selector":
+            selected["lock"]["part"] = "other"
+        elif mutation == "part-base":
+            selected["baseId"] = "sha256:" + "b" * 64
+        name = "main" if mutation == "part-name" else "face"
+        locks["linux-cpu"]["parts"] = {name: selected}
     elif mutation.startswith("package-") or mutation.startswith("wheel-"):
         url = {
             "wheel-url-no-host": "https:///fixture.whl",

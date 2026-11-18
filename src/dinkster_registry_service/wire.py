@@ -208,12 +208,16 @@ class CloudEligibility(ResponseModel):
     policy_version: str
 
 
-class InstallationLock(ResponseModel):
+class InstallationPartLock(ResponseModel):
     base_id: str
     artifact_digest: str
     digest: str
     size: int
     url: str
+
+
+class InstallationLock(InstallationPartLock):
+    parts: dict[str, InstallationPartLock] = Field(default_factory=dict)
 
 
 class ReleaseDetail(ResponseModel):

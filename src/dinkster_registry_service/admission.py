@@ -62,7 +62,13 @@ from .identifiers import require_canonical_pack_name
 from .ids import uuid7
 from .indexes import StaticIndexes, queue_index_rebuild
 from .object_store import MAX_ARTIFACT_SIZE, ObjectStore, ObjectStoreError
-from .pack_locks import MAX_LOCK_SIZE, lock_object_key, parse_pack_locks, quarantine_lock_key
+from .pack_locks import (
+    MAX_LOCK_SIZE,
+    iter_install_locks,
+    lock_object_key,
+    parse_pack_locks,
+    quarantine_lock_key,
+)
 from .principals import PrincipalRepository
 from .release_sets import clean_one_set, queue_set_cleanup, settle_one_set
 from .scan_engine import parse_scan_engine
@@ -299,21 +305,24 @@ class AdmissionService:
         )
         if prepared and (digest != artifact_digest(archive) or size != len(archive)):
             raise AdmissionError("lock-bearing submission archive identity does not match bytes")
-        install_locks = {
-            lock.variant: {
+        install_locks: dict[str, dict[str, Any]] = {}
+        for lock in prepared:
+            binding = {
                 "baseId": lock.base_id,
                 "artifactDigest": digest,
                 "digest": lock.digest,
                 "size": len(lock.data),
             }
-            for lock in prepared
-        }
+            if lock.part is None:
+                install_locks[lock.variant] = binding
+            else:
+                install_locks[lock.variant].setdefault("parts", {})[lock.part] = binding
         candidate_id = uuid7()
         object_key = quarantine_object_key(candidate_id)
         self.object_store.put(object_key, archive)
         try:
             for lock in prepared:
-                self.object_store.put(quarantine_lock_key(candidate_id, lock.variant), lock.data)
+                self.object_store.put(quarantine_lock_key(candidate_id, lock.key), lock.data)
             own_transaction = session is None
             with (
                 self.database.session() if session is None else nullcontext(session) as session,
@@ -367,9 +376,7 @@ class AdmissionService:
                             raise AdmissionError(f"release candidate is {previous.status}")
                         self.object_store.remove(object_key)
                         for lock in prepared:
-                            self.object_store.remove(
-                                quarantine_lock_key(candidate_id, lock.variant)
-                            )
+                            self.object_store.remove(quarantine_lock_key(candidate_id, lock.key))
                         return previous.id
                     if previous_candidates:
                         supersedes = str(previous_candidates[0].id)
@@ -425,7 +432,7 @@ class AdmissionService:
         except BaseException:
             self.object_store.remove(object_key)
             for lock in prepared:
-                self.object_store.remove(quarantine_lock_key(candidate_id, lock.variant))
+                self.object_store.remove(quarantine_lock_key(candidate_id, lock.key))
             raise
         return candidate_id
 
@@ -1279,7 +1286,7 @@ class AdmissionService:
                         else:
                             self._probe_library_wheels(set(wheel.requirements), catalog)
                     self.object_store.put(artifact_object_key(candidate.declared_digest), data)
-                    for variant, binding in candidate.install_locks.items():
+                    for variant, binding in iter_install_locks(candidate.install_locks):
                         stored = self.object_store.open(
                             quarantine_lock_key(candidate.id, variant),
                             expected_size=binding["size"],
@@ -1455,7 +1462,7 @@ class AdmissionService:
                         expected_digest=candidate.declared_digest,
                     )
                     stored.close()
-                for variant, lock in release.install_locks.items():
+                for variant, lock in iter_install_locks(release.install_locks):
                     source = quarantine_lock_key(candidate_id, variant)
                     destination = lock_object_key(lock["digest"])
                     if self.object_store.exists(source):
@@ -1482,7 +1489,7 @@ class AdmissionService:
         if failure is not None:
             return True
         self.object_store.remove(source_key)
-        for variant in release.install_locks:
+        for variant, _ in iter_install_locks(release.install_locks):
             self.object_store.remove(quarantine_lock_key(candidate_id, variant))
         return True
 
@@ -1696,7 +1703,7 @@ class AdmissionService:
 
     def probe_install_locks(self, claim: CandidateClaim) -> dict[str, bytes]:
         locks = {}
-        for variant, binding in claim.install_locks.items():
+        for variant, binding in iter_install_locks(claim.install_locks):
             data = self.object_store.read(
                 quarantine_lock_key(claim.id, variant), max_size=MAX_LOCK_SIZE
             )

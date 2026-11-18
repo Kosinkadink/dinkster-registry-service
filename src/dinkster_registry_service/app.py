@@ -1124,7 +1124,9 @@ def create_app(settings: ServerSettings | None = None) -> FastAPI:
     ) -> Response:
         query = _query(request, LockQuery)
         release = repository.release_detail(_pack_name(canonical_name), _version(canonical_version))
-        lock = release.install_locks.get(variant) if release is not None else None
+        parent, _, part = variant.partition("~")
+        binding = release.install_locks.get(parent) if release is not None else None
+        lock = binding.parts.get(part) if binding is not None and part else binding
         if lock is None:
             raise _not_found("The requested installation lock was not found.")
         if lock.base_id != query.base_id:
