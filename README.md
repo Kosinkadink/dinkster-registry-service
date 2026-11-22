@@ -12,8 +12,9 @@ OAuth redirect page, uses the approved cropped Dinkster D browser icon. The whee
 includes its ICO, SVG and 32px PNG at `/favicon.ico`, `/favicon.svg` and
 `/favicon-32.png`, an opaque dark 180px `/apple-touch-icon.png`, and transparent
 192px/512px PNGs linked by `/manifest.webmanifest`. All are copied unchanged
-from Dinkster-Frontend main `c21e3c0e4355fffb339884c1040533913ee8bd93`, under
-`branding/favicon/`. Stored simple-index HTML receives the same links when
+from Dinkster-Frontend `branding/favicon/`: the approved rounded cyan/coral
+vector, source-bounds crop and exact-source small sizes. The opaque touch icon
+uses the shared dark canvas background. Stored simple-index HTML receives the same links when
 served, with response ETags and lengths calculated after adding the head;
 no republishing or external icon host is required.
 
