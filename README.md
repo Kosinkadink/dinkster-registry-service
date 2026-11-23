@@ -31,4 +31,3 @@ For a SQLite setup or a real admission exercise, see
 - [Publishing, index recovery and scanner operations](docs/operations.md).
 - [Production deployment](docs/deployment.md).
 - [Signed release notices and independent trust](SECURITY-NOTICES.md).
-- [Validation record](TESTED.md).
