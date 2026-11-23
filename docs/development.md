@@ -41,12 +41,12 @@ Start a disposable empty registry, build the deterministic fixture in the
 container and submit it:
 
 ```sh
-DOCKER_BUILDKIT=1 DINKSTER_SEED_FIXTURES=0 docker-compose up --build --wait
-docker-compose exec -T registry dinkster-registry admin add-user operator
-docker-compose exec -T registry dinkster-registry admin add-publisher dinkster --owner operator
-docker-compose exec -T registry python -c 'from pathlib import Path; from dinkster_registry_service.artifacts import build_registry_fixture_archive; from dinkster_registry_service.seed import FIXTURE_ROOT; Path("/tmp/example_pack-1.2.3-py3-none-any.whl").write_bytes(build_registry_fixture_archive(FIXTURE_ROOT / "example-pack"))'
-candidate_id="$(docker-compose exec -T registry dinkster-registry submit /tmp/example_pack-1.2.3-py3-none-any.whl --pack example-pack --version 1.2.3 --publisher dinkster --submitted-by operator)"
-docker-compose exec -T registry dinkster-registry status "$candidate_id"
+DOCKER_BUILDKIT=1 DINKSTER_SEED_FIXTURES=0 docker compose up --build --wait
+docker compose exec -T registry dinkster-registry admin add-user operator
+docker compose exec -T registry dinkster-registry admin add-publisher dinkster --owner operator
+docker compose exec -T registry python -c 'from pathlib import Path; from dinkster_registry_service.artifacts import build_registry_fixture_archive; from dinkster_registry_service.seed import FIXTURE_ROOT; Path("/tmp/example_pack-1.2.3-py3-none-any.whl").write_bytes(build_registry_fixture_archive(FIXTURE_ROOT / "example-pack"))'
+candidate_id="$(docker compose exec -T registry dinkster-registry submit /tmp/example_pack-1.2.3-py3-none-any.whl --pack example-pack --version 1.2.3 --publisher dinkster --submitted-by operator)"
+docker compose exec -T registry dinkster-registry status "$candidate_id"
 curl --fail http://127.0.0.1:18041/v1/packs/example-pack/versions/1.2.3
 ```
 
@@ -54,13 +54,13 @@ Repeat `status` until `accepted` before the final `curl` (which otherwise return
 404). Schedule a static/security rescan with:
 
 ```sh
-docker-compose exec -T registry dinkster-registry rescan --pack example-pack --version 1.2.3
+docker compose exec -T registry dinkster-registry rescan --pack example-pack --version 1.2.3
 ```
 
 Remove the disposable containers and volumes when finished:
 
 ```sh
-docker-compose down --volumes --remove-orphans --rmi local
+docker compose down --volumes --remove-orphans --rmi local
 ```
 
 ## Checks
