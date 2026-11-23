@@ -2,7 +2,6 @@
 
 Revision ID: 20260904_0003
 Revises: 20260903_0002
-Create Date: 2026-09-04 00:00:00
 """
 
 from collections.abc import Sequence
