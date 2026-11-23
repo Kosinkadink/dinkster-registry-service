@@ -82,7 +82,7 @@ rerun or cancel workflows to obtain deployment evidence.
 
 Natural pushes to `main` run checks, conformance and container validation. Only
 after all three succeed, and production is enabled, the reusable
-[deploy workflow](.github/workflows/deploy.yml) runs. It checks out `github.sha`,
+[deploy workflow](../.github/workflows/deploy.yml) runs. It checks out `github.sha`,
 builds with that revision label on hosted Ubuntu, pushes the image to the existing Fly
 registry, and resolves an immutable `registry.fly.io/dinkster-registry@sha256:...`
 linux/amd64 image digest. When the push produces an OCI index, the workflow
